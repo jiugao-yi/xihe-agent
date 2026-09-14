@@ -2663,21 +2663,11 @@ registry.register(
 # Setup/collect run on the browser worker thread; the finish poll runs on the
 # agent thread so the expose_binding callback (worker thread) can fire.
 
-# PyInstaller bundles may place the file at tools/web_record_recorder.js
-# (normal) or at tools/web_record_recorder.js/web_record_recorder.js (a
-# directory-plus-same-name artifact of package-data/add-data merging). Resolve
-# both shapes so the frozen build keeps browser_* tools registered.
-_BR_JS_CANDIDATES = (
-    Path(__file__).parent / "web_record_recorder.js",
-    Path(__file__).parent / "web_record_recorder.js" / "web_record_recorder.js",
-)
-_BR_JS_PATH = next((p for p in _BR_JS_CANDIDATES if p.is_file()), None)
-if _BR_JS_PATH is None:
-    raise RuntimeError(
-        "web_record_recorder.js not found in bundle (looked under %s)"
-        % (Path(__file__).parent,)
-    )
-_BR_JS = _BR_JS_PATH.read_text(encoding="utf-8")
+# The recorder sits next to this module as a plain file. Packaging note: the
+# build scripts use `--add-data <file>:<dir>` — PyInstaller treats the target
+# of a file source as a directory, so the bundle always lands at
+# tools/web_record_recorder.js (never a nested tools/<name>/<name>).
+_BR_JS = (Path(__file__).parent / "web_record_recorder.js").read_text(encoding="utf-8")
 _BR_BOUND = {"context": None}        # context the recorder is installed on
 _BR_HOLDER = {"holder": None}        # current recording's buffer (set per call)
 _BR_ACTIVE = {"on": False}           # master switch for popup-enablement

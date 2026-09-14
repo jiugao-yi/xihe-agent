@@ -56,8 +56,8 @@ Remove-Item -Recurse -Force dist\cli, build\pyinstaller, build\xihe.spec -ErrorA
   --add-data "$Root\src\core\kbs_templates;core\kbs_templates" `
   --add-data "$Root\src\agents;agents" `
   --add-data "$Root\src\skills;skills" `
-  --add-data "$Root\src\core\kbs_protocol.md;core\kbs_protocol.md" `
-  --add-data "$Root\src\tools\web_record_recorder.js;tools\web_record_recorder.js" `
+  --add-data "$Root\src\core\kbs_protocol.md;core" `
+  --add-data "$Root\src\tools\web_record_recorder.js;tools" `
   "$Root\src\app\__main__.py"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller 打包失败 (exit=$LASTEXITCODE)" }
 

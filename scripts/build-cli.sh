@@ -61,8 +61,9 @@ rm -rf dist/cli build/pyinstaller build/xihe.spec
   --add-data "$ROOT/src/core/kbs_templates:core/kbs_templates" \
   --add-data "$ROOT/src/agents:agents" \
   --add-data "$ROOT/src/skills:skills" \
-  --add-data "$ROOT/src/core/kbs_protocol.md:core/kbs_protocol.md" \
-  --add-data "$ROOT/src/tools/web_record_recorder.js:tools/web_record_recorder.js" \
+  # 注意：PyInstaller 对“源为文件”的 add-data 会把目标当作目录，因此这里只写目录名
+  --add-data "$ROOT/src/core/kbs_protocol.md:core" \
+  --add-data "$ROOT/src/tools/web_record_recorder.js:tools" \
   "$ROOT/src/app/__main__.py"
 
 echo "[3/4] 冒烟验证"
