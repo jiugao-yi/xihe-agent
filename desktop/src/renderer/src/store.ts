@@ -481,7 +481,7 @@ export const useStore = create<DesktopState>()((set, get) => {
     if (Object.keys(sessions).length !== keys.length) set({ sessions })
   }
 
-  function scheduleReconnect() {
+  function retryStreamConnection() {
     if (reconnectTimer || deliberateClose) return
     // Don't hammer /stream while main reports the serve process is down (or
     // still starting) — main owns the restart, and reconnecting would race it.
@@ -499,11 +499,11 @@ export const useStore = create<DesktopState>()((set, get) => {
     try {
       stream = await connectStream(handleEvent, (connected) => {
         set({ serveConnected: connected })
-        if (!connected && !deliberateClose) scheduleReconnect()
+        if (!connected && !deliberateClose) retryStreamConnection()
       })
       await resyncAfterReconnect()
     } catch {
-      if (!deliberateClose) scheduleReconnect()
+      if (!deliberateClose) retryStreamConnection()
     }
   }
 
