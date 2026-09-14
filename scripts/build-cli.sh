@@ -44,6 +44,7 @@ echo "[1/4] 创建构建环境: $VENV"
 
 echo "[2/4] PyInstaller 打包 xihe"
 rm -rf dist/cli build/pyinstaller build/xihe.spec
+# 注意：PyInstaller 对“源为文件”的 add-data 会把目标当作目录，目标只写目录名（勿写成 文件:完整路径）
 "$VENV/bin/pyinstaller" --noconfirm --clean \
   --name xihe \
   --onedir \
@@ -61,7 +62,6 @@ rm -rf dist/cli build/pyinstaller build/xihe.spec
   --add-data "$ROOT/src/core/kbs_templates:core/kbs_templates" \
   --add-data "$ROOT/src/agents:agents" \
   --add-data "$ROOT/src/skills:skills" \
-  # 注意：PyInstaller 对“源为文件”的 add-data 会把目标当作目录，因此这里只写目录名
   --add-data "$ROOT/src/core/kbs_protocol.md:core" \
   --add-data "$ROOT/src/tools/web_record_recorder.js:tools" \
   "$ROOT/src/app/__main__.py"
