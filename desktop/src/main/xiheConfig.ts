@@ -26,6 +26,43 @@ export function xiheConfigPath(): string {
   return join(homedir(), '.xihe-agent', 'config.yaml')
 }
 
+/** Template bundled with the desktop app (copied from the repo root
+ *  config.example.yaml by scripts/build-desktop.*). Used to initialize a full
+ *  commented config on first save — the GUI only patches a curated key set and
+ *  must never create a 3-line skeleton that xihe's own seed (which skips
+ *  existing files) would then refuse to complete. */
+async function bundledConfigTemplatePath(): Promise<string | null> {
+  // Packaged: <resources>/config.example.yaml; dev: repo desktop/resources/.
+  for (const p of [join(process.resourcesPath || '', 'config.example.yaml'),
+                   join(__dirname, '..', '..', 'resources', 'config.example.yaml')]) {
+    try {
+      const tpl = await fs.readFile(p, 'utf8')
+      if (tpl.trim() !== '') return tpl
+    } catch {
+      /* try next */
+    }
+  }
+  return null
+}
+
+/** Initialize ~/.xihe-agent/config.yaml from the bundled template when it does
+ *  not exist yet (mirrors xihe's own seed_default_config). Returns the file
+ *  lines, or null when no template is available (caller falls back to empty). */
+async function seedFromTemplate(): Promise<string[] | null> {
+  const tpl = await bundledConfigTemplatePath()
+  if (tpl === null) return null
+  const header = '# xihe 首次启动时按模板生成——填好 api_key（并按需调整 model/toolsets）后即可使用。\n'
+  const path = xiheConfigPath()
+  try {
+    await fs.mkdir(dirname(path), { recursive: true })
+    const full = header + tpl
+    await fs.writeFile(path, full, 'utf8')
+    return full.split(/\r?\n/)
+  } catch {
+    return null
+  }
+}
+
 type LeafType = 'string' | 'number' | 'boolean' | 'enum'
 
 /** The 11 non-secret value fields the panel exposes. Shared by the read shape
@@ -297,7 +334,10 @@ async function readLines(): Promise<string[]> {
     const raw = await fs.readFile(xiheConfigPath(), 'utf8')
     return raw.split(/\r?\n/)
   } catch {
-    return [] // missing / unreadable → treat as empty (reader yields all-defaults)
+    // Missing / unreadable. On first save the GUI must not create a skeleton
+    // that lacks the full template (toolsets/skills/…): initialize from the
+    // bundled example first so the patched file is complete.
+    return (await seedFromTemplate()) ?? [] // reader yields all-defaults
   }
 }
 

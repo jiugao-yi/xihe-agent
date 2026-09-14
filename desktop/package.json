@@ -35,6 +35,10 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "resources/config.example.yaml",
+        "to": "config.example.yaml"
       }
     ],
     "win": {

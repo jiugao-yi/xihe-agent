@@ -24,8 +24,12 @@ if ($env:XIHE_SKIP_CLI -eq "1") {
   Copy-Item -Recurse "dist\cli\xihe" (Join-Path $BinDir "xihe")
 }
 
-# ② 构建桌面 bundle
-Write-Host "[2/3] electron-vite 构建 renderer/main/preload"
+# ② 携带配置模板（桌面端首启/首次保存时用于初始化完整 config.yaml）
+Write-Host "[2/4] 内嵌 config.example.yaml 模板"
+Copy-Item -Force "config.example.yaml" "desktop\resources\config.example.yaml"
+
+# ③ 构建桌面 bundle
+Write-Host "[3/4] electron-vite 构建 renderer/main/preload"
 Set-Location (Join-Path $Root "desktop")
 if (-not (Test-Path "node_modules")) {
   npm install
@@ -34,8 +38,8 @@ if (-not (Test-Path "node_modules")) {
 npm run build
 if ($LASTEXITCODE -ne 0) { throw "electron-vite build 失败" }
 
-# ③ electron-builder 出包
-Write-Host "[3/3] electron-builder 打包 (win)"
+# ④ electron-builder 出包
+Write-Host "[4/4] electron-builder 打包 (win)"
 npx electron-builder --win
 if ($LASTEXITCODE -ne 0) { throw "electron-builder 打包失败" }
 

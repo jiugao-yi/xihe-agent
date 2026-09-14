@@ -32,16 +32,20 @@ else
   chmod +x desktop/resources/bin/xihe/xihe
 fi
 
-# ② 构建桌面 bundle（electron-vite）
-echo "[2/3] electron-vite 构建 renderer/main/preload"
+# ② 携带配置模板（桌面端首启/首次保存时用于初始化完整 config.yaml）
+echo "[2/4] 内嵌 config.example.yaml 模板"
+cp "$ROOT/config.example.yaml" "$ROOT/desktop/resources/config.example.yaml"
+
+# ③ 构建桌面 bundle（electron-vite）
+echo "[3/4] electron-vite 构建 renderer/main/preload"
 cd desktop
 if [ ! -d node_modules ]; then
   npm install
 fi
 npm run build
 
-# ③ electron-builder 出安装包
-echo "[3/3] electron-builder 打包 ($TARGET)"
+# ④ electron-builder 出安装包
+echo "[4/4] electron-builder 打包 ($TARGET)"
 npx electron-builder --"$TARGET"
 
 echo ""
