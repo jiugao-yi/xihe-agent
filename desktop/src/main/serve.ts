@@ -69,6 +69,13 @@ const LIVENESS_FAIL_THRESHOLD = 3
 const ADOPT_REPROBE_MS = 3_000
 // Backoff cadence (ms) for owned-child restart after an unexpected exit.
 const BACKOFF_MS = [1_000, 2_000, 5_000]
+// Circuit breaker: after this many consecutive spawn/readiness failures we
+// STOP auto-retrying and park in `errored` with the last stderr tail attached
+// — an infinite retry loop (port 7788 stuck bound by a half-killed old serve,
+// or a config.yaml that crashes serve at boot) otherwise reads as an eternal
+// "xihe未就绪" with no way to see why. A manual restart() (or a successful
+// boot) resets the counter.
+const MAX_RESTART_FAILURES = 6
 // serve.log rotation threshold — at open, an oversized log is renamed to
 // serve.log.old (dropping any previous .old) so the file can't grow forever.
 const SERVE_LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -121,6 +128,8 @@ export class ServeSupervisor {
   private stopped = false
   private timer: ReturnType<typeof setTimeout> | null = null
   private backoffIdx = 0
+  private restartFailures = 0
+  private lastExitDetail = ''
   private livenessFailures = 0
   private readinessDeadline = 0
   private logStream: WriteStream | null = null
@@ -170,6 +179,7 @@ export class ServeSupervisor {
   restart(): void {
     if (this.stopped) return
     this.clearTimer()
+    this.restartFailures = 0
     this.owned = false
     if (this.child) {
       try {
@@ -267,8 +277,9 @@ export class ServeSupervisor {
         this.emit('not_found', { message: this.notFoundMessage() })
         return
       }
+      this.lastExitDetail = `exit code=${code} signal=${signal ?? ''}`
       this.emit('stopped', {
-        message: `xihe进程退出（code=${code} signal=${signal ?? ''}），将重启…`,
+        message: `xihe进程退出（${this.lastExitDetail}），将重启…`,
         version: null,
       })
       this.scheduleRestart()
@@ -281,6 +292,7 @@ export class ServeSupervisor {
         this.emit('not_found', { message: this.notFoundMessage() })
         return
       }
+      this.lastExitDetail = m
       this.emit('errored', { message: `xihe启动失败：${m}` })
       this.scheduleRestart()
     })
@@ -307,6 +319,7 @@ export class ServeSupervisor {
     if (h) {
       this.backoffIdx = 0
       this.livenessFailures = 0
+      this.restartFailures = 0
       this.emit('running', { version: h.version, message: undefined })
       this.scheduleLiveness()
       return
@@ -334,6 +347,7 @@ export class ServeSupervisor {
     if (this.stopped) return
     if (h) {
       this.backoffIdx = 0
+      this.restartFailures = 0
       if (this.status.state !== 'running') {
         this.emit('running', { version: h.version, message: undefined })
       }
@@ -384,12 +398,40 @@ export class ServeSupervisor {
 
   private scheduleRestart(): void {
     if (this.stopped) return
+    this.restartFailures += 1
+    if (this.restartFailures >= MAX_RESTART_FAILURES) {
+      // Circuit open: stop the infinite retry loop. Surface the last failure
+      // with a stderr tail from serve.log so the user (or the settings panel)
+      // can see the real cause — a stuck port (old serve not fully dead) or a
+      // config.yaml that crashes serve at boot.
+      const tail = this.logTail()
+      this.emit('errored', {
+        message:
+          `xihe连续${this.restartFailures}次启动失败，已停止自动重启。` +
+          (tail ? `\n最近日志：${tail}` : ''),
+        version: null,
+      })
+      return
+    }
     const delay = BACKOFF_MS[Math.min(this.backoffIdx, BACKOFF_MS.length - 1)]
     this.backoffIdx += 1
     this.setTimer(() => {
       if (this.stopped) return
       this.spawnChild()
     }, delay)
+  }
+
+  /** Best-effort tail of serve.log (last ~600 chars, single line) for the
+   *  circuit-breaker message. */
+  private logTail(): string {
+    try {
+      const { readFileSync } = require('fs') as typeof import('fs')
+      const raw = readFileSync(serveLogPath(), 'utf8')
+      const tail = raw.slice(-600).replace(/\s+/g, ' ').trim()
+      return tail || ''
+    } catch {
+      return ''
+    }
   }
 
   /** Idempotent. Called from `before-quit`. Tree-kills the owned child; leaves
