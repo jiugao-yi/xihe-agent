@@ -4,7 +4,7 @@
 // The renderer is a browser bundle — it cannot import node's `fs`/`path`, which
 // is why every desktop-only op funnels through these invoke bridges.
 
-import type { Workspace } from '../store'
+import type { Workspace } from '../appStore'
 
 /** One immediate child of a directory, as returned by `listDir`. `path` is the
  *  absolute child path, joined by main — the renderer never builds paths itself

@@ -1,5 +1,5 @@
 import { Terminal, Boxes, MonitorUp, Shield, GitFork, Cpu } from 'lucide-react'
-import type { EngineKind, AgentStatus } from '../store'
+import type { EngineKind, AgentStatus } from '../appStore'
 import { cn } from '../lib/cn'
 
 const ENGINE_LABEL: Record<EngineKind, string> = {

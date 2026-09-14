@@ -1,9 +1,9 @@
 import { memo, useEffect, useMemo, useState, type MouseEvent } from 'react'
 import { Brain, Check, ChevronRight, Copy, ExternalLink, Loader2, Navigation, SplitSquareHorizontal, Wrench, X } from 'lucide-react'
-import type { TraceEvent } from '../store'
+import type { TraceEvent } from '../appStore'
 import { cn } from '../lib/cn'
 import { getFullToolResult, getToolArgs } from '../lib/serveClient'
-import { useStore } from '../store'
+import { useStore } from '../appStore'
 import { detectLanguage } from '../lib/lang'
 import { DiffBlock } from './DiffBlock'
 

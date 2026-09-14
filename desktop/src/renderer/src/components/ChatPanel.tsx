@@ -15,7 +15,7 @@ import {
   ShieldAlert,
   Square,
 } from 'lucide-react'
-import { useStore, type Agent, type Message, type PendingApproval } from '../store'
+import { useStore, type Agent, type Message, type PendingApproval } from '../appStore'
 import { cn } from '../lib/cn'
 import { desktop } from '../lib/desktop'
 import { detectLanguage } from '../lib/lang'

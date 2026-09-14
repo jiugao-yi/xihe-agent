@@ -16,7 +16,7 @@ import {
   type SshStream,
 } from '../lib/serveClient'
 import { desktop } from '../lib/desktop'
-import { useStore } from '../store'
+import { useStore } from '../appStore'
 import { cn } from '../lib/cn'
 import { Resizer, usePanelSize } from './Resizer'
 

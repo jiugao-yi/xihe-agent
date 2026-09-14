@@ -13,7 +13,7 @@
 // rebuilds by construction — there is nothing on ConvMeta to drop.
 
 import { desktop, type WindowState, type WorkspaceStore } from './desktop'
-import type { Workspace } from '../store'
+import type { Workspace } from '../appStore'
 
 export type { WorkspaceStore }
 

@@ -13,7 +13,7 @@ import {
   Wifi,
   WifiOff,
 } from 'lucide-react'
-import { useStore, type ConvMeta } from '../store'
+import { useStore, type ConvMeta } from '../appStore'
 import { cn } from '../lib/cn'
 import { desktop } from '../lib/desktop'
 import { Resizer, usePanelSize } from './Resizer'

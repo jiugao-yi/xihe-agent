@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, Play, History, Square } from 'lucide-react'
 import { desktop, type RunEvent } from '../lib/desktop'
-import { useStore } from '../store'
+import { useStore } from '../appStore'
 import { cn } from '../lib/cn'
 import { Resizer, usePanelSize } from './Resizer'
 

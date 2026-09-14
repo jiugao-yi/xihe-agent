@@ -22,7 +22,7 @@ import {
 import { guessRunCommand } from './EditorArea'
 import { desktop, type DirEntry, type FsResult, type GitStatus } from '../lib/desktop'
 import { detectLanguage } from '../lib/lang'
-import { useStore, type Workspace } from '../store'
+import { useStore, type Workspace } from '../appStore'
 import { cn } from '../lib/cn'
 import { Resizer, usePanelSize } from './Resizer'
 

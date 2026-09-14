@@ -16,8 +16,8 @@ import {
   ToggleRight,
   Zap,
 } from 'lucide-react'
-import { useStore } from '../store'
-import type { Agent } from '../store'
+import { useStore } from '../appStore'
+import type { Agent } from '../appStore'
 import { cn } from '../lib/cn'
 import { desktop, type XiheConfigPatch, type ThemeMode } from '../lib/desktop'
 import {

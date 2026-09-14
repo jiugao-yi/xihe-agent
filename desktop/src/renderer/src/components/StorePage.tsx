@@ -12,7 +12,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { useStore } from '../store'
+import { useStore } from '../appStore'
 import { cn } from '../lib/cn'
 import {
   installStoreItem,

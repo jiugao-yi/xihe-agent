@@ -2,7 +2,7 @@ import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { FileDiff, Play, X } from 'lucide-react'
 import { desktop, type ReadResult } from '../lib/desktop'
 import { detectLanguage } from '../lib/lang'
-import { useStore } from '../store'
+import { useStore } from '../appStore'
 import { cn } from '../lib/cn'
 
 const MonacoPane = lazy(() =>

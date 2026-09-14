@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { BookOpen, CodeXml, FolderTree, Globe, MessageSquare, PanelLeftOpen, PanelRightClose, PanelRightOpen, Play, Settings, ShoppingBag, SquareTerminal } from 'lucide-react'
-import { useStore } from './store'
+import { useStore } from './appStore'
 import { Sidebar } from './components/Sidebar'
 import { ChatPanel } from './components/ChatPanel'
 import { SettingsPanel } from './components/SettingsPanel'

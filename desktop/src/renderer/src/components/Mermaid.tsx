@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import mermaid from 'mermaid'
-import { useStore } from '../store'
+import { useStore } from '../appStore'
 
 let seq = 0
 

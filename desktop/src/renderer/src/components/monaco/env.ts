@@ -7,7 +7,7 @@ import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker'
 import JsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker'
 import TsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker'
 import type * as MonacoNs from 'monaco-editor'
-import { useStore } from '../../store'
+import { useStore } from '../../appStore'
 
 type Monaco = typeof MonacoNs
 
