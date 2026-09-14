@@ -23,6 +23,20 @@ import {
 } from './localPty'
 import { desktopDataDir } from './dataDir'
 
+// 单实例锁：双击两次（或残留进程 + 新开）会起两个桌面端、两个 serve 抢
+// 127.0.0.1:7788 —— 后到者 bind 失败 (winerror 10048)。拿不到锁的实例直接
+// 退出；second-instance 事件里聚焦已存在的窗口。必须在 whenReady 之前申请。
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.exit(0)
+}
+app.on('second-instance', () => {
+  if (mainWin) {
+    if (mainWin.isMinimized()) mainWin.restore()
+    mainWin.focus()
+  }
+})
+
 // Chromium 启动噪音(均无害:GPU 硬解回退软解;后台公网探测在气隙必 reset),
 // app 实际走 ws://localhost,与此无关,仅压日志。对应日志签名 kTransientFailure /
 // net_error -101。全部须在 app ready 前设。(GPU 仍残留则再加 disable-gpu。)
