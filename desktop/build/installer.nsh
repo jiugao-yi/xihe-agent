@@ -52,6 +52,12 @@ Var XiheCliDir
 
 ; Contains: (stack top: needle, below: haystack) -> push 1 if haystack
 ; contains needle else 0.
+
+; Conditional compilation: electron-builder compiles the installer and the
+; uninstaller as separate units with -WX (warnings as errors). Each unit only
+; defines the helper it actually calls so makensis has no "not referenced"
+; warning to promote.
+!ifndef BUILD_UNINSTALLER
 Function Contains
   Pop $R6
   Pop $R7
@@ -70,53 +76,7 @@ Function Contains
   Push $R4
 FunctionEnd
 
-Function un.Contains
-  Pop $R6
-  Pop $R7
-  StrLen $R0 $R6
-  StrLen $R1 $R7
-  StrCpy $R2 0
-  StrCpy $R4 0
-  ${DoWhile} $R2 <= $R1
-    StrCpy $R3 $R7 $R0 $R2
-    ${If} $R3 == $R6
-      StrCpy $R4 1
-      ${Break}
-    ${EndIf}
-    IntOp $R2 $R2 + 1
-  ${Loop}
-  Push $R4
-FunctionEnd
-
-; RemoveEntry: (stack top: needle, below: haystack) -> push haystack with the
-; first occurrence of needle removed (needle left empty by callers when the
-; entry was not found).
-Function RemoveEntry
-  Pop $R6
-  Pop $R7
-  StrLen $R0 $R6
-  StrLen $R1 $R7
-  StrCpy $R2 0
-  StrCpy $R8 ""
-  StrCpy $R9 0
-  ${DoWhile} $R2 <= $R1
-    StrCpy $R3 $R7 $R0 $R2
-    ${If} $R3 == $R6
-      StrCpy $R8 $R7 $R2
-      IntOp $R5 $R2 + $R0
-      StrCpy $R5 $R7 "" $R5
-      StrCpy $R8 "$R8$R5"
-      StrCpy $R9 1
-      ${Break}
-    ${EndIf}
-    IntOp $R2 $R2 + 1
-  ${Loop}
-  ${If} $R9 == 0
-    StrCpy $R8 $R7
-  ${EndIf}
-  Push $R8
-FunctionEnd
-
+!else
 Function un.RemoveEntry
   Pop $R6
   Pop $R7
@@ -142,3 +102,5 @@ Function un.RemoveEntry
   ${EndIf}
   Push $R8
 FunctionEnd
+
+!endif
