@@ -6,6 +6,7 @@
 !include "LogicLib.nsh"
 !include "StrFunc.nsh"
 ${StrStr}
+${Using:StrFunc} UnStrStr
 
 Var XiheCliDir
 
@@ -30,7 +31,7 @@ Var XiheCliDir
   StrCpy $XiheCliDir "$INSTDIR\bin\xihe"
   ReadRegStr $0 HKCU "Environment" "Path"
   ${If} $0 != ""
-    ${StrStr} $1 $0 "$XiheCliDir;"
+    ${UnStrStr} $1 $0 "$XiheCliDir;"
     ${If} $1 != ""
       StrLen $2 "$XiheCliDir;"
       StrLen $3 $1
