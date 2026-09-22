@@ -58,6 +58,7 @@ rm -rf dist/cli build/pyinstaller build/xihe.spec
   --exclude-module modelscope \
   --exclude-module pytest \
   --hidden-import RestrictedPython \
+  --hidden-import olefile \
   --collect-all playwright \
   --collect-submodules tools \
   --add-data "$ROOT/src/core/kbs_templates:core/kbs_templates" \

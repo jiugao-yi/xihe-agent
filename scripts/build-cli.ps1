@@ -54,6 +54,7 @@ Remove-Item -Recurse -Force dist\cli, build\pyinstaller, build\xihe.spec -ErrorA
   --exclude-module modelscope `
   --exclude-module pytest `
   --hidden-import RestrictedPython `
+  --hidden-import olefile `
   --collect-all playwright `
   --collect-submodules tools `
   --add-data "$Root\src\core\kbs_templates;core\kbs_templates" `
