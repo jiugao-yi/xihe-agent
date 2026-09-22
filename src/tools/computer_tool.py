@@ -269,6 +269,9 @@ def _diff_vs_previous(cur: "Image.Image", grid_size: tuple):
 
 
 def _computer_screenshot(args: dict, **kw) -> str:
+    """Pure capture: screen → PNG path + coordinate grid + diff. Reading the
+    image is the agent's own call (its vision/OCR tools, its prompt) — this
+    tool never spends LLM tokens."""
     global _last_shot
     region = args.get("region")
     if region is not None and (not isinstance(region, (list, tuple)) or len(region) != 4):
@@ -299,19 +302,11 @@ def _computer_screenshot(args: dict, **kw) -> str:
         except OSError as e:
             return tool_error(f"capture succeeded but writing the PNG failed: {e}")
 
-    description = None
-    if args.get("describe"):
-        from tools.vision_tools import describe_image_sync
-        description = describe_image_sync(str(path), args.get("prompt"))
-        if description == "(vision not available)":
-            description = None
     return tool_result(
         success=True, path=str(path),
         width=img.width, height=img.height,
         screen_size=grid_size, scale=scale,
-        diff=diff, description=description,
-        hint=("vision not configured — use image_ocr to read text from the image"
-              if args.get("describe") and description is None else None),
+        diff=diff,
     )
 
 
@@ -1252,8 +1247,8 @@ registry.register(
                 "default 1920). Returns the saved path, screen_size — the "
                 "coordinate grid computer_click uses — scale (saved-image px "
                 "per grid px), and a diff vs the previous shot to verify what "
-                "changed. describe=true adds a vision caption (needs "
-                "vision_model; otherwise use image_ocr)."
+                "changed. To READ the image, call your own vision/OCR tool on "
+                "the returned path."
             ),
             "parameters": {
                 "type": "object",
@@ -1262,10 +1257,6 @@ registry.register(
                                "description": "Optional [x, y, width, height] in screen coordinates"},
                     "max_width": {"type": "integer",
                                   "description": "Downscale cap in pixels (default 1920)"},
-                    "describe": {"type": "boolean",
-                                 "description": "Also run vision analysis on the capture (default false)"},
-                    "prompt": {"type": "string",
-                               "description": "Vision prompt when describe=true"},
                 },
             },
         },

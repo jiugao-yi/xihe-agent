@@ -23,13 +23,15 @@ def _sid(db, chat="c1"):
 def _rows(db, sid):
     """All persisted columns in row order — the ground truth for equivalence."""
     return db._execute(
-        "SELECT role, content, tool_calls, tool_call_id, reasoning, usage "
-        "FROM messages WHERE session_id = ? ORDER BY id", (sid,)).fetchall()
+        "SELECT m.role, m.content, m.tool_calls, m.tool_call_id, "
+        "mt.reasoning, mt.usage "
+        "FROM messages m LEFT JOIN message_meta mt ON mt.message_id = m.id "
+        "WHERE m.session_id = ? ORDER BY m.ord", (sid,)).fetchall()
 
 
 def _ids(db, sid):
     return [r[0] for r in db._execute(
-        "SELECT id FROM messages WHERE session_id = ? ORDER BY id",
+        "SELECT id FROM messages WHERE session_id = ? ORDER BY ord",
         (sid,)).fetchall()]
 
 
@@ -135,13 +137,14 @@ def test_truncate_then_rewrite_is_consistent():
     """truncate_messages_from invalidates the cache; the next rewrite must
     not assume stale prefix knowledge."""
     db = _mk_db()
+    key = db.build_key(SessionSource(platform="serve", chat_id="c1"))
     sid = _sid(db)
     msgs = _turn(2)
     db.rewrite_messages(sid, msgs)
     ids = _ids(db, sid)
 
     cut = ids[len(ids) // 2]
-    db.truncate_messages_from(sid, cut)
+    db.truncate_messages_from(key, sid, cut)
 
     tail = msgs[: len(ids) // 2]
     db.rewrite_messages(sid, tail)

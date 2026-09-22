@@ -10,9 +10,9 @@ tags:
   - desktop
   - claude
   - transport
-status: active
+status: deprecated
 created: 2026-08-12
-updated: 2026-08-12
+updated: 2026-09-14
 related_pages:
   - wiki/changes/0027_desktop-claude-longlived-rewrite.md
   - wiki/insights/0026_desktop-agent-model-built-in-xihe.md
@@ -25,6 +25,8 @@ sources:
 ---
 
 # 桌面端 claude 接入架构（长驻 stream-json STDIO 传输层）
+
+> ⚠️ **已过时（2026-09-14）**：本页描述的桌面端 ClaudeRunner（`desktop/src/main/claude.ts`、`claude:send/interrupt/dispose/event` IPC、长驻 stream-json 子进程）**已整体删除**。桌面端收敛为单 agent——唯一引擎是 main 托管的 `xihe serve`；claude/codex 经 **xihe 内核的 `external_agent` 工具**（[[0040_external-agent-adapter-protocol]]，`core/services/external_agent.py`）访问，不再作为桌面并列引擎。变更记录见 [[0047_desktop-single-agent-collapse]]。本页保留为历史架构参考（其中 spawn 硬化、NDJSON 协议分析对理解 claude CLI 仍有参考价值），**不再反映当前代码**。
 
 ## 摘要
 

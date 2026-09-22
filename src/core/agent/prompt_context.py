@@ -178,7 +178,7 @@ def _load_cursorrules(cwd: Path) -> str:
 
 
 def load_project_context(
-    cwd: str = None,
+    cwd: Optional[str] = None,
     include_claude_md: bool = True,
     include_cursorrules: bool = True,
 ) -> str:

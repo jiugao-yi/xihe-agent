@@ -68,6 +68,10 @@ class Emitter:
         self._pending: dict = {}
         self._last_flush = 0.0
         self._flusher = None
+        # model tool_call_id → args-ring id: lets the tool_result frame echo
+        # the tool_call frame's id for exact client-side pairing. Per-turn
+        # Emitter, so the map dies with the turn (no unbounded growth).
+        self._call_ring: dict[str, int] = {}
 
     def on_delta(self, text, **kw) -> None:
         # ``text is None`` is the agent's segment-boundary sentinel (fired before
@@ -124,10 +128,15 @@ class Emitter:
             event.setdefault("turn_id", self._turn_id)
             self._q.put(event)
 
-    def on_tool_start(self, name: str, args: str, by: str = None) -> None:
+    def on_tool_start(self, name: str, args: str, by: str = None,
+                      tool_call_id: str = None) -> None:
         # `args` arrives FULL from the agent — slice for the wire, ring the
-        # full copy for GET /toolargs (desktop fetches on expand).
+        # full copy for GET /toolargs (desktop fetches on expand). The ring
+        # id rides both the tool_call and its tool_result frame so the desktop
+        # pairs them exactly — parallel same-name tools don't cross-match.
         i = put_tool_args(name, args)
+        if tool_call_id:
+            self._call_ring[tool_call_id] = i
         event = {"type": "tool_call", "conv_id": self._conv_id,
                  "name": name, "args": args[:_WS_ARGS_LIMIT], "id": i}
         if by:
@@ -135,10 +144,10 @@ class Emitter:
         self._emit(event)
 
     def on_tool_result(self, name: str, result: str, elapsed: float,
-                       by: str = None) -> None:
+                       by: str = None, tool_call_id: str = None) -> None:
         # Carries the tool's actual output (truncated), not the input summary.
-        # The desktop pairs this with the matching `running` tool_call by name
-        # to flip it to done and render the result card.
+        # `id` echoes the tool_call frame's ring id — the desktop pairs on it
+        # exactly (parallel same-name tools don't cross-match).
         text = result if isinstance(result, str) else str(result)
         if len(text) > _WS_RESULT_LIMIT:
             text = text[:_WS_RESULT_LIMIT]
@@ -148,6 +157,9 @@ class Emitter:
         event = {"type": "tool_result", "conv_id": self._conv_id,
                  "name": name, "result": text,
                  "elapsed": round(float(elapsed), 3), "truncated": truncated}
+        ring_id = self._call_ring.pop(tool_call_id, None) if tool_call_id else None
+        if ring_id is not None:
+            event["id"] = ring_id
         if by:
             event["by"] = by
         self._emit(event)
@@ -169,6 +181,18 @@ class Emitter:
         self._emit({"type": "approval_resolved", "conv_id": self._conv_id,
                     "id": info.get("id"), "approved": bool(approved),
                     "reason": reason})
+
+    def on_clarify_request(self, info: dict) -> None:
+        self._emit({"type": "clarify_request", "conv_id": self._conv_id,
+                    "id": info.get("id"), "question": info.get("question"),
+                    "options": info.get("options") or []})
+
+    def on_clarify_result(self, info: dict) -> None:
+        # {id, status, answer} — the desktop settles its card; status
+        # "answered" carries the user's answer text.
+        self._emit({"type": "clarify_resolved", "conv_id": self._conv_id,
+                    "id": info.get("id"), "status": info.get("status"),
+                    "answer": info.get("answer")})
 
     def finish(self) -> None:
         with self._lock:

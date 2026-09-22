@@ -10,6 +10,9 @@ const desktop = {
   notify: (title: string, body: string): Promise<boolean> =>
     ipcRenderer.invoke('desktop:notify', title, body),
   openDirectory: (): Promise<string | null> => ipcRenderer.invoke('dialog:openDirectory'),
+  openFiles: (): Promise<string[]> => ipcRenderer.invoke('dialog:openFiles'),
+  readAttachment: (path: string): Promise<ArrayBuffer | null> =>
+    ipcRenderer.invoke('fs:readAttachment', path),
   listDir: (path: string) => ipcRenderer.invoke('fs:listDir', path),
   readFile: (path: string) => ipcRenderer.invoke('fs:readFile', path),
   writeFile: (path: string, content: string) => ipcRenderer.invoke('fs:writeFile', path, content),
@@ -38,28 +41,21 @@ const desktop = {
   gitStatus: (workdir: string) => ipcRenderer.invoke('git:status', workdir),
   // HEAD text of one file — the base for editor gutter change marks.
   gitHeadFile: (path: string) => ipcRenderer.invoke('git:headFile', path),
-  // Run panel — one-shot local command exec in the workspace, output streamed
-  // back via onRunEvent; history is persisted per workdir in main.
-  runStart: (command: string, cwd: string) => ipcRenderer.invoke('run:start', command, cwd),
-  runStop: (cwd: string): Promise<boolean> => ipcRenderer.invoke('run:stop', cwd),
-  runHistory: () => ipcRenderer.invoke('run:history'),
-  onRunEvent: (cb: (ev: unknown) => void): (() => void) => {
+  // Shell panel — multi-instance local terminals in main (ConPTY). Attach
+  // returns the session's replay snapshot; live chunks/exit arrive via
+  // onTermEvent. Sessions survive panel close.
+  termCreate: (cwd: string | undefined, cols: number, rows: number) =>
+    ipcRenderer.invoke('term:create', cwd, cols, rows),
+  termAttach: (id: number) => ipcRenderer.invoke('term:attach', id),
+  termInput: (id: number, data: string) => ipcRenderer.invoke('term:input', id, data),
+  termResize: (id: number, cols: number, rows: number) =>
+    ipcRenderer.invoke('term:resize', id, cols, rows),
+  termKill: (id: number): Promise<boolean> => ipcRenderer.invoke('term:kill', id),
+  termList: () => ipcRenderer.invoke('term:list'),
+  onTermEvent: (cb: (ev: unknown) => void): (() => void) => {
     const handler = (_e: unknown, ev: unknown) => cb(ev)
-    ipcRenderer.on('run:event', handler)
-    return () => ipcRenderer.removeListener('run:event', handler)
-  },
-  // Local terminal (ConPTY shell owned by main, survives panel close).
-  localPtyAttach: (cwd: string | undefined, cols: number, rows: number) =>
-    ipcRenderer.invoke('localPty:attach', cwd, cols, rows),
-  localPtyInput: (data: string) => ipcRenderer.invoke('localPty:input', data),
-  localPtyResize: (cols: number, rows: number) =>
-    ipcRenderer.invoke('localPty:resize', cols, rows),
-  localPtyDetach: (): Promise<boolean> => ipcRenderer.invoke('localPty:detach'),
-  localPtyKill: (): Promise<boolean> => ipcRenderer.invoke('localPty:kill'),
-  onLocalPtyEvent: (cb: (ev: unknown) => void): (() => void) => {
-    const handler = (_e: unknown, ev: unknown) => cb(ev)
-    ipcRenderer.on('localPty:event', handler)
-    return () => ipcRenderer.removeListener('localPty:event', handler)
+    ipcRenderer.on('term:event', handler)
+    return () => ipcRenderer.removeListener('term:event', handler)
   },
   // Browser panel — the placeholder rect (CSS px, content-area coords) drives
   // the Win32 snap in main + serve; null un-tracks ('float' releases the

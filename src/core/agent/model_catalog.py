@@ -34,6 +34,7 @@ _TABLE: list[tuple[str, int]] = [
     ("glm-4.5v", 64_000),
     ("glm-4.6", 200_000),
     ("glm-4.5", 128_000),
+    ("glm-5", 200_000),
     ("glm-", 128_000),
     # Volcano Ark
     ("doubao-seed-1-6", 256_000),

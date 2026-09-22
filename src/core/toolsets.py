@@ -21,7 +21,7 @@ TOOLSETS = {
         "tools": ["todo", "model_info", "skills_list", "skill_view",
                   "memory", "kbs_search", "kbs_status",
                   "read_file", "search_files", "directory_tree",
-                  "run_sandbox_code"],
+                  "run_sandbox_code", "clarify"],
     },
     "web": {
         "label": "网页与搜索",
@@ -76,13 +76,18 @@ TOOLSETS = {
     },
     "communication": {
         "label": "消息通知",
-        "description": "跨平台发消息/发图、向用户澄清提问",
-        "tools": ["send_message", "send_image", "clarify"],
+        "description": "跨平台发消息/发图/发文件、向用户澄清提问",
+        "tools": ["send_message", "send_image", "send_file", "clarify"],
+    },
+    "office": {
+        "label": "办公文档",
+        "description": "Excel/Word 文件生成与读取（离线，交付物落地）",
+        "tools": ["office"],
     },
     "media": {
         "label": "图像与语音",
-        "description": "视觉分析、OCR、图像生成、语音合成",
-        "tools": ["vision_analyze", "image_ocr", "image_generate", "text_to_speech"],
+        "description": "视觉分析、OCR、图像生成、确定性渲染出图、语音合成",
+        "tools": ["vision_analyze", "image_ocr", "image_generate", "image_render", "text_to_speech"],
     },
     "agent": {
         "label": "委派",
@@ -171,7 +176,7 @@ _logger = _logging.getLogger(__name__)
 # Conditional toolsets: expanded on demand via the request_tools meta tool.
 CONDITIONAL_TOOLSETS = {
     "web":       "browser automation (navigate/click/type on web pages), website login (SSO), screenshots, web search, recording web operations into a skill",
-    "media":     "image analysis (vision), OCR (text from images), text-to-speech (voice synthesis)",
+    "media":     "image analysis (vision), OCR (text from images), deterministic image rendering (data charts / mermaid / HTML / markdown → PNG; gateway delivery via send_image), text-to-speech (voice synthesis)",
     "scheduler": "cron jobs, scheduled/recurring tasks, timers",
 }
 
@@ -179,20 +184,21 @@ CONDITIONAL_TOOLSETS = {
 # roster — registry flags are the enforcement, this set is the documented
 # source of truth that tests assert against. Rationale per group:
 #   recursion:        delegate_task, run_*_agent (dynamic, not listed here)
-#   user face:        clarify, send_message, send_image
+#   user face:        clarify, send_message, send_image, send_file
 #   escalation / persistent mutation:
 #                     cronjob (cron jobs run unrestricted), skill_manage,
 #                     kbs_init, web_record, browser_record*, browser_state_delete
 #                     (shared login-state asset)
 SUBAGENT_BLOCKED_TOOLS = {
-    "delegate_task", "clarify", "send_message", "send_image",
+    "delegate_task", "clarify", "send_message", "send_image", "send_file",
     "cronjob", "skill_manage", "kbs_init",
     "web_record", "browser_record", "browser_record_start",
     "browser_record_stop", "browser_state_delete",
 }
 
 
-def normalize_toolset_names(names, *, where: str = "", warnings: list = None):
+def normalize_toolset_names(names: Optional[list], *, where: str = "",
+                            warnings: Optional[list[str]] = None) -> Optional[list[str]]:
     """Validate a toolset-name list (main agent config and agents/*.yaml alike).
 
     Returns None for a list containing "*" (= every toolset, bypasses name
@@ -217,7 +223,9 @@ def normalize_toolset_names(names, *, where: str = "", warnings: list = None):
     return out
 
 
-def resolve_roster(spec: dict, *, where: str = "", warnings: list = None):
+def resolve_roster(spec: dict, *, where: str = "",
+                   warnings: Optional[list[str]] = None
+                   ) -> tuple[Optional[list[str]], Optional[list[str]]]:
     """toolsets + skills from one spec mapping — shared by the main agent
     (config.yaml top-level keys) and specialists (agents/<slug>.yaml), which
     use the same key names and the same semantics:

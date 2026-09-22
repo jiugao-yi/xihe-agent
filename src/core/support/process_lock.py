@@ -14,6 +14,8 @@ Zero-dependency by charter: importable at module level from anywhere
 import os
 import time
 from pathlib import Path
+from types import TracebackType
+from typing import IO, Optional, Type, Union
 
 
 class CrossProcessLock:
@@ -29,11 +31,11 @@ class CrossProcessLock:
     the timeout — Windows byte-range locks do not stack.
     """
 
-    def __init__(self, path, timeout: float = 10.0, poll: float = 0.05):
+    def __init__(self, path: Union[str, Path], timeout: float = 10.0, poll: float = 0.05):
         self._path = Path(path)
         self._timeout = timeout
         self._poll = poll
-        self._fh = None
+        self._fh: Optional[IO] = None
 
     def acquire(self) -> "CrossProcessLock":
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,26 +71,27 @@ class CrossProcessLock:
     def __enter__(self) -> "CrossProcessLock":
         return self.acquire()
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type: Optional[Type[BaseException]],
+                 exc: Optional[BaseException],
+                 tb: Optional[TracebackType]) -> None:
         self.release()
-        return False
 
     @staticmethod
-    def _try_lock(fh):
+    def _try_lock(fh: IO) -> None:
         if os.name == "nt":
             import msvcrt
             fh.seek(0)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]  # POSIX only
 
     @staticmethod
-    def _try_unlock(fh):
+    def _try_unlock(fh: IO) -> None:
         if os.name == "nt":
             import msvcrt
             fh.seek(0)
             msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
-            fcntl.flock(fh, fcntl.LOCK_UN)
+            fcntl.flock(fh, fcntl.LOCK_UN)  # type: ignore[attr-defined]  # POSIX only

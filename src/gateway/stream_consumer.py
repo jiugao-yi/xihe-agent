@@ -174,7 +174,8 @@ class StreamConsumer:
             self._feed.append(f"💭 {_gist(self._pending_gist)}")
         self._pending_gist = ""
 
-    def on_tool_start(self, name: str, args_summary: str, by: str = None) -> None:
+    def on_tool_start(self, name: str, args_summary: str, by: str = None,
+                      tool_call_id: str = None) -> None:
         self._flush_gist()
         if not self._content_sent:
             self._open_process_frame()
@@ -182,7 +183,7 @@ class StreamConsumer:
             self._feed.append(f"{tag}{_tool_emoji(name)} {name}({_arg_gist(args_summary)})")
 
     def on_tool_result(self, name: str, result: str, elapsed: float,
-                       by: str = None) -> None:
+                       by: str = None, tool_call_id: str = None) -> None:
         if not self._content_sent:
             self._open_process_frame()
             self._feed.append(f"✅ {_result_gist(result)}")

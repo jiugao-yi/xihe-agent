@@ -9,6 +9,8 @@
 desktop/node_modules/
 desktop/out/
 desktop/dist/
+# 各环境镜像割裂(公网 npmmirror vs 内网 wnpm),lockfile 无法跨环境共享,各自本地生成
+desktop/package-lock.json
 
 # --- misc ---
 *.log
@@ -29,3 +31,5 @@ __pycache__/
 /dist/
 /desktop/release/
 /desktop/resources/bin/
+/desktop/resources/config.example.yaml
+/xihe-agent.iml

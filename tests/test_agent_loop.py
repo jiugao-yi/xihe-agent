@@ -220,7 +220,7 @@ def test_persistent_empties_escalate_to_compressed_retry_then_warning(make_agent
 
 
 def test_reshape_history_hides_internal_nudges():
-    from gateway.serve.chat import _reshape_history
+    from gateway.serve.conversations import _reshape_history
 
     rows = [
         {"id": 1, "role": "user", "content": "go"},
@@ -235,7 +235,7 @@ def test_reshape_history_hides_internal_nudges():
 
 
 def test_reshape_history_marks_severed_turns_incomplete():
-    from gateway.serve.chat import _reshape_history
+    from gateway.serve.conversations import _reshape_history
 
     # Turn severed mid-loop (interrupt, or the serve process killed itself):
     # trailing tool round-trip, no final plain-text row.

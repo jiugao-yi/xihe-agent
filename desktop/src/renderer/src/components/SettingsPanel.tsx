@@ -17,8 +17,8 @@ import {
   Zap,
 } from 'lucide-react'
 import { useStore } from '../appStore'
-import type { Agent } from '../appStore'
 import { cn } from '../lib/cn'
+import { Markdown } from './Markdown'
 import { desktop, type XiheConfigPatch, type ThemeMode } from '../lib/desktop'
 import {
   cronAction,
@@ -85,7 +85,7 @@ interface CfgForm {
  *  apply, so there's no per-field auto-save like Halo — the commit is explicit.
  *  Instance resources (MCP/skills/cron) are process-level, pulled read-only
  *  from serve via loadManageData. */
-export function SettingsPanel({ agent, onBack }: { agent: Agent; onBack: () => void }) {
+export function SettingsPanel({ onBack }: { onBack: () => void }) {
   const serveConnected = useStore((s) => s.serveConnected)
   const xiheStatus = useStore((s) => s.xiheStatus)
   const cronJobs = useStore((s) => s.cronJobs)
@@ -593,7 +593,11 @@ function CronCard() {
   const schedulerHealth = useStore((s) => s.schedulerHealth)
   const loadManageData = useStore((s) => s.loadManageData)
   const [expanded, setExpanded] = useState<string | null>(null)
-  const [busy, setBusy] = useState(false)
+  // 按 job_id 记录操作中，避免一个任务的操作禁用所有行的按钮
+  const [busyIds, setBusyIds] = useState<Set<string>>(new Set())
+  // 行内操作失败提示（serve 返回 error），几秒后自动消失
+  const [actionError, setActionError] = useState<string | null>(null)
+  const errTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // 点击"立即运行"后短暂显示 ✓，给用户确认反馈（无状态条）
   const [ranOk, setRanOk] = useState<string | null>(null)
   const ranTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -601,10 +605,13 @@ function CronCard() {
   const refreshTimers = useRef<ReturnType<typeof setTimeout>[]>([])
   // 展开行时拉取的最近运行记录（组件级：展开区渲染在 map 内部）
   const [runs, setRuns] = useState<CronRunInfo[]>([])
+  // 点开的某次运行全文（Markdown 渲染），null = 收起
+  const [openRun, setOpenRun] = useState<string | null>(null)
   useEffect(() => {
     if (!expanded) return
     let stale = false
     setRuns([])
+    setOpenRun(null)
     void listCronRuns(expanded, 5).then((r) => {
       if (!stale) setRuns(r)
     })
@@ -615,9 +622,10 @@ function CronCard() {
   useEffect(
     () => () => {
       if (ranTimer.current) clearTimeout(ranTimer.current)
+      if (errTimer.current) clearTimeout(errTimer.current)
       refreshTimers.current.forEach(clearTimeout)
     },
-    []
+    [],
   )
 
   const fmt = (iso: string | null | undefined) => {
@@ -625,17 +633,26 @@ function CronCard() {
     return iso.slice(2, 16).replace('T', ' ')
   }
 
-  const act = async (fn: () => Promise<{ ok: boolean; error?: string }>) => {
-    setBusy(true)
+  const act = async (jobId: string, fn: () => Promise<{ ok: boolean; error?: string }>) => {
+    setBusyIds((s) => new Set(s).add(jobId))
     const r = await fn()
-    setBusy(false)
-    if (!r?.ok) return false
+    setBusyIds((s) => {
+      const next = new Set(s)
+      next.delete(jobId)
+      return next
+    })
+    if (!r?.ok) {
+      if (errTimer.current) clearTimeout(errTimer.current)
+      setActionError(r?.error || '操作失败')
+      errTimer.current = setTimeout(() => setActionError(null), 5000)
+      return false
+    }
     await loadManageData()
     return true
   }
 
   const run = (j: CronJobInfo) =>
-    void act(() => cronAction(j.job_id, 'run')).then((ok) => {
+    void act(j.job_id, () => cronAction(j.job_id, 'run')).then((ok) => {
       if (!ok) return
       setRanOk(j.job_id)
       if (ranTimer.current) clearTimeout(ranTimer.current)
@@ -647,10 +664,10 @@ function CronCard() {
       )
     })
   const toggle = (j: CronJobInfo) =>
-    void act(() => cronAction(j.job_id, j.enabled ? 'pause' : 'resume'))
+    void act(j.job_id, () => cronAction(j.job_id, j.enabled ? 'pause' : 'resume'))
   const remove = async (j: CronJobInfo) => {
     if (!window.confirm(`删除定时任务「${j.name || j.job_id}」？`)) return
-    if (await act(() => deleteCron(j.job_id))) {
+    if (await act(j.job_id, () => deleteCron(j.job_id))) {
       if (expanded === j.job_id) setExpanded(null)
       await loadManageData()
     }
@@ -684,6 +701,11 @@ function CronCard() {
         <Empty>还没有定时任务。在对话里让 agent 建一个即可（如"每天早上 9 点提醒我站会"）。</Empty>
       ) : (
         <div className="space-y-1">
+          {actionError && (
+            <div className="rounded-md border border-danger/40 bg-danger/10 px-3 py-1.5 text-[11px] text-danger">
+              {actionError}
+            </div>
+          )}
           {/* 防御性去重：serve 数据层无重复（已验证），但React的key碰撞
               在极端时序下可能渲染出幽灵行——按job_id去重保证UI永不重复 */}
           {cronJobs
@@ -739,7 +761,7 @@ function CronCard() {
                 <span className="flex shrink-0 gap-0.5">
                   <button
                     onClick={() => void run(j)}
-                    disabled={busy}
+                    disabled={busyIds.has(j.job_id)}
                     title="立即运行一次"
                     className={cn(
                       'rounded p-1 transition hover:bg-elevated disabled:opacity-30',
@@ -750,7 +772,7 @@ function CronCard() {
                   </button>
                   <button
                     onClick={() => void toggle(j)}
-                    disabled={busy}
+                    disabled={busyIds.has(j.job_id)}
                     title={j.enabled ? '暂停（不再触发）' : '恢复'}
                     className="rounded p-1 text-ink-4 transition hover:bg-elevated hover:text-warning disabled:opacity-30"
                   >
@@ -758,7 +780,7 @@ function CronCard() {
                   </button>
                   <button
                     onClick={() => void remove(j)}
-                    disabled={busy}
+                    disabled={busyIds.has(j.job_id)}
                     title="删除"
                     className="rounded p-1 text-ink-4 transition hover:bg-elevated hover:text-danger disabled:opacity-30"
                   >
@@ -791,16 +813,28 @@ function CronCard() {
                     {runs.length === 0 ? (
                       <div className="text-ink-4">暂无运行记录</div>
                     ) : (
-                      runs.map((r) => (
-                        <div
-                          key={r.run_at}
-                          title={r.content}
-                          className="truncate text-ink-3"
-                        >
-                          {fmt(r.run_at)}{' '}
-                          {(r.content.split('\n').find((l) => l.trim()) ?? '').slice(0, 100)}
-                        </div>
-                      ))
+                      runs.map((r) => {
+                        const isOpen = openRun === r.run_at
+                        return (
+                          <div key={r.run_at}>
+                            <button
+                              onClick={() => setOpenRun(isOpen ? null : r.run_at)}
+                              className={cn(
+                                'w-full truncate text-left transition hover:text-ink-1',
+                                isOpen ? 'text-ink-1' : 'text-ink-3'
+                              )}
+                            >
+                              {fmt(r.run_at)}{' '}
+                              {(r.content.split('\n').find((l) => l.trim()) ?? '').slice(0, 100)}
+                            </button>
+                            {isOpen && (
+                              <div className="mt-1 max-h-64 overflow-auto rounded-md border border-line bg-panel/60 px-3 py-2">
+                                <Markdown content={r.content} />
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })
                     )}
                   </div>
                 </div>

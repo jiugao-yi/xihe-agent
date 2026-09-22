@@ -14,7 +14,7 @@ tags:
   - transport
 status: active
 created: 2026-08-26
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0028_desktop-claude-transport-architecture.md
   - wiki/concepts/0029_desktop-dual-engine-architecture.md
@@ -30,7 +30,7 @@ sources:
 
 ## 摘要
 
-xihe 把本地 `claude` / `codex` CLI 当作**可委派的外部 agent 引擎**接入（`run_external_agent` 工具 → `src/core/services/external_agent.py`）。两引擎的 headless 协议同构——子进程 + NDJSON 事件流 + 会话 id 冷 resume + 基于 cwd + env 注入凭据 + 杀进程中断——因此**一个适配层共载两个引擎**，差异收敛为**两种生命周期策略**：`ClaudeDriver` WARM（一会话一长驻进程 + stdin 跨轮喂消息）与 `CodexDriver` ONE-SHOT（每轮新进程 + `exec resume <thread_id>`）。双引擎均实测通过（claude 2026-08-12 / codex 2026-08-26，后者在内部 litellm 网关 + Responses API 环境）。与 [[0028_desktop-claude-transport-architecture]] 组成「外部 agent 接入协议」双页：本页是 **xihe 内核侧**的协议对照与驱动架构，0028 是**桌面端** claude 传输层细节。
+xihe 把本地 `claude` / `codex` CLI 当作**可委派的外部 agent 引擎**接入（`external_agent` 工具 → `src/core/services/external_agent.py`；订正 2026-09-14：注册工具名是 **`external_agent`**，非 run_external_agent）。两引擎的 headless 协议同构——子进程 + NDJSON 事件流 + 会话 id 冷 resume + 基于 cwd + env 注入凭据 + 杀进程中断——因此**一个适配层共载两个引擎**，差异收敛为**两种生命周期策略**：`ClaudeDriver` WARM（一会话一长驻进程 + stdin 跨轮喂消息）与 `CodexDriver` ONE-SHOT（每轮新进程 + `exec resume <thread_id>`）。双引擎均实测通过（claude 2026-08-12 / codex 2026-08-26，后者在内部 litellm 网关 + Responses API 环境）。（订正：原「与 [[0028_desktop-claude-transport-architecture]] 组双页」——0028 所述**桌面端** ClaudeRunner 已删除，本页现在是外部 agent 接入的唯一现行参考页。）
 
 ## 核心要点
 
@@ -46,7 +46,8 @@ xihe 把本地 `claude` / `codex` CLI 当作**可委派的外部 agent 引擎**�
 ExternalAgentDriver（接口）
 └─ _SweptDriver（首跑触发孤儿清扫）
    ├─ ClaudeDriver  —— WARM：一会话一长驻进程，stdin 跨轮喂 NDJSON user 帧；
-   │                   冷路径 --resume；45s 就绪门 + 10min 空闲回收（桌面侧，见 0028）
+   │                   冷路径 --resume；45s 就绪门 + 10min 空闲回收（driver 内建：external_agent.py 的 READY_TIMEOUT_S/IDLE_TTL_S——订正 2026-09-14，桌面侧 runner 已删）
+   │                   codex argv 另含 -c model_max_output_tokens=<n>（external_agents.codex.max_tokens>0 时，插在 provider -c 与 extra_args 之间）
    └─ CodexDriver   —— ONE-SHOT：每轮 spawn，prompt 写 stdin 后立即 close（EOF=boot 门）；
                        轮末 kill_tree + 摘 PID，不留跨轮进程；无 idle/ready 状态机
 ```

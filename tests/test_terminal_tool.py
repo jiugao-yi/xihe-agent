@@ -66,7 +66,7 @@ def test_run_mirrors_to_conv_channel(monkeypatch):
 
     assert data["exit_code"] == 0
     streamed, _ = ch.read_from(before)
-    assert "agent $ echo hi" in streamed
+    assert "—— $ echo hi" in streamed
     assert "hello" in streamed
     assert "exit 0" in streamed
     snap = ch.snapshot()

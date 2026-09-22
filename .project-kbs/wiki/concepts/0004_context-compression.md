@@ -11,7 +11,7 @@ tags:
   - core
 status: active
 created: 2026-07-01
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/entities/0001_xihe-agent.md
 sources:
@@ -23,11 +23,11 @@ sources:
 
 ## 摘要
 
-当对话 token 接近模型上下文窗口阈值时，`ContextCompressor`（`core/agent/compressor.py`）自动压缩历史，释放空间。核心是 4 步算法：裁剪旧 tool 结果 → 三段划分 → LLM 摘要中段 → 拼装并修复孤立 tool 对。摘要走 AuxiliaryClient（可用更便宜模型）。`core/agent/agent.py` 的 `_chat_step` 每次调用前用 `should_compress` 判断。
+当对话 token 接近模型上下文窗口阈值时，`ContextCompressor`（`core/agent/compressor.py`）自动压缩历史，释放空间。核心是 4 步算法：裁剪旧 tool 结果 → 三段划分 → LLM 摘要中段 → 拼装并修复孤立 tool 对。摘要走 AuxiliaryClient（可用更便宜模型）。判断在 `agent.chat()` 入口与循环体内（`_should_compress`）——**优先用上一次 API 调用返回的真实 token 用量**，冷启动或处于阈值 ≥80% 灰区时才回落字符估算；压缩开始会以 reasoning delta 形式通知客户端（`_notify_compressing`）。
 
 ## 核心要点
 
-- **触发**: 估算 token ≥ `context_length × compression_threshold`（默认 0.50，见 `config.yaml`）。例: 128k × 0.5 = 64k。
+- **触发**: token ≥ `context_length × compression_threshold`（代码默认 0.50，模板 `config.example.yaml` 推荐 0.30）。例: 128k × 0.5 = 64k。摘要按 `session_key` 分桶存 `_summaries`（FIFO 32）——一个共享 compressor 不会把不同会话的摘要串线。
 - **Step 1 裁剪旧 tool 结果**: 远处（>200 字符）tool 输出替换为占位符，**保护最近 20 条**。tool 输出通常最长，先裁以减少后续摘要成本。
 - **Step 2 三段划分**:
   - head（前 3 条: system prompt + 首轮）— 始终保留
@@ -35,7 +35,7 @@ sources:
   - middle — 被摘要替换
 - **Step 3 LLM 摘要 middle**: 首次用结构化模板（Goal / Progress / Key Decisions / Relevant Files / Next Steps）；增量更新时把上次摘要 + 新 turns 喂回，要求保留具体 file paths / commands / errors。目标 ~2000 tokens。
 - **Step 4 拼装 + 修复**: `[head] + [摘要消息] + [tail]`。摘要消息 role 按前后 role 选择避免连续同 role；`_sanitize_tool_pairs` 补无 result 的 tool_call stub、删无 call 的 tool result。
-- **token 估算**: `Σ(len(content)/4 + 10) + Σ tool_call.arguments/4`（4 字符≈1 token，每条 +10 开销），粗估不做精确 tiktoken。
+- **token 估算**: CJK 感知——中文字符≈1 token/字、ASCII≈4 字符/token（`_text_tokens`）+ 每条 +10 开销，粗估不做精确 tiktoken。
 - **压缩后重建 system prompt**: 见 CLAUDE.md——压缩后系统提示会重建（memory snapshot 更新），不是原样保留。
 
 ## 适用场景

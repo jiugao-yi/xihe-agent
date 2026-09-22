@@ -38,7 +38,7 @@ export function EditorArea({ className }: { className?: string }) {
   const fsVersion = useStore((s) => s.fsVersion)
   const setActiveTab = useStore((s) => s.setActiveTab)
   const closeTab = useStore((s) => s.closeTab)
-  const openRunPanel = useStore((s) => s.openRunPanel)
+  const openShellPanel = useStore((s) => s.openShellPanel)
 
   const [files, setFiles] = useState<Record<string, Content>>({})
   const [drafts, setDrafts] = useState<Record<string, string>>({})
@@ -213,8 +213,8 @@ export function EditorArea({ className }: { className?: string }) {
         })}
         {activeRunCmd != null && (
           <button
-            onClick={() => openRunPanel(activeRunCmd)}
-            title="在运行面板中执行（按扩展名猜的命令，可修改）"
+            onClick={() => openShellPanel(activeRunCmd)}
+            title="在终端中运行（按扩展名猜的命令，可在终端里交互）"
             className="ml-auto flex shrink-0 items-center gap-1 self-center rounded-md px-2 py-1 text-xs text-ink-3 transition hover:bg-elevated hover:text-ink"
           >
             <Play className="h-3 w-3" /> 运行

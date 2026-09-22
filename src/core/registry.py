@@ -17,7 +17,7 @@ at module level from anywhere.
 import json
 import logging
 import threading
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 from core.support.approvals import evaluate, remember_rule
 from core.support.paths import resolve_path
@@ -35,11 +35,15 @@ class ToolEntry:
         "subagent_blocked", "path_params",
     )
 
-    def __init__(self, name, toolset, schema, handler, check_fn,
-                 requires_env, is_async, description,
-                 max_result_size_chars=None, read_only=False,
-                 description_modifier=None, subagent_blocked=False,
-                 path_params=()):
+    def __init__(self, name: str, toolset: str, schema: dict,
+                 handler: Callable, check_fn: Optional[Callable],
+                 requires_env: Optional[list], is_async: bool,
+                 description: str,
+                 max_result_size_chars: int | float | None = None,
+                 read_only: bool = False,
+                 description_modifier: Optional[Callable[[str, set], str]] = None,
+                 subagent_blocked: bool = False,
+                 path_params: Iterable[str] = ()) -> None:
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -82,15 +86,15 @@ class ToolRegistry:
         handler: Callable,
         check_fn: Optional[Callable] = None,
         toolset: str = "default",
-        requires_env: list = None,
+        requires_env: Optional[list[str]] = None,
         is_async: bool = False,
         description: str = "",
         max_result_size_chars: int | float | None = None,
         read_only: bool = False,
         description_modifier: Optional[Callable[[str, set], str]] = None,
         subagent_blocked: bool = False,
-        path_params=(),
-    ):
+        path_params: Iterable[str] = (),
+    ) -> None:
         """Register a tool.  Called at module-import time by each tool file.
 
         Args:
@@ -202,9 +206,9 @@ class ToolRegistry:
                     except (ImportError, Exception):
                         pass
                     # Also include tools directly in that toolset in the registry
-                    for entry in self._tools.values():
-                        if entry.toolset == ts:
-                            resolved_tool_names.add(entry.name)
+                    for tool_entry in self._tools.values():
+                        if tool_entry.toolset == ts:
+                            resolved_tool_names.add(tool_entry.name)
 
             # Phase 1: determine which tools are available
             check_results: Dict[Callable, bool] = {}
@@ -212,7 +216,7 @@ class ToolRegistry:
             tool_names = names if names is not None else set(self._tools.keys())
 
             for name in sorted(tool_names):
-                entry = self._tools.get(name)
+                entry: Optional[ToolEntry] = self._tools.get(name)
                 if not entry:
                     continue
                 if subagent and entry.subagent_blocked:
@@ -236,7 +240,7 @@ class ToolRegistry:
             # Phase 2: build schemas with dynamic descriptions
             from core.config import expand_agent_vars
 
-            def _expand_strs(obj):
+            def _expand_strs(obj: object) -> object:
                 """Recursively expand ${AGENT_HOME} in all schema strings (top-level
                 description AND nested parameter descriptions) so they reference the
                 actual data root."""
@@ -252,13 +256,13 @@ class ToolRegistry:
             for entry in available_entries:
                 schema = entry.schema
                 if "function" in schema:
-                    func = {**schema["function"], "name": entry.name}
+                    func: dict = {**schema["function"], "name": entry.name}
                     # Apply description modifier if present
                     if entry.description_modifier:
                         base_desc = func.get("description", entry.description)
                         func["description"] = entry.description_modifier(base_desc, available_names)
                     # Expand ${AGENT_HOME} everywhere in the schema (top-level + nested)
-                    func = _expand_strs(func)
+                    func = _expand_strs(func)  # type: ignore[assignment]
                     result.append({"type": "function", "function": func})
                 else:
                     result.append({**schema, "name": entry.name})
@@ -269,7 +273,8 @@ class ToolRegistry:
 
     _PW_THREAD_ERROR = "cannot switch to a different thread"
 
-    def dispatch(self, name: str, arguments: str, context: dict = None, **kwargs) -> str:
+    def dispatch(self, name: str, arguments: str,
+                 context: Optional[dict] = None, **kwargs: object) -> str:
         """Execute a tool handler by name, return JSON string result.
 
         * Handlers receive ``(args, **kw)`` — context/kwargs flow through
@@ -296,7 +301,11 @@ class ToolRegistry:
             # 危险操作审批门（唯一汇聚点）。无 parent_agent（cron no_agent
             # 脚本、测试直调）= 用户直接驱动，跳过。deny 规则命中即拒——
             # 不等用户、不弹窗；"ask" 批准且 always 时把该调用记入会话记忆。
+            # 审批经过的调用（ask→批准/拒绝/超时，deny）把决议内嵌进返回的
+            # result JSON：随 role='tool' 行持久化，trace 展开可见（刷新后
+            # 审批痕迹不丢）。
             _ag = kw.get("parent_agent")
+            _approval_record: dict | None = None
             if _ag is not None:
                 _sk = getattr(_ag, "_approval_shared", {}).get("session_key")
                 _decision, _summary = evaluate(
@@ -306,19 +315,28 @@ class ToolRegistry:
                     return tool_error(
                         f"操作被审批策略拒绝（{_summary}），未执行。不得改用其他工具或"
                         f"命令实现相同效果；如确需调整，请向用户说明，由用户修改审批配置。",
-                        blocked=True, approval=_summary,
+                        blocked=True,
+                        approval_record={"decision": "denied", "summary": _summary,
+                                         "reason": "deny 规则命中"},
                     )
                 if _decision == "ask":
                     # Raw args (capped) ride along so desktop approval cards can
                     # show a diff before the write lands.
-                    _approved, _why, _always = _ag.request_approval(
+                    _approved, _why, _always = _ag.request_approval(  # type: ignore[attr-defined]  # duck-typed parent_agent
                         name, _summary, args=(arguments or "")[:65536])
+                    _approval_record = {
+                        "decision": "approved" if _approved else "rejected",
+                        "summary": _summary,
+                        "reason": _why,
+                        **({"always": True} if _always else {}),
+                    }
                     if not _approved:
                         return tool_error(
                             f"操作未获批准（{_why}），未执行。这是用户的否决：不得改用任何"
                             f"其他工具或命令（terminal、patch、重定向等）实现相同效果。"
                             f"如确有必要，请向用户说明理由，等用户明确批准后再执行。",
-                            blocked=True, approval=_summary,
+                            blocked=True,
+                            approval_record=_approval_record,
                         )
                     if _always:
                         remember_rule(_sk, name, args,
@@ -346,6 +364,16 @@ class ToolRegistry:
                 result = entry.handler(args, **kw)
             if not isinstance(result, str):
                 result = json.dumps(result, ensure_ascii=False)
+            # 批准后执行成功：把审批决议补进 result JSON（持久化随 role='tool'
+            # 行；trace 端点提取后桌面上渲染审批徽章）。
+            if _approval_record is not None and not result.startswith('{"error"'):
+                try:
+                    _data = json.loads(result)
+                    if isinstance(_data, dict):
+                        _data["approval_record"] = _approval_record
+                        result = json.dumps(_data, ensure_ascii=False)
+                except ValueError:
+                    pass
 
             # Do NOT call _full_restart() here — it would touch Playwright from
             # the dispatch (agent) thread and reintroduce the cross-thread bug.
@@ -444,7 +472,7 @@ class ToolRegistry:
                     toolsets[ts]["requirements"].append(env)
         return toolsets
 
-    def check_tool_availability(self, quiet: bool = False):
+    def check_tool_availability(self, quiet: bool = False) -> tuple[list, list[dict]]:
         """Return (available_toolsets, unavailable_info)."""
         available = []
         unavailable = []
@@ -470,7 +498,7 @@ class ToolRegistry:
 registry = ToolRegistry()
 
 
-def tool_error(message, **extra) -> str:
+def tool_error(message: str, **extra: object) -> str:
     """Return a JSON error string for tool handlers.
 
     >>> tool_error("file not found")
@@ -478,13 +506,13 @@ def tool_error(message, **extra) -> str:
     >>> tool_error("bad input", path="/foo")
     '{"error": "bad input", "path": "/foo"}'
     """
-    result = {"error": str(message)}
+    result: dict[str, object] = {"error": str(message)}
     if extra:
         result.update(extra)
     return json.dumps(result, ensure_ascii=False)
 
 
-def tool_result(data=None, **kwargs) -> str:
+def tool_result(data: Optional[dict] = None, **kwargs: object) -> str:
     """Return a JSON result string for tool handlers.
 
     Accepts a dict positional arg *or* keyword arguments (not both):
@@ -499,7 +527,7 @@ def tool_result(data=None, **kwargs) -> str:
     return json.dumps(kwargs, ensure_ascii=False)
 
 
-def _run_async(coro, timeout: float = 60.0):
+def _run_async(coro: Any, timeout: float = 60.0) -> Any:
     """Run an async coroutine from sync context."""
     import asyncio
 

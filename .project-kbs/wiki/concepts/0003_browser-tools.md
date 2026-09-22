@@ -11,7 +11,7 @@ tags:
   - playwright
 status: active
 created: 2026-07-01
-updated: 2026-07-03
+updated: 2026-09-14
 related_pages:
   - wiki/entities/0001_xihe-agent.md
   - wiki/concepts/0002_tool-registry-and-dispatch.md
@@ -45,7 +45,10 @@ sources:
   3. **StorageState 导入导出**: `browser_state_save/load`（JSON，`~/.xihe-agent/browser/states/`），显式快照，辅助手段。
 - **`browser_logout`**: 按域名清 cookies+localStorage（含 SSO 父域）；`wipe_profile=true` 删 cdp/profile 做彻底重置。
 - **`browser_connect`**: 手动接管用户自己起的外部 CDP 浏览器（高级用法，URL 用 `127.0.0.1` 非 localhost）。
-- **降级**: 无 Playwright 时 `browser_navigate` 降级为 httpx 抓取（只读无交互）——即「agent 没有浏览器工具」症状的根因（`check_fn` 门控）。
+- ~~**降级**: 无 Playwright 时 `browser_navigate` 降级为 httpx 抓取~~（订正 2026-09-14：**无 httpx 回落**——无 Playwright 时 `_check_browser()` 为假，`check_fn` 门控把整个 `browser_*` 家族从 schema 里隐藏，即「agent 没有浏览器工具」的根因；httpx 抓取是独立的 `web_tools.py` 的事）。
+- **浏览器工作线程**: 所有 Playwright 调用经 `_run_on_browser_thread` 串行化到专用线程（单操作 120s 超时），解 sync-API 的 greenlet 线程亲和问题（本页「sync-API 约束」节的现行机制；不在事件回调里调 `page.*` 的纪律仍成立）。
+- **录制工具**: `browser_record` / `browser_record_start` / `browser_record_stop`——把网页操作录成 skill（`tools/web_record_tool.py`）。
+- **CDP 端口可配**: `browser.cdp_port`（默认 9222）。serve 侧另有桌面吸附面板端点（`/browser/status|launch|snap|hide|show|release|appearance|restart`，见 [[0024_desktop-serve-protocol]]）。
 - **环境约束**: 本部署内网无公网，用系统 Chrome/Edge，**不**依赖 `playwright install chromium`。
 
 ## 适用场景

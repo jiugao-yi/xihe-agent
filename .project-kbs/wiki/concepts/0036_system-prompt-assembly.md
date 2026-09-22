@@ -14,7 +14,7 @@ tags:
   - prompt
 status: active
 created: 2026-08-19
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0034_three-layer-agent-roster.md
   - wiki/concepts/0032_specialist-agents.md
@@ -46,7 +46,7 @@ related_pages:
 XiheAgent.chat()  (每轮)
   └─ _build_system_prompt(platform, session_key)
        ├─ available_tools = registry.get_schemas(toolsets=enabled ∪ expansion, subagent=is_subagent) 的工具名集合
-       ├─ 主 agent 专属：kbs_preamble（kbs.enabled）+ agent_roster（specialists.enabled，按 available_tools 过滤）
+       ├─ 主 agent 专属：kbs_preamble（kbs.enabled）+ agent_roster（有任一 run_*_agent 在面——bundled 专家不受 specialists.enabled 闸控，按 available_tools 过滤）
        └─ build_system_prompt(...)          ← core/agent/prompts.py
             ├─ PromptCtx(tools, platform, skills_allowed, cwd, identity_override,
             │            agent_roster, kbs_preamble, kbs_read_note, load_claude_md,
@@ -75,7 +75,7 @@ XiheAgent.chat()  (每轮)
 | Tool guidance | `_memory_guidance` | Memory 节（读/写两行合并单头） | memory 或 memory_manage 在面 |
 | | session_search | 会话续接提示 | session_search 在面 |
 | | delegate_task | 委派指导 | delegate_task 在面 |
-| | agent_roster | 专家花名册 + 路由阶梯 | 仅主 agent 且 specialists.enabled 且 run_*_agent 实际在面 |
+| | agent_roster | 专家花名册 + 路由阶梯 | 仅主 agent 且 run_*_agent 实际在面（bundled 专家不受 specialists.enabled 闸控，见 [[0032]]；PromptCtx 另有 `language` 字段驱动思考/回复语言） |
 | | external_agent | 外部引擎(claude)指导 | external_agent 在面 |
 | | browser_login | 浏览器登录流 | browser_login 在面 |
 | | cronjob | 定时任务指导 | cronjob 在面 |
@@ -94,7 +94,7 @@ XiheAgent.chat()  (每轮)
 
 - **platform 层**：入口平台决定（cli/wecom/feishu/…）。
 - **kbs preamble**：`kbs.enabled` 时整篇精简协议进 prompt（`load_kbs_preamble` 每次现读 `kbs_protocol.md`——**改 .md 无需重启**）。
-- **roster 层**：specialists.enabled 时列出各 `run_<slug>_agent` + 路由阶梯，且按 `available_tools` 过滤——花名册永不宣传该 agent 调不到的专家。
+- **roster 层**：列出各实际可调的 `run_<slug>_agent` + 路由阶梯，且按 `available_tools` 过滤——花名册永不宣传该 agent 调不到的专家（bundled 专家不受 `specialists.enabled` 闸控，闸关时花名册仍列 bundled）。
 - **记忆快照**：每轮在 `chat()` 的 **API 边界**把召回记忆 append 到 system message（`<memory-context>` 块），**不进 prompt 文本、不落库**——落库的 user message 必须是用户字面输入，且 prompt 文本保持稳定利于前缀缓存。
 
 名单来自 config.yaml 顶层 `toolsets`/`skills`（[[0034]]）；project_context/cwd/`session.load_claude_md`/`load_cursorrules` 均按主配置。

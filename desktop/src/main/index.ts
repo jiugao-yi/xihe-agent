@@ -1,32 +1,40 @@
-import { app, shell, BrowserWindow, dialog, ipcMain, nativeTheme, Notification } from 'electron'
+import { app, shell, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, net, protocol } from 'electron'
 import { join, isAbsolute, dirname, basename, relative } from 'path'
+import { pathToFileURL } from 'url'
 import { existsSync, promises as fs } from 'fs'
 import { ServeSupervisor, serveLogPath, type XiheStatus, type XiheStatusState } from './serve'
 import { BrowserPanelController } from './browserPanel'
 import { readXiheConfig, writeXiheConfig, type XiheConfigPatch } from './xiheConfig'
 import { gitStatus, gitHeadFile } from './git'
 import {
-  startRun,
-  stopRun,
-  stopAllRuns,
-  setRunPusher,
-  loadRunHistory,
-  addRunHistory,
-} from './run'
-import {
-  attachLocalPty,
-  detachLocalPty,
-  writeLocalPty,
-  resizeLocalPty,
-  killLocalPty,
-  setLocalPtyPusher,
-} from './localPty'
+  createTerminal,
+  attachTerminal,
+  writeTerminal,
+  resizeTerminal,
+  killTerminal,
+  listTerminals,
+  killAllTerminals,
+  setTermPusher,
+} from './terminals'
 import { desktopDataDir } from './dataDir'
 
 // 单实例锁：双击两次（或残留进程 + 新开）会起两个桌面端、两个 serve 抢
 // 127.0.0.1:7788 —— 后到者 bind 失败 (winerror 10048)。拿不到锁的实例直接
 // 退出；second-instance 事件里聚焦已存在的窗口。必须在 whenReady 之前申请。
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
+
+// xfile:// serves LOCAL IMAGE FILES to the renderer (rendered charts from
+// image_render turns, browser screenshots…). A privileged custom scheme is
+// the only way that works from BOTH origins the renderer runs on (http dev
+// server and file:// build) — plain file:// subresources are blocked from
+// http pages. URLs carry a dummy host (`xfile://local/`) + one percent-
+// encoded path segment (see lib/localImage.ts): standard schemes reject
+// empty hosts, and a raw drive letter would be misparsed as the host.
+// Must be registered before app ready; images only.
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'xfile', privileges: { standard: true, secure: true, supportFetchAPI: false, stream: true } },
+])
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|ico)$/i
 if (!gotSingleInstanceLock) {
   app.exit(0)
 }
@@ -395,51 +403,38 @@ function registerIpc(): void {
     return gitHeadFile(path)
   })
 
-  // --- Run panel (one-shot local exec) + local terminal pty ------------------
-  // Both push events through main's window; pushers run at emit time so a
+  // --- Shell panel (multi-instance local terminals) --------------------------
+  // Events push through main's window; the pusher runs at emit time so a
   // recreated window (dev reload) still receives them.
   const pushToWin = (channel: string, payload: unknown): void => {
     const wc = mainWin?.webContents
     if (wc && !wc.isDestroyed()) wc.send(channel, payload)
   }
-  setRunPusher((ev) => pushToWin('run:event', ev))
-  setLocalPtyPusher((ev) => pushToWin('localPty:event', ev))
+  setTermPusher((ev) => pushToWin('term:event', ev))
 
-  ipcMain.handle('run:start', (_e, command: unknown, cwd: unknown) => {
-    if (typeof command !== 'string' || !command.trim() || typeof cwd !== 'string') {
-      return { ok: false }
-    }
-    void addRunHistory(cwd, command.trim())
-    return { ok: true, id: startRun(command.trim(), cwd) }
-  })
-  ipcMain.handle('run:stop', (_e, cwd: unknown) =>
-    typeof cwd === 'string' ? stopRun(cwd) : false
-  )
-  ipcMain.handle('run:history', () => loadRunHistory())
-
-  ipcMain.handle('localPty:attach', (_e, cwd: unknown, cols: unknown, rows: unknown) => {
-    return attachLocalPty(
+  ipcMain.handle('term:create', (_e, cwd: unknown, cols: unknown, rows: unknown) => {
+    return createTerminal(
       typeof cwd === 'string' && cwd ? cwd : undefined,
       typeof cols === 'number' ? cols : 100,
       typeof rows === 'number' ? rows : 30
     )
   })
-  ipcMain.handle('localPty:input', (_e, data: unknown) => {
-    if (typeof data === 'string') writeLocalPty(data)
+  ipcMain.handle('term:attach', (_e, id: unknown) =>
+    typeof id === 'number' ? attachTerminal(id) : { ok: false, reason: 'bad id' }
+  )
+  ipcMain.handle('term:input', (_e, id: unknown, data: unknown) => {
+    if (typeof id === 'number' && typeof data === 'string') writeTerminal(id, data)
     return true
   })
-  ipcMain.handle('localPty:resize', (_e, cols: unknown, rows: unknown) => {
-    if (typeof cols === 'number' && typeof rows === 'number') resizeLocalPty(cols, rows)
+  ipcMain.handle('term:resize', (_e, id: unknown, cols: unknown, rows: unknown) => {
+    if (typeof id === 'number' && typeof cols === 'number' && typeof rows === 'number')
+      resizeTerminal(id, cols, rows)
     return true
   })
-  ipcMain.handle('localPty:detach', () => {
-    detachLocalPty()
-    return true
-  })
-  ipcMain.handle('localPty:kill', () => {
-    killLocalPty()
-    return true
-  })
+  ipcMain.handle('term:kill', (_e, id: unknown) =>
+    typeof id === 'number' ? killTerminal(id) : false
+  )
+  ipcMain.handle('term:list', () => listTerminals())
 
   // Browser panel: renderer reports the placeholder rect (CSS px, relative to
   // the content area) or null to un-track. All Win32 work is in serve; main
@@ -463,6 +458,31 @@ function registerIpc(): void {
     })
     if (res.canceled || res.filePaths.length === 0) return null
     return res.filePaths[0]
+  })
+
+  // 附件选择（聊天上传）。返回原始路径列表——真正的上传走 serve HTTP
+  // （渲染层 fetch multipart），不在这里读文件。
+  ipcMain.handle('dialog:openFiles', async () => {
+    const res = await dialog.showOpenDialog({
+      title: '选择要发送的文件',
+      properties: ['openFile', 'multiSelections'],
+    })
+    if (res.canceled) return []
+    return res.filePaths
+  })
+
+  // 附件上传的内容读取：任意类型（含二进制），上限与 serve 的
+  // /upload 一致（50MB）。渲染层拿到 ArrayBuffer 后经 FormData 上传。
+  ipcMain.handle('fs:readAttachment', async (_e, filePath: unknown) => {
+    if (typeof filePath !== 'string' || !isAbsolute(filePath)) return null
+    try {
+      const stat = await fs.stat(filePath)
+      if (!stat.isFile() || stat.size > 50 * 1024 * 1024) return null
+      const buf = await fs.readFile(filePath)
+      return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)
+    } catch {
+      return null
+    }
   })
 
   // Returns the absolute child `path` ready-made: the renderer cannot import
@@ -676,6 +696,16 @@ app.whenReady().then(async () => {
   registerIpc()
   createWindow() // hidden — revealed by maybeShowMain when serve is ready
 
+  // xfile:///<percent-encoded absolute path> → the local file (images only).
+  // The renderer encodes the whole path as one segment — a raw drive letter
+  // (`C:`) would otherwise be swallowed as the URL host.
+  protocol.handle('xfile', (req) => {
+    const path = decodeURIComponent(new URL(req.url).pathname).replace(/^\//, '')
+    if (!IMAGE_EXT.test(path))
+      return new Response('images only', { status: 403 })
+    return net.fetch(pathToFileURL(path).toString())
+  })
+
   browserPanel = new BrowserPanelController({
     getBaseUrl: () => supervisor?.baseUrl() ?? 'http://127.0.0.1:7788',
     getWin: () => mainWin,
@@ -728,9 +758,8 @@ app.whenReady().then(async () => {
 app.on('before-quit', () => {
   browserPanel?.release()
   supervisor?.stop()
-  // Owned child processes (run panel + local pty) must not outlive the app.
-  stopAllRuns()
-  killLocalPty()
+  // Owned shell sessions must not outlive the app.
+  killAllTerminals()
 })
 
 app.on('window-all-closed', () => {

@@ -16,7 +16,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from core.config import AGENT_HOME
 
@@ -47,11 +47,11 @@ class SessionSource:
     """
     platform: str
     chat_id: str
-    chat_name: str = None
+    chat_name: Optional[str] = None
     chat_type: str = "dm"      # "dm", "group", "channel", "thread"
-    user_id: str = None
-    user_name: str = None
-    thread_id: str = None      # Sub-topic (Telegram topics, Discord threads, etc.)
+    user_id: Optional[str] = None
+    user_name: Optional[str] = None
+    thread_id: Optional[str] = None  # Sub-topic (Telegram topics, Discord threads, etc.)
 
     def to_dict(self) -> dict:
         return {
@@ -134,11 +134,12 @@ def build_session_key(
 @dataclass
 class ResetPolicy:
     """Determines when a session should auto-reset."""
-    mode: str = "idle"           # "idle", "daily", "both", "none"
+    mode: str = "none"           # "idle", "daily", "both", "none"
     idle_minutes: int = 1440     # 24 hours
     daily_reset_hour: int = 4    # 4 AM local time
 
-    def should_reset(self, updated_at: datetime, now: datetime = None) -> Optional[str]:
+    def should_reset(self, updated_at: datetime,
+                     now: Optional[datetime] = None) -> Optional[str]:
         """Check if a session should be reset.
 
         Returns the reset reason ("idle" or "daily") if reset is needed, or None.
@@ -167,12 +168,13 @@ class ResetPolicy:
         return None
 
 
-def load_reset_policy(config: dict, platform: str = None, chat_type: str = None) -> ResetPolicy:
+def load_reset_policy(config: dict, platform: Optional[str] = None,
+                      chat_type: Optional[str] = None) -> ResetPolicy:
     """Load reset policy from config, with per-platform overrides.
 
     Config structure (in config.yaml):
         session:
-          default_reset: idle
+          default_reset: none
           idle_minutes: 1440
           daily_reset_hour: 4
           platforms:
@@ -185,13 +187,13 @@ def load_reset_policy(config: dict, platform: str = None, chat_type: str = None)
         platform_cfg = session_cfg.get("platforms", {}).get(platform, {}) or {}
         if platform_cfg:
             return ResetPolicy(
-                mode=platform_cfg.get("reset", session_cfg.get("default_reset", "idle")),
+                mode=platform_cfg.get("reset", session_cfg.get("default_reset", "none")),
                 idle_minutes=platform_cfg.get("idle_minutes", session_cfg.get("idle_minutes", 1440)),
                 daily_reset_hour=platform_cfg.get("daily_reset_hour", session_cfg.get("daily_reset_hour", 4)),
             )
 
     return ResetPolicy(
-        mode=session_cfg.get("default_reset", "idle"),
+        mode=session_cfg.get("default_reset", "none"),
         idle_minutes=session_cfg.get("idle_minutes", 1440),
         daily_reset_hour=session_cfg.get("daily_reset_hour", 4),
     )
@@ -246,16 +248,18 @@ _PERSIST_CACHE_LIMIT = 64
 
 
 def _persist_row_key(msg: dict) -> int:
-    """Hash of exactly the columns rewrite_messages persists for one message.
+    """Hash of exactly the model-facing columns rewrite_messages persists for
+    one message.
 
     Mirrors the INSERT column list — any field not in this tuple changing
     wouldn't be persisted anyway, any field in it changing must force a
     rewrite of that row (agent.py mutates the last tool-result dict in place
-    for budget nudges, so identity checks are not enough).
+    for budget nudges, so identity checks are not enough). Meta payloads
+    (``_reasoning``/``_usage``/``_attachments``/``_approval``) are excluded:
+    they live in message_meta, written once at row creation, never diffed.
     """
     content = msg.get("content")
     tc = msg.get("tool_calls")
-    us = msg.get("_usage")
     return hash((
         msg.get("role"),
         # str/None bind to sqlite directly; anything else would fail the INSERT
@@ -263,15 +267,40 @@ def _persist_row_key(msg: dict) -> int:
         content if isinstance(content, (str, bytes, type(None))) else repr(content),
         json.dumps(tc, ensure_ascii=False) if tc else None,
         msg.get("tool_call_id"),
-        msg.get("_reasoning"),
-        json.dumps(us, ensure_ascii=False) if us else None,
     ))
+
+
+def _strip_approval(content: str) -> tuple[str, dict | None]:
+    """从 tool 结果 JSON 中剥离审批痕迹，返回 (净 content, 决议 record)。
+
+    两条来源统一成 record：dispatch 的 ``approval_record``（完整判决）与
+    legacy ``approval`` 摘要字符串（早期拒绝路径，补 decision=rejected）。
+    无审批痕迹时原样返回 (content, None)。必须在 INSERT 之前调用——先洗
+    再插一次写对；INSERT 触发器已把 content 写进 FTS，落库后再 UPDATE 洗净
+    会让 FTS 留脏值且行数对账发现不了（索引与数据不一致）。
+    """
+    if "approval_record" not in content and '"approval"' not in content:
+        return content, None
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return content, None
+    if not isinstance(data, dict):
+        return content, None
+    rec = data.get("approval_record")
+    if not isinstance(rec, dict):
+        summary = data.get("approval")
+        rec = {"decision": "rejected", "summary": summary} \
+            if isinstance(summary, str) else None
+    data.pop("approval_record", None)
+    data.pop("approval", None)
+    return json.dumps(data, ensure_ascii=False), rec
 
 
 class SessionDB:
     """SQLite session store — metadata + message transcripts."""
 
-    def __init__(self, config: dict = None):
+    def __init__(self, config: Optional[dict] = None):
         self._config = config or {}
         self._db_lock = threading.RLock()
         self._conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
@@ -305,21 +334,63 @@ class SessionDB:
         """)
         self._execute("""
             CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
+                id TEXT PRIMARY KEY,    -- uuid4 hex (stable anchor for message_meta)
+                session_id TEXT NOT NULL,  -- round tag: which context generation wrote
+                                           -- this row (NOT a FK — past rounds have no
+                                           -- sessions row; agent context loads by it)
+                role TEXT NOT NULL,     -- user | assistant | tool (model-facing only —
+                                        -- system is rebuilt per turn, never persisted)
                 content TEXT,
                 tool_calls TEXT,
                 tool_call_id TEXT,
-                reasoning TEXT,         -- persisted model reasoning (思考), display-only
-                usage TEXT,             -- per-turn token usage (JSON), on the turn's final assistant row
+                ord INTEGER NOT NULL,   -- row order WITHIN a conversation (monotonic
+                                        -- across reset rounds); uuid ids are unordered
+                                        -- and created_at ties within one rewrite, so
+                                        -- this is the only sort anchor
                 created_at TEXT,
-                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+                session_key TEXT        -- owning conversation (the real relationship;
+                                        -- transcript/delete/truncate/search scope by it)
+            )
+        """)
+        # Application-side annotations, 1:1 with a message row (the split line:
+        # a field belongs here iff the model's context loses nothing without it).
+        self._execute("""
+            CREATE TABLE IF NOT EXISTS message_meta (
+                message_id TEXT PRIMARY KEY,  -- FK → messages.id (uuid, rewrite-stable)
+                reasoning TEXT,         -- model thinking snapshot (assistant), display-only
+                usage TEXT,             -- per-turn token usage (JSON), turn's final assistant row
+                attachments TEXT,       -- user-message attachment metadata (JSON array);
+                                        -- `content` stays the user's literal input — the
+                                        -- attachment hint block is API-boundary-injected
+                                        -- (agent._prepare_api_messages), never persisted
+                approval TEXT,          -- approval verdict JSON (tool rows that passed the
+                                        -- gate); stripped from content at persist time
+                FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
             )
         """)
         self._execute("""
             CREATE INDEX IF NOT EXISTS idx_messages_session
             ON messages(session_id)
+        """)
+        self._execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_order
+            ON messages(session_key, ord)
+        """)
+        self._execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_conv
+            ON messages(session_key)
+        """)
+        self._execute("""
+            CREATE TABLE IF NOT EXISTS reset_marks (
+                session_id TEXT PRIMARY KEY,   -- the round a reset CREATED
+                session_key TEXT NOT NULL,
+                reason TEXT,                   -- 'manual' | 'idle' | 'daily'
+                created_at TEXT
+            )
+        """)
+        self._execute("""
+            CREATE INDEX IF NOT EXISTS idx_reset_marks_key
+            ON reset_marks(session_key)
         """)
 
         self._init_fts()
@@ -334,7 +405,7 @@ class SessionDB:
         self._persisted: dict[str, list[int]] = {}
         self._load_entries()
 
-    def _execute(self, sql, params=()):
+    def _execute(self, sql: str, params: Sequence = ()) -> sqlite3.Cursor:
         """Thread-safe execute — serializes all DB ops with a lock.
         Required because delegate_task spawns parallel subagents that share
         the same SessionDB/connection. Without this, concurrent execute()
@@ -342,18 +413,24 @@ class SessionDB:
         with self._db_lock:
             return self._conn.execute(sql, params)
 
-    def _commit(self):
+    def _commit(self) -> None:
         with self._db_lock:
             self._conn.commit()
 
-    def _init_fts(self):
-        """Create FTS5 virtual table and triggers for auto-sync."""
+    def _init_fts(self) -> None:
+        """Create FTS5 virtual table and triggers for auto-sync.
+
+        Content-table flavor (message_id UNINDEXED + content column), NOT the
+        external-content mode the pre-uuid schema used: external content keys
+        the index by rowid, and a TEXT uuid primary key is not a rowid alias —
+        inserting a uuid into messages_fts(rowid, ...) fails with a datatype
+        mismatch. Triggers copy the content in/out explicitly instead.
+        """
         try:
             self._execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-                    content,
-                    content='messages',
-                    content_rowid='id'
+                    message_id UNINDEXED,
+                    content
                 )
             """)
         except sqlite3.OperationalError:
@@ -366,45 +443,39 @@ class SessionDB:
             self._execute("""
                 CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages
                 BEGIN
-                    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+                    INSERT INTO messages_fts(message_id, content)
+                    VALUES (new.id, new.content);
                 END
             """)
             self._execute("""
                 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages
                 BEGIN
-                    INSERT INTO messages_fts(messages_fts, rowid, content)
-                    VALUES ('delete', old.id, old.content);
-                END
-            """)
-            self._execute("""
-                CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages
-                BEGIN
-                    INSERT INTO messages_fts(messages_fts, rowid, content)
-                    VALUES ('delete', old.id, old.content);
-                    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+                    DELETE FROM messages_fts WHERE message_id = old.id;
                 END
             """)
         except sqlite3.OperationalError:
             pass
 
         # Rebuild only when the index is out of sync with the table: a full
-        # 'rebuild' re-tokenizes every message (measured ~7s at 23K rows) and
-        # this runs on every process start, while the count check costs
-        # ~0.1s. The insert/delete triggers keep the counts honest through
-        # normal operation (they are transactional with the rows), so a
-        # mismatch means drift that only a rebuild fixes — typically the
-        # first start after FTS was introduced to an existing db.
+        # re-tokenize of every message (~7s at 23K rows) would run on every
+        # process start otherwise, while the count check costs ~0.1s. The
+        # insert/delete triggers keep the counts honest through normal
+        # operation (they are transactional with the rows), so a mismatch
+        # means drift that only a rebuild fixes.
         try:
             msg_n = self._execute("SELECT count(*) FROM messages").fetchone()[0]
             fts_n = self._execute("SELECT count(*) FROM messages_fts").fetchone()[0]
             if msg_n != fts_n:
-                self._execute("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
+                self._execute("DELETE FROM messages_fts")
+                self._execute(
+                    "INSERT INTO messages_fts(message_id, content) "
+                    "SELECT id, content FROM messages")
         except Exception:
             # a broken FTS index silently disables session search
             logger.warning("FTS rebuild failed — session search degraded",
                            exc_info=True)
 
-    def _load_entries(self):
+    def _load_entries(self) -> None:
         """Load all session entries from SQLite into memory cache."""
         rows = self._execute(
             "SELECT session_key, session_id, platform, chat_id, user_id, "
@@ -432,14 +503,24 @@ class SessionDB:
                 auto_reset_reason=reset_reason,
             )
 
-    def _save_entry(self, entry: SessionEntry):
-        """Persist a SessionEntry to SQLite."""
+    def _save_entry(self, entry: SessionEntry) -> None:
+        """Persist a SessionEntry to SQLite.
+
+        On conflict (reset creating a new round under the same key) only the
+        round-scoped columns change — title/model belong to the conversation,
+        not the round, and INSERT OR REPLACE here used to wipe them on every
+        reset.
+        """
         origin_json = json.dumps(entry.origin.to_dict(), ensure_ascii=False) if entry.origin else None
         self._execute(
-            "INSERT OR REPLACE INTO sessions "
+            "INSERT INTO sessions "
             "(session_key, session_id, platform, chat_id, user_id, chat_type, "
             "origin, was_auto_reset, auto_reset_reason, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_key) DO UPDATE SET "
+            "session_id=excluded.session_id, updated_at=excluded.updated_at, "
+            "was_auto_reset=excluded.was_auto_reset, "
+            "auto_reset_reason=excluded.auto_reset_reason",
             (
                 entry.session_key, entry.session_id,
                 entry.origin.platform if entry.origin else None,
@@ -453,6 +534,14 @@ class SessionDB:
             ),
         )
         self._commit()
+
+    def _key_for_sid(self, session_id: str) -> Optional[str]:
+        """Reverse-lookup the owning session_key of a live session_id (message
+        writes stamp the key so the transcript survives round switches)."""
+        for key, entry in self._entries.items():
+            if entry.session_id == session_id:
+                return key
+        return None
 
     def build_key(self, source: SessionSource) -> str:
         """Build a deterministic session key from a SessionSource."""
@@ -504,10 +593,11 @@ class SessionDB:
         session_key: str,
         source: SessionSource,
         was_auto_reset: bool = False,
-        auto_reset_reason: str = None,
+        auto_reset_reason: Optional[str] = None,
     ) -> str:
         session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         now = _now()
+        prior_round = self._entries.get(session_key)
 
         entry = SessionEntry(
             session_key=session_key,
@@ -521,7 +611,39 @@ class SessionDB:
         )
         self._entries[session_key] = entry
         self._save_entry(entry)
+        if prior_round is not None:
+            # Round switch (auto or manual reset): persist why, so the
+            # transcript can label this boundary.
+            self._execute(
+                "INSERT OR REPLACE INTO reset_marks "
+                "(session_id, session_key, reason, created_at) VALUES (?, ?, ?, ?)",
+                (session_id, session_key, auto_reset_reason or "manual", now),
+            )
+            self._commit()
         return session_id
+
+    def reset_marks(self, session_key: str) -> dict[str, str]:
+        """{session_id: reason} for every reset that created a round of this
+        conversation — the per-boundary labels for transcript dividers."""
+        rows = self._execute(
+            "SELECT session_id, reason FROM reset_marks WHERE session_key = ?",
+            (session_key,),
+        ).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def pending_auto_reset(self, source: SessionSource) -> Optional[str]:
+        """The reset reason the NEXT get_or_create_session would apply, or
+        None. Lets a caller flag an incoming round switch just before it
+        happens (serve turn_start) using the same policy check instead of a
+        copy of it."""
+        entry = self._entries.get(self.build_key(source))
+        if not entry:
+            return None
+        policy = load_reset_policy(
+            self._config, platform=source.platform, chat_type=source.chat_type)
+        updated = (datetime.fromisoformat(entry.updated_at)
+                   if entry.updated_at else _now_dt())
+        return policy.should_reset(updated, _now_dt())
 
     def reset_session(self, session_key: str) -> Optional[str]:
         """Force-create a new session for this key."""
@@ -531,23 +653,27 @@ class SessionDB:
         return self._create_session(session_key, entry.origin)
 
     def delete_session(self, session_key: str) -> bool:
-        """Delete a session and its message transcript (conversation removal).
-
-        Removes the ``sessions`` row (keyed by session_key) and the messages of
-        its current ``session_id``, then drops the in-memory entry. The FTS
-        triggers on ``messages`` keep the full-text index in sync on DELETE.
-
-        Returns True if a session was found and removed. Messages orphaned by
-        earlier ``reset_session`` calls (old session_ids no longer present in
-        the table) are not swept here — they are unreferenced and benign, and a
-        reset before a delete is uncommon. (serve is the only caller today; it
-        scopes deletes to its own serve-platform conv_ids.)
+        """Delete a conversation: the ``sessions`` row and the messages of ALL
+        its rounds (keyed rows across resets). The FTS triggers on ``messages``
+        keep the full-text index in sync on DELETE; message_meta rows are
+        swept explicitly (foreign_keys is off, CASCADE would not fire).
         """
         entry = self._entries.get(session_key)
         if not entry:
             return False
         session_id = entry.session_id
-        self._execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        dead = self._execute(
+            "SELECT id FROM messages WHERE session_key = ? OR session_id = ?",
+            (session_key, session_id)).fetchall()
+        self._execute(
+            "DELETE FROM messages WHERE session_key = ? OR session_id = ?",
+            (session_key, session_id))
+        if dead:
+            ph = ",".join("?" * len(dead))
+            self._execute(
+                f"DELETE FROM message_meta WHERE message_id IN ({ph})",
+                [d[0] for d in dead])
+        self._execute("DELETE FROM reset_marks WHERE session_key = ?", (session_key,))
         self._execute("DELETE FROM sessions WHERE session_key = ?", (session_key,))
         self._commit()
         self._entries.pop(session_key, None)
@@ -565,7 +691,7 @@ class SessionDB:
         ).fetchone()
         return row[0] if row and row[0] else None
 
-    def set_session_title(self, session_id: str, title: str):
+    def set_session_title(self, session_id: str, title: str) -> None:
         self._execute(
             "UPDATE sessions SET title = ? WHERE session_id = ?",
             (title, session_id),
@@ -580,7 +706,7 @@ class SessionDB:
         ).fetchone()
         return row[0] if row and row[0] else None
 
-    def set_session_model(self, session_key: str, model: str):
+    def set_session_model(self, session_key: str, model: str) -> None:
         """Persist a per-session model override so /model switching survives
         gateway per-message agent recreation."""
         self._execute(
@@ -589,13 +715,18 @@ class SessionDB:
         )
         self._commit()
 
-    def append_message(self, session_id: str, role: str, content: str = None,
-                       tool_calls: str = None, tool_call_id: str = None):
+    def append_message(self, session_id: str, role: str,
+                       content: Optional[str] = None,
+                       tool_calls: Optional[str] = None,
+                       tool_call_id: Optional[str] = None) -> None:
+        if role == "system":  # rebuilt per turn, never persisted (rewrite_messages)
+            return
         now = _now()
         self._execute(
-            "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (session_id, role, content, tool_calls, tool_call_id, now),
+            "INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, ord, created_at, session_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex, session_id, role, content, tool_calls, tool_call_id,
+             self._next_ord(session_id), now, self._key_for_sid(session_id)),
         )
         self._execute(
             "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
@@ -603,13 +734,45 @@ class SessionDB:
         )
         self._commit()
 
-    def truncate_messages_from(self, session_id: str, from_id: int) -> int:
-        """Delete message rows id >= from_id in one session — desktop resend
-        rolls a conversation back to before a chosen user message."""
+    def _next_ord(self, session_id: str) -> int:
+        """The next in-conversation row order value (max + 1; 0 when empty).
+        Keyed by conversation, not round — reset switches session_id but the
+        transcript order must keep increasing."""
+        key = self._key_for_sid(session_id)
+        if key is None:
+            return 0
+        row = self._execute(
+            "SELECT max(ord) FROM messages WHERE session_key = ?",
+            (key,),
+        ).fetchone()
+        return 0 if row is None or row[0] is None else row[0] + 1
+
+    def truncate_messages_from(self, session_key: str, session_id: str,
+                               from_id: str) -> int:
+        """Delete the message row ``from_id`` (uuid) and everything after it —
+        conversation-wide ord order, across all reset rounds (the target user
+        row may sit in an earlier round than the current one). Meta rows go
+        with them (foreign_keys is off, CASCADE inert). Returns the number of
+        deleted rows; 0 (with a warning logged) when the target id doesn't
+        exist."""
+        dead = self._execute(
+            "SELECT id FROM messages WHERE id IN ("
+            "SELECT id FROM messages WHERE session_key = ? OR session_id = ?) "
+            "AND ord >= (SELECT ord FROM messages WHERE id = ?)",
+            (session_key, session_id, from_id),
+        ).fetchall()
+        if not dead:
+            # ord >= NULL → NULL → 静默删 0 行；打日志防"成功但没删"的
+            # 客户端（旧 int id / 已删 id / 跨会话 id）排查盲区
+            logger.warning("truncate_messages_from: target id %r not found "
+                           "(session_key=%s) — deleted nothing", from_id, session_key)
+            return 0
+        dead_ids = [d[0] for d in dead]
+        ph = ",".join("?" * len(dead_ids))
         cur = self._execute(
-            "DELETE FROM messages WHERE session_id = ? AND id >= ?",
-            (session_id, from_id),
-        )
+            f"DELETE FROM messages WHERE id IN ({ph})", dead_ids)
+        self._execute(
+            f"DELETE FROM message_meta WHERE message_id IN ({ph})", dead_ids)
         self._commit()
         # Row positions no longer match the rewrite cache — force its next
         # call onto the full-rewrite path.
@@ -619,19 +782,24 @@ class SessionDB:
     def load_messages(self, session_id: str) -> list[dict]:
         """Load all messages for a session in order.
 
-        ``reasoning``/``usage`` come back as underscore-prefixed internal keys
-        so the next turn's rewrite_messages can re-persist them — without the
-        reload, every _persist_messages call (DELETE + re-INSERT) would wipe
-        both columns for all completed turns. ``_prepare_api_messages`` strips
-        underscore keys, so the API request shape is unaffected.
+        Meta annotations (``reasoning``/``usage``/``attachments``) come back as
+        underscore-prefixed internal keys so the next turn's rewrite_messages
+        can re-persist them — without the reload, every _persist_messages call
+        (DELETE + re-INSERT) would wipe them for completed turns.
+        ``_prepare_api_messages`` strips underscore keys (after re-injecting the
+        attachment hint block), so the API request shape is unaffected.
+        ``approval`` is NOT returned — it is human-facing audit data; the model
+        never sees it (content stays pure tool output).
         """
         rows = self._execute(
-            "SELECT role, content, tool_calls, tool_call_id, reasoning, usage FROM messages "
-            "WHERE session_id = ? ORDER BY id",
+            "SELECT m.role, m.content, m.tool_calls, m.tool_call_id, "
+            "mt.reasoning, mt.usage, mt.attachments FROM messages m "
+            "LEFT JOIN message_meta mt ON mt.message_id = m.id "
+            "WHERE m.session_id = ? ORDER BY m.ord",
             (session_id,),
         ).fetchall()
         messages = []
-        for role, content, tool_calls_json, tool_call_id, reasoning, usage_json in rows:
+        for role, content, tool_calls_json, tool_call_id, reasoning, usage_json, att_json in rows:
             msg = {"role": role}
             if content is not None:
                 msg["content"] = content
@@ -649,30 +817,22 @@ class SessionDB:
                     msg["_usage"] = json.loads(usage_json)
                 except json.JSONDecodeError:
                     pass
+            if att_json:
+                try:
+                    msg["_attachments"] = json.loads(att_json)
+                except json.JSONDecodeError:
+                    pass
             if role == "assistant" and not content and not tool_calls_json:
                 continue
             messages.append(msg)
         return messages
 
-    def load_messages_with_id(self, session_id: str) -> list[dict]:
-        """Like ``load_messages``, but includes each row's stable autoincrement
-        ``id``. Used only by display paths (serve history/trace) that need a
-        stable per-message key to lazy-fetch tool-call detail.
-
-        ``load_messages`` itself MUST stay field-compatible with the OpenAI
-        message shape — ``agent.py`` rebuilds the model's conversation history
-        from it, so it cannot gain an ``id`` field (that would leak into the
-        API request). This sibling method exists so display concerns don't
-        contaminate the model-facing shape.
-        """
-        rows = self._execute(
-            "SELECT id, role, content, tool_calls, tool_call_id, reasoning, usage, created_at FROM messages "
-            "WHERE session_id = ? ORDER BY id",
-            (session_id,),
-        ).fetchall()
+    @staticmethod
+    def _rows_to_display(rows: Sequence) -> list[dict]:
         out = []
-        for mid, role, content, tool_calls_json, tool_call_id, reasoning, usage_json, created_at in rows:
-            msg = {"id": mid, "role": role}
+        for (mid, role, content, tool_calls_json, tool_call_id, reasoning,
+             usage_json, created_at, sid, att_json, approval_json) in rows:
+            msg = {"id": mid, "role": role, "session_id": sid}
             if created_at:
                 msg["created_at"] = created_at
             if content is not None:
@@ -691,27 +851,76 @@ class SessionDB:
                     msg["usage"] = json.loads(usage_json)
                 except json.JSONDecodeError:
                     pass
+            if att_json:
+                try:
+                    msg["attachments"] = json.loads(att_json)
+                except json.JSONDecodeError:
+                    pass
+            if approval_json:
+                try:
+                    msg["approval"] = json.loads(approval_json)
+                except json.JSONDecodeError:
+                    pass
             if role == "assistant" and not content and not tool_calls_json:
                 continue
             out.append(msg)
         return out
 
-    def set_last_assistant_usage(self, session_id: str, usage: dict):
-        """Write per-turn token usage onto the turn's final assistant row.
+    def load_messages_with_id(self, session_id: str) -> list[dict]:
+        """Like ``load_messages``, but includes each row's stable uuid ``id``.
+        Used only by display paths (serve history/trace) that need a stable
+        per-message key to lazy-fetch tool-call detail.
+
+        ``load_messages`` itself MUST stay field-compatible with the OpenAI
+        message shape — ``agent.py`` rebuilds the model's conversation history
+        from it, so it cannot gain an ``id`` field (that would leak into the
+        API request). This sibling method exists so display concerns don't
+        contaminate the model-facing shape.
+        """
+        rows = self._execute(
+            "SELECT m.id, m.role, m.content, m.tool_calls, m.tool_call_id, "
+            "mt.reasoning, mt.usage, m.created_at, m.session_id, mt.attachments, mt.approval "
+            "FROM messages m LEFT JOIN message_meta mt ON mt.message_id = m.id "
+            "WHERE m.session_id = ? ORDER BY m.ord",
+            (session_id,),
+        ).fetchall()
+        return self._rows_to_display(rows)
+
+    def load_transcript(self, session_key: str) -> list[dict]:
+        """A conversation's display rows across ALL reset rounds, in row order
+        (``ord``). The transcript view is per-conversation; the agent context
+        stays per-round (load_messages on the current session_id)."""
+        rows = self._execute(
+            "SELECT m.id, m.role, m.content, m.tool_calls, m.tool_call_id, "
+            "mt.reasoning, mt.usage, m.created_at, m.session_id, mt.attachments, mt.approval "
+            "FROM messages m LEFT JOIN message_meta mt ON mt.message_id = m.id "
+            "WHERE m.session_key = ? ORDER BY m.ord",
+            (session_key,),
+        ).fetchall()
+        return self._rows_to_display(rows)
+
+    def set_last_assistant_usage(self, session_id: str, usage: dict) -> None:
+        """Write per-turn token usage to the turn's final assistant row's meta.
 
         ``_log_turn_usage`` runs after the turn's last assistant message is
         persisted, so "newest assistant row in this session" is exactly the
         turn the usage belongs to. A turn with zero model calls never writes.
         """
-        self._execute(
-            "UPDATE messages SET usage = ? WHERE id = ("
+        row = self._execute(
             "SELECT id FROM messages WHERE session_id = ? AND role = 'assistant' "
-            "ORDER BY id DESC LIMIT 1)",
-            (json.dumps(usage, ensure_ascii=False), session_id),
+            "ORDER BY ord DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return
+        self._execute(
+            "INSERT INTO message_meta (message_id, usage) VALUES (?, ?) "
+            "ON CONFLICT(message_id) DO UPDATE SET usage = excluded.usage",
+            (row[0], json.dumps(usage, ensure_ascii=False)),
         )
         self._commit()
 
-    def rewrite_messages(self, session_id: str, messages: list[dict]):
+    def rewrite_messages(self, session_id: str, messages: list[dict]) -> None:
         """Make the session's rows equal ``messages`` — incrementally.
 
         The agent loop calls this after EVERY iteration with the full list,
@@ -724,7 +933,17 @@ class SessionDB:
         nudges), delete only rows past it, insert only the tail. A mid-list
         change (context compression replaces the list) naturally falls back
         to a full rewrite at the first divergent row.
+
+        system rows are NOT persisted: the prompt is rebuilt every turn from
+        code/config/skills and re-inserted at the API-boundary copy's head
+        (agent._chat_turn). Meta annotations (``_reasoning``/``_usage``/
+        ``_attachments``) go to message_meta, written once at row creation.
+        Tool rows carrying an ``approval_record`` in their result JSON have it
+        stripped here into message_meta.approval — content stays pure tool
+        output (the model-facing rejection error TEXT remains in content; only
+        the human-facing verdict moves to meta).
         """
+        messages = [m for m in messages if m.get("role") != "system"]
         with self._db_lock:
             cached = self._persisted.get(session_id)
             prefix = 0
@@ -737,31 +956,61 @@ class SessionDB:
             if cached is not None and prefix == len(cached) == len(messages):
                 return  # nothing changed since the last write
 
-            # Drop rows at/after the first divergent position. The OFFSET
-            # subquery is empty (NULL) when prefix == row count → deletes
-            # nothing; surplus cached rows (list shrank) are covered because
-            # the delete is positioned, not counted.
-            if prefix == 0:
+            # Drop rows at/after the first divergent position (by ord — uuids
+            # are unordered). The OFFSET subquery is empty (NULL) when
+            # prefix == row count → deletes nothing; surplus cached rows (list
+            # shrank) are covered because the delete is positioned, not
+            # counted. Meta rows for deleted messages go with them (explicit —
+            # foreign_keys is off, CASCADE would not fire).
+            dead = self._execute(
+                "SELECT id FROM messages WHERE session_id = ? AND ord >= ("
+                "SELECT ord FROM messages WHERE session_id = ? "
+                "ORDER BY ord LIMIT 1 OFFSET ?)",
+                (session_id, session_id, prefix),
+            ).fetchall()
+            if dead:
+                dead_ids = [d[0] for d in dead]
+                ph = ",".join("?" * len(dead_ids))
+                self._execute(f"DELETE FROM messages WHERE id IN ({ph})", dead_ids)
                 self._execute(
-                    "DELETE FROM messages WHERE session_id = ?", (session_id,))
-            else:
-                self._execute(
-                    "DELETE FROM messages WHERE session_id = ? AND id >= ("
-                    "SELECT id FROM messages WHERE session_id = ? "
-                    "ORDER BY id LIMIT 1 OFFSET ?)",
-                    (session_id, session_id, prefix))
-            for msg in messages[prefix:]:
+                    f"DELETE FROM message_meta WHERE message_id IN ({ph})", dead_ids)
+            conv_key = self._key_for_sid(session_id)
+            # ord continues the conversation-wide sequence (across reset
+            # rounds), not the in-list position — a new round's prefix starts
+            # at 0 but its rows must sort after everything already stored.
+            next_ord = self._next_ord(session_id)
+            now = _now()
+            for i, msg in enumerate(messages[prefix:]):
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 tool_calls = json.dumps(msg["tool_calls"], ensure_ascii=False) if msg.get("tool_calls") else None
                 tool_call_id = msg.get("tool_call_id")
                 reasoning = msg.get("_reasoning")  # internal-only key; never sent to the API
                 usage = json.dumps(msg["_usage"], ensure_ascii=False) if msg.get("_usage") else None
+                atts = json.dumps(msg["_attachments"], ensure_ascii=False) if msg.get("_attachments") is not None else None
+                # 审批剥离在 INSERT 之前：先洗再插一次写对（FTS 触发器随后
+                # 写入的就是净 content，无 drift）。
+                approval = None
+                if role == "tool" and isinstance(content, str):
+                    content, rec = _strip_approval(content)
+                    if rec is not None:
+                        approval = json.dumps(rec, ensure_ascii=False)
+                mid = uuid.uuid4().hex
                 self._execute(
-                    "INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, reasoning, usage, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (session_id, role, content, tool_calls, tool_call_id, reasoning, usage, _now()),
+                    "INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, ord, created_at, session_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (mid, session_id, role, content, tool_calls, tool_call_id,
+                     next_ord + i, now, conv_key),
                 )
+                # Meta annotations ride their row's creation (rare: most rows
+                # have none).
+                if reasoning is not None or usage is not None or atts is not None \
+                        or approval is not None:
+                    self._execute(
+                        "INSERT INTO message_meta (message_id, reasoning, usage, attachments, approval) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (mid, reasoning, usage, atts, approval),
+                    )
             self._commit()
 
             if cached is None and len(self._persisted) >= _PERSIST_CACHE_LIMIT:
@@ -773,8 +1022,9 @@ class SessionDB:
                 + [_persist_row_key(m) for m in messages[prefix:]]
             )
 
-    def list_sessions(self, limit: int = 50, platform: str = None,
-                      user_id: str = None, include_internal: bool = False) -> list[dict]:
+    def list_sessions(self, limit: int = 50, platform: Optional[str] = None,
+                      user_id: Optional[str] = None,
+                      include_internal: bool = False) -> list[dict]:
         """List sessions, most-recently-updated first.
 
         Returns dicts: session_key, session_id, platform, chat_id, title,
@@ -785,7 +1035,8 @@ class SessionDB:
         subagents) — they're transcripts, not user conversations to browse or
         resume. Pass ``include_internal=True`` to include them.
         """
-        clauses, params = [], []
+        clauses: list[str] = []
+        params: list[object] = []
         if platform:
             clauses.append("s.platform = ?")
             params.append(platform)
@@ -799,7 +1050,8 @@ class SessionDB:
         sql = (
             "SELECT s.session_key, s.session_id, s.platform, s.chat_id, s.title, "
             "s.updated_at, "
-            "(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.session_id) AS msg_count "
+            "(SELECT COUNT(*) FROM messages m "
+            " WHERE m.session_key = s.session_key OR m.session_id = s.session_id) AS msg_count "
             "FROM sessions s " + where + "ORDER BY s.updated_at DESC LIMIT ?"
         )
         rows = self._execute(sql, tuple(params)).fetchall()
@@ -813,14 +1065,18 @@ class SessionDB:
         Uses FTS5 for fast, ranked search when available.
         Falls back to LIKE for databases created before FTS5 was added.
         """
-        # Try FTS5 first
+        # Try FTS5 first. The sessions join keys on the conversation
+        # (session_key) so pre-reset rounds are searchable too; the
+        # session_id disjunct covers rows written before that column
+        # existed (NULL key).
         try:
             rows = self._execute(
-                "SELECT m.session_id, m.role, snippet(messages_fts, -1, '>>>', '<<<', '...', 20) AS snippet, "
+                "SELECT m.session_id, m.role, snippet(messages_fts, 1, '>>>', '<<<', '...', 20) AS snippet, "
                 "s.platform "
                 "FROM messages_fts fts "
-                "JOIN messages m ON m.id = fts.rowid "
-                "JOIN sessions s ON m.session_id = s.session_id "
+                "JOIN messages m ON m.id = fts.message_id "
+                "JOIN sessions s ON m.session_key = s.session_key "
+                "                OR m.session_id = s.session_id "
                 "WHERE messages_fts MATCH ? "
                 "ORDER BY fts.rank "
                 "LIMIT ?",
@@ -837,8 +1093,9 @@ class SessionDB:
         try:
             rows = self._execute(
                 "SELECT m.session_id, m.role, m.content, s.platform "
-                "FROM messages m JOIN sessions s ON m.session_id = s.session_id "
-                "WHERE m.content LIKE ? ORDER BY m.id DESC LIMIT ?",
+                "FROM messages m JOIN sessions s ON m.session_key = s.session_key "
+                "                OR m.session_id = s.session_id "
+                "WHERE m.content LIKE ? ORDER BY m.created_at DESC, m.ord DESC LIMIT ?",
                 (f"%{query}%", limit),
             ).fetchall()
             return [

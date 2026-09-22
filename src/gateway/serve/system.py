@@ -1,5 +1,5 @@
 """SystemMixin — the system-probe business (health / readiness /
-test-connection / agents) and its routes.
+test-connection) and its routes.
 
 One business module like chat/admin/browser: a mixin on ServeApp, sharing its
 state (capabilities cache lives on the shell — chat's stream hello uses it
@@ -11,8 +11,6 @@ import asyncio
 import logging
 
 from aiohttp import web
-
-from core.config import AGENT_HOME
 
 logger = logging.getLogger(__name__)
 
@@ -55,23 +53,9 @@ class SystemMixin:
         result["model_configured"] = self.config.get("model")
         return web.json_response(result)
 
-    async def agents(self, request):
-        return web.json_response({"agents": [{
-            "id": "self",
-            "name": self.config.get("agent_name", "xihe"),
-            "engine": "xihe",
-            "shape": "process",
-            "model": self.config.get("model"),
-            "status": "online",
-            "capabilities": self.capabilities(),
-            "dataRoot": str(AGENT_HOME),
-            "description": "Local xihe instance (this serve process).",
-        }]})
-
 
 def add_routes(router, app):
     """The system-probe routes. ``app`` is the ServeApp instance."""
     router.add_get("/health", app.health)
     router.add_get("/readiness", app.readiness)
     router.add_post("/test-connection", app.test_connection)
-    router.add_get("/agents", app.agents)

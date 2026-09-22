@@ -262,6 +262,11 @@ def test_dispatch_denied_blocks_handler(terminal_stub):
     assert result.get("error")
     assert result.get("blocked") is True
     assert len(agent.requests) == 1
+    # 审批痕迹随 result 持久化（用户刷新后仍可见的契约）
+    assert result.get("approval_record") == {
+        "decision": "rejected", "summary": agent.requests[0][1],
+        "reason": "stub",
+    }
 
 
 def test_dispatch_denial_message_forbids_workaround(terminal_stub):
@@ -281,6 +286,29 @@ def test_dispatch_approved_runs_handler(terminal_stub):
         parent_agent=agent))
     assert terminal_stub["count"] == 1
     assert result.get("ok") is True
+    assert result.get("approval_record", {}).get("decision") == "approved"
+
+
+def test_dispatch_always_approved_records_flag(terminal_stub):
+    class _AlwaysAgent(_StubAgent):
+        def request_approval(self, tool, summary, args=""):
+            self.requests.append((tool, summary))
+            return True, "stub", True
+
+    agent = _AlwaysAgent()
+    result = json.loads(registry.dispatch(
+        "terminal", json.dumps({"command": "rm -rf /tmp/x"}),
+        parent_agent=agent))
+    assert terminal_stub["count"] == 1
+    assert result.get("approval_record", {}).get("always") is True
+
+
+def test_dispatch_non_json_result_without_approval_untouched(terminal_stub):
+    """无审批路径（safe 命令）的 result 不被注水——原样返回。"""
+    agent = _StubAgent(approved=False)
+    raw = registry.dispatch("terminal", json.dumps({"command": "echo hi"}),
+                            parent_agent=agent)
+    assert json.loads(raw) == {"ok": True}
 
 
 def test_dispatch_without_parent_agent_skips_gate(terminal_stub):
@@ -330,7 +358,7 @@ def test_request_approval_resolved_deny(make_agent):
     _wire(agent, request_cb=_cb)
     approved, _, _always = agent.request_approval("terminal", "危险命令")
     assert approved is False
-    assert agent._approval_shared["pending"] is None
+    assert agent._midturn._pending is None
 
 
 def test_request_approval_timeout_denies_by_default(make_agent):
@@ -386,9 +414,7 @@ def test_request_approval_callback_failure_denies(make_agent):
 def test_request_approval_second_pending_rejected(make_agent):
     from tests.fakes import FakeChatClient
     agent = make_agent(FakeChatClient())
-    shared = agent._approval_shared
-    shared["pending"] = {"id": "held", "event": threading.Event(),
-                         "approved": None, "reason": ""}
+    _make_pending(agent, approval_id="held")
     _wire(agent, request_cb=lambda info: None)
     approved, reason, _always = agent.request_approval("terminal", "危险命令")
     assert approved is False
@@ -464,7 +490,7 @@ def test_chat_approval_key_overrides_bucket(make_agent, monkeypatch):
 
 
 def test_ws_approval_key_normalization():
-    from gateway.serve.chat import _ws_approval_key
+    from gateway.serve.conversations import _ws_approval_key
     # Windows 盘符大小写不敏感 + 正反斜杠 + 尾斜杠 → 同一工作空间同一桶
     assert _ws_approval_key("E:\\Proj\\X") == _ws_approval_key("e:/proj/x")
     assert _ws_approval_key("e:/proj/x/") == "ws:e:/proj/x"
@@ -484,10 +510,14 @@ def test_parse_reply_word_sets():
 
 
 def _make_pending(agent, approval_id="ap-1"):
-    agent._approval_shared["pending"] = {
-        "id": approval_id, "tool": "terminal", "summary": "危险命令",
-        "event": threading.Event(), "approved": None, "reason": "",
-    }
+    from core.support.interaction import MidturnQuestion
+    q = MidturnQuestion("approval", {"tool": "terminal", "summary": "危险命令"})
+    q.id = approval_id
+    agent._midturn._pending = q
+
+
+def _pending_view(agent):
+    return agent._midturn._pending
 
 
 def test_try_resolve_steer_yes(make_agent):
@@ -495,8 +525,9 @@ def test_try_resolve_steer_yes(make_agent):
     agent = make_agent(FakeChatClient())
     _make_pending(agent)
     assert try_resolve_steer(agent, "y") is True
-    assert agent._approval_shared["pending"]["approved"] is True
-    assert agent._approval_shared["pending"]["event"].is_set()
+    q = _pending_view(agent)
+    assert q.answer["approved"] is True
+    assert q.event.is_set()
 
 
 def test_try_resolve_steer_no(make_agent):
@@ -504,7 +535,7 @@ def test_try_resolve_steer_no(make_agent):
     agent = make_agent(FakeChatClient())
     _make_pending(agent)
     assert try_resolve_steer(agent, "n") is True
-    assert agent._approval_shared["pending"]["approved"] is False
+    assert _pending_view(agent).answer["approved"] is False
 
 
 def test_try_resolve_steer_prose_is_steer(make_agent):
@@ -512,7 +543,7 @@ def test_try_resolve_steer_prose_is_steer(make_agent):
     agent = make_agent(FakeChatClient())
     _make_pending(agent)
     assert try_resolve_steer(agent, "继续但别删文件") is False
-    assert agent._approval_shared["pending"]["approved"] is None
+    assert _pending_view(agent).answer is None
 
 
 def test_try_resolve_steer_without_pending(make_agent):
@@ -607,8 +638,9 @@ def test_try_resolve_steer_always(make_agent):
     agent = make_agent(FakeChatClient())
     _make_pending(agent)
     assert try_resolve_steer(agent, "a") is True
-    assert agent._approval_shared["pending"]["approved"] is True
-    assert agent._approval_shared["pending"]["always"] is True
+    q = _pending_view(agent)
+    assert q.answer["approved"] is True
+    assert q.answer["always"] is True
 
 
 def test_request_approval_returns_always_flag(make_agent):

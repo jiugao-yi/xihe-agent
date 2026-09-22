@@ -18,11 +18,12 @@ import os
 import re
 import subprocess
 import sys
+from typing import Optional
 
 _WMIC_RE = re.compile(r"CommandLine=(.*)")
 
 
-def kill_tree(pid) -> None:
+def kill_tree(pid: Optional[int]) -> None:
     """Best-effort kill of an entire process tree rooted at *pid*. Never raises.
 
     - Windows: ``taskkill /PID <pid> /T /F`` walks the tree.
@@ -49,7 +50,7 @@ def kill_tree(pid) -> None:
         pass
 
 
-def list_process_command_line(pid) -> "str | None":
+def list_process_command_line(pid: Optional[int]) -> "str | None":
     """Look up a pid's full command line for the orphan-sweep fingerprint.
 
     Windows via ``wmic`` (5s timeout). Returns None if it can't be obtained
@@ -74,7 +75,7 @@ def list_process_command_line(pid) -> "str | None":
         return None
 
 
-def process_alive(pid) -> bool:
+def process_alive(pid: Optional[int]) -> bool:
     """True if *pid* is currently running. ``os.kill(pid, 0)`` probe."""
     if not pid:
         return False

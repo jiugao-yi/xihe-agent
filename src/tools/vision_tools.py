@@ -243,25 +243,8 @@ def _vision_analyze(args: dict, **kw) -> str:
         return tool_error(user_msg, hint=hint)
 
 
-def describe_image_sync(image_path: str, prompt: str = None) -> str:
-    """Synchronous image description for gateway auto-processing.
-
-    Returns description text or error message. Never raises.
-    """
-    if not _check_vision():
-        return "(vision not available)"
-
-    try:
-        result = _vision_analyze({
-            "image": image_path,
-            "prompt": prompt or "Briefly describe this image. Focus on text, objects, and key visual information.",
-        })
-        parsed = json.loads(result)
-        if parsed.get("analysis"):
-            return parsed["analysis"]
-        return parsed.get("error", "(vision analysis failed)")
-    except Exception as e:
-        return f"(vision error: {e})"
+# 入站附件的自动描述不在这里：工具间保持解耦，gateway/serve/computer_tool
+# 一律走 core 层的 auxiliary_client.describe_image（工具内部基础设施）。
 
 
 registry.register(

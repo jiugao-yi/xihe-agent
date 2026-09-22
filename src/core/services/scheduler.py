@@ -24,6 +24,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ SILENT_MARKER = "[SILENT]"
 JOB_TIMEOUT = 300
 
 _active_sessions: dict[str, str] = {}  # job_id -> session_key
-_active_agents: dict[str, object] = {}  # job_id -> running agent (cancel 可直接打断)
+_active_agents: dict[str, Any] = {}  # job_id -> running agent (cancel 可直接打断)
 _cancel_flags: set[str] = set()  # session_keys that should be cancelled
 
 
@@ -75,7 +76,7 @@ def is_session_cancelled(session_key: str) -> bool:
     return session_key in _cancel_flags
 
 
-def clear_cancel_flag(session_key: str):
+def clear_cancel_flag(session_key: str) -> None:
     """Clear the cancellation flag for a session."""
     _cancel_flags.discard(session_key)
 
@@ -194,7 +195,7 @@ def _prune_outputs(job_dir: Path, pattern: str, keep: int = _KEEP_OUTPUTS) -> No
         pass
 
 
-def _save_job_output(job_id: str, output: str):
+def _save_job_output(job_id: str, output: str) -> None:
     _ensure_dirs()
     job_dir = _OUTPUT_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -203,7 +204,7 @@ def _save_job_output(job_id: str, output: str):
     _prune_outputs(job_dir, "*.md")
 
 
-def _save_script_output(job_id: str, output: str):
+def _save_script_output(job_id: str, output: str) -> None:
     """Persist a job's script stdout for audit + context_from chaining."""
     _ensure_dirs()
     job_dir = _OUTPUT_DIR / job_id / "scripts"
@@ -274,6 +275,7 @@ def _run_job_script(script_ref: str, timeout: int) -> tuple[str, bool]:
     # to shell=True which honors shebangs.
     import sys as _sys
     low = path.lower()
+    cmd: str | list[str]
     if low.endswith(".py"):
         cmd = [_sys.executable, path]
         use_shell = False
@@ -465,7 +467,7 @@ def _to_naive_local(dt: datetime) -> datetime:
     return dt
 
 
-def _compute_next_run(schedule: dict, last_run_at: str = None) -> str | None:
+def _compute_next_run(schedule: dict, last_run_at: Optional[str] = None) -> str | None:
     """Compute ISO timestamp for next run. Returns None if no more runs."""
     now = datetime.now()
 
@@ -499,10 +501,10 @@ def _compute_next_run(schedule: dict, last_run_at: str = None) -> str | None:
 # reserved for BasePlatformAdapter subclasses (full-duplex platform
 # residents, gateway mode). The legacy single-adapter stays as the routing
 # fallback so gateway behavior is untouched.
-_channels: dict[str, object] = {}
+_channels: dict[str, Any] = {}
 
 
-def register_channel(name: str, sender) -> None:
+def register_channel(name: str, sender: Any) -> None:
     """Register an outbound channel under a routing name. Multiple names may
     point at one sender — serve registers its DesktopChannel as both
     "desktop" and "serve" (its conversation platform), so `deliver: origin`
@@ -586,7 +588,33 @@ def _send_to_chat(target: dict, message: str) -> bool:
         return False
 
 
-def _deliver_result(job: dict, content: str):
+def _send_card_to_chat(target: dict, card: dict) -> bool:
+    """Send a relay card when the delivery channel supports it (gateway
+    WeCom adapter). Same thread→loop crossing as _send_to_chat."""
+    sender = _platform_adapter
+    if sender is None or not hasattr(sender, "send_card"):
+        return False
+    chat_id = str(target.get("chat_id"))
+    if not chat_id:
+        return False
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        coro = sender.send_card(chat_id, card)
+        if loop and loop.is_running():
+            result = asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=15)
+        else:
+            result = asyncio.run(coro)
+        return bool(getattr(result, "success", False))
+    except Exception as e:
+        logger.error("Card delivery to %s:%s failed: %s",
+                     target.get("platform"), chat_id, e)
+        return False
+
+
+def _deliver_result(job: dict, content: str) -> None:
     """Deliver job result to ALL targets. Skips if local-only or [SILENT].
     Per-target failures are logged, never fatal — the run itself succeeded."""
     targets = _resolve_delivery_targets(job)
@@ -613,7 +641,7 @@ def _deliver_result(job: dict, content: str):
                        "ok)", job.get("id"), ", ".join(failed))
 
 
-def _make_approval_callbacks(job: dict, agent):
+def _make_approval_callbacks(job: dict, agent: Any) -> "tuple[Callable | None, Callable | None]":
     """Build approval callbacks that surface this job's approval cards on its
     delivery chat (gateway adapter). Returns (request_cb, result_cb); both None
     when the job has no delivery channel — the agent then keeps the unattended
@@ -628,23 +656,46 @@ def _make_approval_callbacks(job: dict, agent):
     chat_id = str(target["chat_id"])
     job_name = job.get("name", job.get("id", "?"))
 
-    def _request(info: dict):
-        card = (f"[定时任务: {job_name}] ⚠️ 需要人工确认\n"
-                f"{info.get('summary', '')}\n"
-                "回复 y 批准本次 / n 拒绝 / a 批准且本任务不再询问")[:4000]
-        if not _send_to_chat({"platform": platform, "chat_id": chat_id}, card):
-            # 卡片没送到就没有确认通道：抛错让 request_approval 立即拒绝，
-            # 不空等超时
-            raise RuntimeError(f"approval card delivery failed ({chat_id})")
-        from core.support.approvals import register_pending
+    def _request(info: dict) -> None:
+        from core.support.approvals import register_card, register_pending
+        card_id = str(info.get("id") or "")
+        resolve = (lambda choice, _id=card_id:
+                   agent.resolve_approval(
+                       _id, approved=choice is not False,
+                       always=choice == "always"))
+        # 卡片优先（按钮直达）；文本 y/n/a 通道并存兜底——两条路由同一
+        # resolve，谁先到谁裁决，MidturnHub 按状态幂等。
+        card_sent = False
+        if hasattr(_platform_adapter, "send_card"):
+            from gateway.platforms.wecom import build_approval_card
+            summary = f"[定时任务: {job_name}] {info.get('summary', '')}"
+            # task_id 用连字符编码——实测冒号使卡片静默不渲染
+            card_sent = _send_card_to_chat(
+                {"platform": platform, "chat_id": chat_id},
+                build_approval_card(summary, f"approval-{card_id}"))
+        if card_sent:
+            register_card("approval", card_id, resolve,
+                          meta={"summary": summary})
         register_pending(
             platform, chat_id, info["id"],
-            lambda approved, always, _id=info["id"]:
+            lambda approved, always, _id=info["id"]:  # type: ignore[misc]  # 位置签名由 approvals.register_pending 约定
                 agent.resolve_approval(_id, approved, always=always))
+        if not card_sent:
+            card = (f"[定时任务: {job_name}] ⚠️ 需要人工确认\n"
+                    f"{info.get('summary', '')}\n"
+                    "回复 y 批准本次 / n 拒绝 / a 总是允许")[:4000]
+            if not _send_to_chat({"platform": platform, "chat_id": chat_id}, card):
+                # 卡片没送到就没有确认通道：抛错让 request_approval 立即拒绝，
+                # 不空等超时
+                raise RuntimeError(f"approval card delivery failed ({chat_id})")
 
-    def _result(info: dict, approved: bool, reason: str):
-        from core.support.approvals import unregister_pending
-        unregister_pending(platform, chat_id, info.get("id"))
+    def _result(info: dict, approved: bool, reason: str) -> None:
+        from core.support.approvals import unregister_card, unregister_pending
+        unregister_pending(platform, chat_id, str(info.get("id") or ""))
+        card_id = str(info.get("id") or "")
+        disposition = unregister_card("approval", card_id)
+        if disposition == "clicked":
+            return  # 卡面终态已在点击事件 5 秒窗口内就地更新
         verdict = "✅ 已批准" if approved else "❌ 已拒绝"
         _send_to_chat({"platform": platform, "chat_id": chat_id},
                       f"[定时任务: {job_name}] {verdict}（{reason}）")
@@ -671,7 +722,7 @@ def _get_due_jobs() -> list[dict]:
     return due
 
 
-def _mark_job_run(job_id: str, success: bool, error: str = None):
+def _mark_job_run(job_id: str, success: bool, error: Optional[str] = None) -> None:
     """Mark a job as having been run, update next_run_at, auto-delete if repeat limit reached."""
     try:
         with _lock, CrossProcessLock(_JOBS_LOCK_FILE):
@@ -720,7 +771,7 @@ def _mark_job_run(job_id: str, success: bool, error: str = None):
         logger.error("_mark_job_run failed for %s: %s", job_id, e)
 
 
-def _execute_job(job: dict):
+def _execute_job(job: dict) -> None:
     """Execute a single cron job. Runs inside its own thread from scheduler.
 
     Three modes (mirrors Hermes):
@@ -755,6 +806,7 @@ def _execute_job(job: dict):
             logger.warning("Cronjob %s: context_from read failed: %s", job_id, e)
 
     # 2. Script pre-run (no_agent OR script-feeding-prompt).
+    result: str | None = None
     if script:
         script_output, wake = _run_job_script(script, JOB_TIMEOUT)
         _save_script_output(job_id, script_output)
@@ -797,8 +849,7 @@ def _execute_job(job: dict):
     from core.config import expand_agent_vars
     full_prompt = cron_hint + expand_agent_vars(prompt)
 
-    result = None
-    exc = None
+    exc: Exception | None = None
     session_key = f"cron_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     # 审批：记忆桶按任务名（同任务所有运行/跨进程共享"不再询问"）；有投递

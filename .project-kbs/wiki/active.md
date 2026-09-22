@@ -2,6 +2,30 @@
 
 > 当前进行中的需求、变更、待决问题。会话开始时优先查阅。
 
+## 已完成：企微中继卡体系——审批/clarify 交互卡 + 协议实测（2026-09-21，pytest 593 全量绿）
+
+[[0055]] 沉淀实现、[[0056]] 沉淀协议实测。功能面：**审批按钮卡**（批准/拒绝/总是允许，点击即裁决 + 5 秒窗卡面终态 + desc 回填 summary）、**clarify 选择卡**（vote 官方 schema，单选/多选由模型 multi_select 声明，选项原文随卡登记、oN 序号折回原文作答）、**通用中继卡路由表**（approvals.py，按 (kind,id) 精确命中）、**健康探测持久化**（wecom_cards.json，2 张 0 事件自动停用回落文本）、cron 后台审批卡。文本 y/n/a 通道并存。**协议实测七轮 spike**（insight 0056）：毒字段静默丢弃（task_id 冒号/source/错 schema）、卡型可用性真相、5 秒更新窗、单连接互顶。**自检工具**：scripts/wecom_card_spike.py（审批）/ wecom_clarify_spike.py（clarify）。**注意：gateway 需重启生效；企微幻觉文件 scripts/wecom_longconn_card.py 建议删除（未删，待定）。**
+
+## 已完成：会话数据模型重构——uuid 主键 + message_meta 拆分 + 附件/审批持久化（2026-09-20，pytest 594 绿 + tsc 0 错）
+
+[[0054]] 沉淀本批（[[0048]] 大订正）。核心：**分类标准「没有它 LLM 上下文是否缺失」**——messages 纯模型面向（uuid4 主键 + `ord` 会话序锚），message_meta 收四样应用附属（reasoning/usage/attachments/approval）。功能面：**附件气泡不变形**（content 恒为用户原文，提示块 API 边界注入；桌面 Ctrl+V 粘贴上传图片/文件）、**审批决议持久化**（meta.approval 列，trace 徽章刷新可见）、**system 不再持久化 + 孤儿清理**（86.6→47.5MB）。坑存档：FTS external-content 的 rowid 别名限制（TEXT 主键必须内容表模式）/ ord 按会话不按轮（跨轮 transcript 排序）/ `max(x) or -1` 吞 0 / 注入索引对位错（测试数据缺 system 前缀漏抓）。**表结构变更与迁移不进项目代码**——历史库走独立脚本 `scripts/migrate_messages_v2.py`（幂等可恢复）。**注意：serve 需重启；桌面 id 全部 string 化（不透明令牌，逻辑零变）。**
+
+## 已完成：三模式调用架构收敛 + plan mode + 技能/工具整备（2026-09-16/17，pytest 584 绿 + tsc 0 错 + 桌面 build 绿）
+
+[[0052]] [[0053]] 两页沉淀本批。核心：**四层架构**——SharedContext（应用装配：重状态持有 + `create_agent` 唯一工厂 + bootstrap_process 组合根；`init_agent` 移出 core 回 CLI 模式层）/ XiheAgent（一轮执行机器：chat 门面 + _chat_turn 轮体 + _dispatch_tools 调度 + TurnCallbacks 7 参数签名）/ **AgentTurnRunner**（轮装配调度：Params+Callbacks 进、TurnResult+PlanOutcome 出，**构造即就绪**传 agent 复用未传自建）+ 入口只剩协议/串行化/投递。功能面：**plan mode**（roster 物理只读 + clarify 结构化批准零文本解析 + 批准后自动执行轮，桌面 📋 开关 / CLI /plan / 网关 /plan）、**regenerate 遗忘语义**（REGENERATE_HINT 独立重答 + 两段式删除确认）、**office 工具集**（excel/word 四动作 + send_file 投递）。**生效：重启 serve/gateway + 桌面；新依赖 matplotlib/openpyxl/python-docx/markdown。**
+
+## 已完成：可视化体系——skill + 桌面 html renderer + image_render + xfile 图片链（2026-09-16，pytest 568 绿 + tsc 0 错 + 桌面 build 绿）
+
+[[0051]] 三模式可视化补全（同日 CLAUDE.md Gotchas 立硬规则"三模式同步考虑"）：**visualization skill**（调研 doubao-visualization 借鉴白名单/数据真实性/输出结构，通道=mermaid 原生 / `html type="renderer"` 沙箱块 / image_render，三模式路由写死 description）+ **桌面 html renderer**（沙箱 iframe allow-scripts + 高度上报）+ **image_render 统一工具**（data/mermaid/html/markdown 四源；matplotlib + 独立无头 Playwright；vendor mermaid.min.js 3.5MB；落 `AGENT_HOME/charts`；两个候选工具按"少且精"合并）+ **xfile:// 本地图片链**（特权协议仅图片、占位 host+整段编码、附件条**正文单源**——live 与刷新一致）。坑：自定义协议 host 陷阱 / markdown 反斜杠吃路径（禁模型嵌图）/ hint 与 description 信号必须一致 / mermaid 无 hbar。**注意：serve 与桌面均需重启；新增依赖 matplotlib、markdown。**冒烟四话术：网关图表（企微收图）/ 桌面 mermaid 题 / hbar 题（正文路径+附件条）/ 刷新持久性。
+
+## 已完成：终端体系整备——agent 终端收敛 + 本地终端独立（2026-09-15，pytest 558 绿 + tsc 0 错 + 桌面 build 绿）
+
+[[0050]] 用户报「terminal 自动打开很吵、Agent 标签打印乱」起的三段改造 + 两轮减法：**agent 终端自动打开收敛**（仅 ssh_connect/process start 立即弹；terminal 5s 延时打开且卡审批时挂起；静音改会话粘性；selOwnerRef 不抢用户 tab）+ **conv 通道打印治乱**（一行头 `—— $ cmd`、cwd 变化才显；LineTap 行纪律防双流截断；StreamDecoder GBK 回退——**`locale.getpreferredencoding` 在 UTF-8 模式下说谎，必须 `getencoding`**）+ **快速连接与本地 tab 整链删除**（连接统一交给 agent，origin 全拔）+ **tab 可见性 = 当前对话 ∨ 活跃运行** + **viewer 永不创建频道**（修"开着面板切对话孵化空 Agent tab"）+ **Run 面板重做为 ShellPanel 通用本地终端**（多 tab 交互式、不绑 workspace、窗口级全宽 dock；`main/terminals.ts` 多会话 ConPTY + 游标回放；run.ts 一次性执行/历史删除）。顶栏按钮定名 agent终端/本地终端；README「Why xihe」补终端条目。0046（三源→双源大订正）/0025/0043 同步。**注意：serve 侧（terminal.py/_local_tap.py/ssh_tool.py 等）需重启 serve 生效；桌面 main IPC 改动需整体重启 `npm run dev`。**手动冒烟建议：秒级命令不弹/>5s 命令到点弹/关面板后本会话不再弹/process 轮询不扰/切对话不孵化 tab/本地终端多开与交互/Play 入口在新 tab 可交互执行。
+
+## 已完成：桌面端单 agent 收敛——多 agent 骨架清除（2026-09-14，pytest 542 绿 + tsc 0 错 + 桌面 build 绿）
+
+[[0026]] 终态落地：桌面唯一 agent = xihe（main 托管 serve）；claude/codex 经 xihe 的 `external_agent` 工具访问。**store 扁平化**（`agents[]`/`selectedAgentId`/`Agent` 描述符/`serveBacked` 全删 → `conversations`+`activeConvId`+`serveModel`，action 全去 `agentId` 首参，持久化零迁移）+ **serve 删 `GET /agents`**（model/capabilities 从 `/health` 取）+ 删死文件 common.tsx + cron_result/complete 列表刷新有意放宽（cron 新会话即时出现）。wiki 同步：新增 [[0047_desktop-single-agent-collapse]]，[[0028]]/[[0029]] 加已过时注记（**ClaudeRunner 双引擎已删除，不再反映当前代码**），[[0025]]/[[0024]]/[[0026]] 订正。变更详见 [[0047_desktop-single-agent-collapse]]。**注意：`.py` 改动需重启 serve 生效（桌面端点「重启 xihe」）；桌面 renderer 改动 `npm run dev` 重启或 Ctrl+R。** 手动冒烟建议：首启自动选会话 / 重启恢复 / cron 推送 / 重连 attach / 删活动会话回退 / 工作空间行操作。
+
 ## 已完成：桌面端开发工作台 Phase 1 + 头部交互重构 + git 行标记（2026-09-02，桌面 build 绿 + serve pytest 绿）
 
 面向 IT 开发者的工作台补全：**Monaco 编辑器**（气隙引入方式：ESM + ?worker + React.lazy，无 CDN loader）+ **chat/workbench 双模式布局** + **编辑器 tab/外部变更协调**（fsVersion + dirty 横幅）+ **diff 可视化**（serve write_file 结果内嵌 unified diff + DiffBlock + 审批卡「查看变更」Monaco 对比）+ **文件树 git 装饰** + **IDEA 紧凑树**（单链目录合并）+ **运行面板**（每 workdir 一槽 + 历史）+ **共享终端三源**（本地/agent 本地命令/SSH 共写一通道）。后续交互定稿：头部按钮与工作空间绑定关联规则 + `inWorkbench` 生效布局推导（防"无绑定困在工作台"死角）+ 品牌资产管线（banner→`docs/_make_icons.py`→logo/icon）。编辑器加 **IDEA 式 git 行标记**（`git:headFile` + lineDiff + Monaco gutter 装饰，编辑实时刷新）。变更详见 [[0043_desktop-workbench-phase1]] / [[0044_desktop-header-workspace-ux]] / [[0045_desktop-git-gutter-marks]]。**注意：serve 侧改动需重启（桌面端点「重启 xihe」）；桌面 main 进程 IPC 改动需整体重启 `npm run dev`（Ctrl+R 只刷 renderer）。**
@@ -51,9 +75,11 @@ F2（claude 接入 + 统一 LLM 配置）的性能/复用升级：`ClaudeRunner`
 
 [[0025_desktop-control-plane]] 的 Agent 层建模（persona / 3 种子 agent / serve 显式暴露）已据 [[0026]] 就地订正；该页其余（控制面定位 / 能力驱动 UI / 三段式 / store / 协议引用）仍有效。
 
-## 知识库现状（2026-09-02）
+## 知识库现状（2026-09-14）
 
-- 已收录 45 个正式页面（1 entity / 28 concept / 14 change / 2 insight）+ 6 个原始快照。
+- 已收录 53 个正式页面（1 entity / 29 concept / 18 change / 4 insight）+ 10 个原始快照。（2026-09-20：新增 change 0054 会话数据模型重构——含附件不变形/审批持久化/垃圾清理/uuid+meta 拆分四批次；大订正 0048 表结构、0037 审批决议记录节、0024 协议帧类型；顺带盘存 sources 7→10 对齐磁盘实数。）（2026-09-17：新增 concept 0052 三模式调用架构 + change 0053 架构重构批次——含 2026-09-15/16 的 0050/0051。）（2026-09-15：0030 打包策略与 0041 server tool 由 concepts 归类订正至 insights——均为调研/方案对比/设计参考；新增 0049 能力商店。）（2026-09-14 盘存订正：会话数据模型页收录时误编号 0030 与打包策略页撞号且漏登记，已重编号 0048 并补 frontmatter/index，计数对齐磁盘实数。）
+- [[0049_capability-store]] —— **能力商店**（2026-09-15）：薄目录+安装器+挂载台账；挂载 main 需重启 / specialist 热生效。
+- [[0047_desktop-single-agent-collapse]] —— **桌面端单 agent 收敛**（2026-09-14）：store 扁平化 + serve 删 /agents + 死代码清理；0028/0029 过时注记。
 - [[0046_shared-session-terminal]] —— **共享会话终端**（2026-09-02）：桌面终端面板三源通道架构（本地 ConPTY / serve conv·proc 通道 / SSH tap），Ring offset 寻址 + 断线续传 + agentTermTarget 聚焦链；0043 终端小节的展开。
 - [[0043_desktop-workbench-phase1]] / [[0044_desktop-header-workspace-ux]] / [[0045_desktop-git-gutter-marks]] —— **桌面端开发工作台 Phase 1 + 头部交互 + git 行标记**（2026-09-02）：Monaco 编辑器 + 双模式布局 + diff 卡 + git 装饰 + 紧凑树 + 运行/终端面板；按钮绑定关联规则与 inWorkbench 推导；编辑器 IDEA 式行标记。
 - [[0042_package-restructuring]] —— **包结构重构**（2026-09-01）：serve 业务分模块 / `app/` 启动器 / registry 契约下沉 `core/registry.py` / core 三子包（`agent/`+`services/`+`support/`）+ tools 基础设施对流；三原则 + DAG 证明 + pytest 466 绿。
@@ -64,7 +90,7 @@ F2（claude 接入 + 统一 LLM 配置）的性能/复用升级：`ClaudeRunner`
 - [[0032_specialist-agents]] + [[0033_specialist-toolset-overhaul]] —— **专家 agent 系统**（2026-08-16）：配置声明常驻专家 + serve CRUD + 桌面编辑器 + 工具集 14 平铺组重构；[[0017]] 角色化的后继（机制对照）。
 - [[0026_desktop-agent-model-built-in-xihe]] —— **桌面端 Agent 模型定调**（insight/ADR）：Agent = 类型（内置 xihe + 可添加 claude），非多实例 / 非 persona；推翻 [[0025]] 的 Agent 层建模，驱动 F1。
 - [[0024_desktop-serve-protocol]] + [[0025_desktop-control-plane]] 记录了 xihe 的**第三运行模式 `xihe serve`**（HTTP+WS 服务）与**桌面控制面**（独立仓 xihe desktop，经协议驱动 serve）。桌面端 P0（serve 接入 `xihe-ops` 槽）已落地；**P1 persona 已废弃**、P2 claude 重构为「可添加 agent 类型」、P3 管理 UI 的 MCP/skills/cron 已只读接入、P4 CodeBuddy 仍是枚举值（roadmap 在 [[0025]]，按 [[0026]] 订正）。
-- [[0027_desktop-claude-longlived-rewrite]] + [[0028_desktop-claude-transport-architecture]] 记录了 **claude 长驻 stream-json 重写**（一会话一长驻子进程 + stdin 跨轮喂 NDJSON；冷/热双路径实测通过）。[[0029_desktop-dual-engine-architecture]] 是**整体架构 hub**——双引擎并列（serve WS + claude STDIO）、统一 `ServeEvent` 归约、main 总编排、两路传输对照、凭据与真理归属；含 ClaudeRunner 生命周期健壮性 5 项（stdin-boot 死锁修复 + interrupt 无条件 teardown + 45s 就绪超时 + 10min 空闲回收 + PID 孤儿清扫）。
+- [[0027_desktop-claude-longlived-rewrite]] + [[0028_desktop-claude-transport-architecture]] 记录了 **claude 长驻 stream-json 重写**（一会话一长驻子进程 + stdin 跨轮喂 NDJSON；冷/热双路径实测通过）。[[0029_desktop-dual-engine-architecture]] 是**整体架构 hub**——双引擎并列（serve WS + claude STDIO）、统一 `ServeEvent` 归约、main 总编排、两路传输对照、凭据与真理归属；含 ClaudeRunner 生命周期健壮性 5 项（stdin-boot 死锁修复 + interrupt 无条件 teardown + 45s 就绪超时 + 10min 空闲回收 + PID 孤儿清扫）。⚠️ **2026-09-14 起这三页描述的 ClaudeRunner/双引擎已删除**（桌面单 agent 收敛，[[0047]]）；[[0040]] 的 external_agent 工具是 claude/codex 的现行通道，其「与 [[0028]] 组双页」表述失效。
 
 ## 后续方向
 

@@ -256,7 +256,7 @@ def catalog_view(catalog: dict | None = None) -> dict:
     return {"items": items, "sources": catalog["sources"]}
 
 
-def _url_base(url) -> str:
+def _url_base(url: object) -> str:
     """URL without the query string — identifies a service across different
     apikey query params (catalog templates carry {placeholders} there)."""
     u = str(url or "").split("?", 1)[0].rstrip("/")
@@ -448,7 +448,7 @@ def _existing_skill_names() -> dict:
     hand-installed nested layout (skills/<group>/<name>/SKILL.md) dodges a
     one-level directory check and installs a duplicate the scanner then
     de-dupes nondeterministically."""
-    out = {}
+    out: dict = {}
     for root in (_USER_SKILLS_DIR, _BUNDLED_SKILLS_DIR):
         if not root.is_dir():
             continue
@@ -528,7 +528,7 @@ def install_skill(item: dict) -> dict:
 
 
 def _render_mcp_config(mcp: dict, secrets: dict) -> dict:
-    def sub(value):
+    def sub(value: object) -> object:
         if isinstance(value, str):
             for key, secret in secrets.items():
                 if secret is not None:
@@ -672,7 +672,9 @@ def mounted_extra(agent_key: str) -> tuple[set, set]:
     return toolsets, skills
 
 
-def merge_mounts(agent_key: str, toolsets, skills):
+def merge_mounts(agent_key: str, toolsets: list | set | None,
+                 skills: list | set | None) -> tuple[list | set | None,
+                                                     list | set | None]:
     """Union ledger mounts into a resolved roster. None means unrestricted —
     left untouched so the []-vs-None invariant (agent.py relies on it) holds."""
     extra_ts, extra_sk = mounted_extra(agent_key)

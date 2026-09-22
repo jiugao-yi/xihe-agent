@@ -115,10 +115,12 @@ def load_all_tools():
         # Frozen (PyInstaller) environment: physical sources absent → explicit list.
         names = [
             "browser_tool", "clarify_tool", "computer_tool", "cronjob_tools",
-            "delegate_tool", "execute_code", "external_agent_tool", "file_tools",
-            "http_tool", "image_generation_tool", "kbs_tool", "maven_tool",
+            "delegate_tool", "execute_code", "external_agent_tool",
+            "file_tools", "http_tool", "image_generation_tool",
+            "image_render_tool", "kbs_tool", "maven_tool",
             "mcp_tool", "memory_tool", "model_info_tool", "node_version_tool",
-            "ocr_tool", "process_tool", "request_tools_tool", "sandbox_tool",
+            "ocr_tool", "office_tool", "process_tool", "request_tools_tool",
+            "sandbox_tool",
             "send_message_tool", "session_search_tool", "skills_tool",
             "skill_manager_tool", "specialist_agent_tool", "ssh_tool",
             "terminal", "todo_tool", "tts_tool", "vision_tools",

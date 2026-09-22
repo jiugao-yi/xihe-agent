@@ -3,7 +3,10 @@
 import json
 import logging
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from core.agent.auxiliary_client import AuxiliaryClient
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +27,7 @@ class ContextCompressor:
         self,
         context_length: int,
         threshold_percent: float = 0.50,
-        aux=None,
+        aux: Optional["AuxiliaryClient"] = None,
     ):
         self.context_length = context_length
         self.threshold_tokens = int(context_length * threshold_percent)

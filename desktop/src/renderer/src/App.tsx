@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { BookOpen, CodeXml, FolderTree, Globe, MessageSquare, PanelLeftOpen, PanelRightClose, PanelRightOpen, Play, Settings, ShoppingBag, SquareTerminal } from 'lucide-react'
+import { BookOpen, CodeXml, FolderTree, Globe, MessageSquare, PanelLeftOpen, PanelRightClose, PanelRightOpen, Settings, ShoppingBag, SquareTerminal, Terminal } from 'lucide-react'
 import { useStore } from './appStore'
 import { Sidebar } from './components/Sidebar'
 import { ChatPanel } from './components/ChatPanel'
@@ -10,7 +10,7 @@ import { FileTree, FileTreePanel } from './components/FileTreePanel'
 import { EditorArea } from './components/EditorArea'
 import { BrowserPanel } from './components/BrowserPanel'
 import { TerminalPanel } from './components/TerminalPanel'
-import { RunPanel } from './components/RunPanel'
+import { ShellPanel } from './components/ShellPanel'
 import { Resizer, usePanelSize } from './components/Resizer'
 import { cn } from './lib/cn'
 import { desktop } from './lib/desktop'
@@ -38,7 +38,6 @@ function EdgeStrip({ side, title, onClick, children }: {
 }
 
 export default function App() {
-  const agent = useStore((s) => s.agents.find((a) => a.id === s.selectedAgentId) ?? null)
   const connectServe = useStore((s) => s.connectServe)
   const hydrateWorkspaceStore = useStore((s) => s.hydrateWorkspaceStore)
   const hydrateXiheConfig = useStore((s) => s.hydrateXiheConfig)
@@ -55,9 +54,9 @@ export default function App() {
   const setShowBrowser = useStore((s) => s.setShowBrowser)
   const showTerminal = useStore((s) => s.showTerminal)
   const setShowTerminal = useStore((s) => s.setShowTerminal)
-  const showRun = useStore((s) => s.showRun)
-  const setShowRun = useStore((s) => s.setShowRun)
-  const openRunPanel = useStore((s) => s.openRunPanel)
+  const showShell = useStore((s) => s.showShell)
+  const setShowShell = useStore((s) => s.setShowShell)
+  const openShellPanel = useStore((s) => s.openShellPanel)
   const layoutMode = useStore((s) => s.layoutMode)
   const setLayoutMode = useStore((s) => s.setLayoutMode)
   const editorTabs = useStore((s) => s.editorTabs)
@@ -66,13 +65,13 @@ export default function App() {
   const closeTabsUnder = useStore((s) => s.closeTabsUnder)
   const renameTabPath = useStore((s) => s.renameTabPath)
   // Workbench chat column width (drag its left edge). The trees and drawers
-  // own their own sizes internally (FileTree / TerminalPanel / RunPanel).
+  // own their own sizes internally (FileTree / TerminalPanel / ShellPanel).
   const [chatW, setChatW] = usePanelSize('chatPanelWidth', 460, 360)
   const chatColRef = useRef<HTMLDivElement>(null)
   // A turn is streaming in the active conversation — cues the collapsed
   // workbench chat strip so replies aren't silently missed.
   const chatBusy = useStore((s) => {
-    const convId = s.agents.find((a) => a.id === s.selectedAgentId)?.activeConvId
+    const convId = s.activeConvId
     return !!convId && (s.sessions[convId] ?? []).some((m) => m.role === 'assistant' && m.pending)
   })
 
@@ -146,7 +145,7 @@ export default function App() {
   // Workspace bound to the active conversation. Derived here (not stored on
   // ConvMeta) so it survives syncConversations rebuilds — the binding lives
   // only in the convWorkspace map.
-  const activeConvId = agent?.activeConvId
+  const activeConvId = useStore((s) => s.activeConvId)
   const boundWsId = activeConvId ? convWorkspace[activeConvId] : undefined
   const activeWs = boundWsId ? workspaces.find((w) => w.id === boundWsId) : undefined
   // Workbench needs a bound workspace (its tree/editor act on it). Without a
@@ -176,9 +175,8 @@ export default function App() {
       <div className={cn('flex h-screen bg-app text-ink', activeTab !== 'chat' && 'hidden')}>
       <Sidebar />
       <main className="flex min-w-0 flex-1 flex-col">
-        {agent ? (
-          <>
-            <header className="flex items-center gap-3 border-b border-line px-5 py-3">
+        <>
+          <header className="flex items-center gap-3 border-b border-line px-5 py-3">
               <div className="ml-auto flex items-center gap-1">
                 {activeWs && (
                   <button
@@ -225,24 +223,8 @@ export default function App() {
                   <Globe className="h-4 w-4" />
                 </button>
                 <button
-                  onClick={() => setShowRun(!showRun)}
-                  // Run executes with a workspace cwd — without a binding the
-                  // panel is inert. Still clickable while open so it can close.
-                  disabled={!activeWs && !showRun}
-                  title={activeWs ? '运行面板（在工作空间执行一次性命令，带历史）' : '先绑定工作空间'}
-                  className={cn(
-                    'rounded-lg p-1.5 transition',
-                    showRun
-                      ? 'bg-contrast text-sky-300'
-                      : 'text-ink-3 hover:bg-elevated hover:text-ink',
-                    !activeWs && !showRun && 'cursor-not-allowed opacity-40'
-                  )}
-                >
-                  <Play className="h-4 w-4" />
-                </button>
-                <button
                   onClick={() => setShowTerminal(!showTerminal)}
-                  title="终端面板（本地 shell / agent 的本地命令 / SSH 会话）"
+                  title="agent终端（对话的命令与 SSH 会话实时输出）"
                   className={cn(
                     'rounded-lg p-1.5 transition',
                     showTerminal
@@ -251,6 +233,18 @@ export default function App() {
                   )}
                 >
                   <SquareTerminal className="h-4 w-4" />
+                </button>
+                <button
+                  onClick={() => setShowShell(!showShell)}
+                  title="本地终端（多开交互式 shell，与对话无关）"
+                  className={cn(
+                    'rounded-lg p-1.5 transition',
+                    showShell
+                      ? 'bg-contrast text-sky-300'
+                      : 'text-ink-3 hover:bg-elevated hover:text-ink'
+                  )}
+                >
+                  <Terminal className="h-4 w-4" />
                 </button>
                 <button
                   onClick={() => setTab('store')}
@@ -295,7 +289,7 @@ export default function App() {
                         selectedPath={activeEditorPath}
                         side="left"
                         onCollapse={() => setTreeCollapsed(true)}
-                        onRunFile={(c) => openRunPanel(c)}
+                        onRunFile={(c) => openShellPanel(c)}
                         onSelectFile={(e) => openFileTab(e.path)}
                         onPathRenamed={renameTabPath}
                         onPathDeleted={closeTabsUnder}
@@ -339,21 +333,21 @@ export default function App() {
                         >
                           <PanelRightClose className="h-3.5 w-3.5" />
                         </button>
-                        <ChatPanel agent={agent} />
+                        <ChatPanel />
                       </div>
                     )}
                   </>
                 ) : (
                   <>
                     <div className="min-w-0 flex-1">
-                      <ChatPanel agent={agent} />
+                      <ChatPanel />
                     </div>
                     {activeWs && !rightTreeCollapsed && (
                       <FileTreePanel
                         workspace={activeWs}
                         className="shrink-0 border-l border-line"
                         onCollapse={() => setRightTreeCollapsed(true)}
-                        onRunFile={(c) => openRunPanel(c)}
+                        onRunFile={(c) => openShellPanel(c)}
                       />
                     )}
                     {activeWs && rightTreeCollapsed && (
@@ -381,23 +375,19 @@ export default function App() {
               {showTerminal && (
                 <TerminalPanel className="shrink-0 border-t border-line" />
               )}
-              {showRun && <RunPanel className="shrink-0 border-t border-line" />}
+              {/* Both bottom drawers are window-level docks spanning the full
+                  content width — neither belongs to the chat column nor the
+                  editor area: the agent panel follows cross-conversation
+                  serve channels, the shell panel is the user's own
+                  conversation/workspace-independent terminals. */}
+              {showShell && <ShellPanel className="shrink-0 border-t border-line" />}
             </div>
-          </>
-        ) : (
-          <div className="flex flex-1 items-center justify-center text-ink-4">
-            选择左侧的 agent 开始
-          </div>
-        )}
+        </>
       </main>
       </div>
-      {activeTab === 'manage' && agent && (
-        <SettingsPanel agent={agent} onBack={() => setTab('chat')} />
-      )}
-      {activeTab === 'store' && agent && <StorePage onBack={() => setTab('chat')} />}
-      {activeTab === 'knowledge' && agent && (
-        <KnowledgePage onBack={() => setTab('chat')} />
-      )}
+      {activeTab === 'manage' && <SettingsPanel onBack={() => setTab('chat')} />}
+      {activeTab === 'store' && <StorePage onBack={() => setTab('chat')} />}
+      {activeTab === 'knowledge' && <KnowledgePage onBack={() => setTab('chat')} />}
     </>
   )
 }

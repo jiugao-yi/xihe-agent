@@ -15,7 +15,7 @@ tags:
   - control-plane
 status: active
 created: 2026-08-10
-updated: 2026-08-11
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0024_desktop-serve-protocol.md
   - wiki/insights/0026_desktop-agent-model-built-in-xihe.md
@@ -27,9 +27,11 @@ related_pages:
 
 # 桌面端控制面设计（xihe desktop）
 
-> **跨仓说明**：xihe desktop 是独立仓库（`E:\xihe-desktop`），但它是 xihe 的桌面前端 / 控制面，与 [[0024_desktop-serve-protocol]] 的协议是一对共生体，故收录在本 wiki。
+> **跨仓说明（订正 2026-09-14）**：xihe desktop 曾是独立仓库（`E:\xihe-desktop`），**现已迁入本仓库 `desktop/` 子目录**（自带 Node 工具链，不与 Python 共享代码）。它是 xihe 的桌面前端 / 控制面，与 [[0024_desktop-serve-protocol]] 的协议是一对共生体。
 
 > ⚠️ **Agent 层建模已被订正（2026-08-11）**：本文「三层模型」里的 **Agent 层**（定义为「一个 provider 下的 persona / 实例」）、**3 个种子 agent**（`xihe-ops`/`xihe-research`/`claude-dev`）以及「**serve 由用户显式启动**」的设定，已被 [[0026_desktop-agent-model-built-in-xihe]] **推翻**。新定调：Agent = 几种**类型**（xihe = 桌面**内置**、main 进程托管 `xihe serve` 生命周期；claude = **可添加**的 connector 占位），**非多实例 / 非 persona**。本页其余部分（控制面定位、能力驱动 UI、electron-vite 三段式、store 机制、组件表、连接生命周期、协议引用）仍然有效。下文涉及 Agent 层处均就地标注「⚠️ 已被 [[0026]] 订正」。
+
+> ⚠️ **终态更新（2026-09-14，见 [[0047_desktop-single-agent-collapse]]）**：多 agent 骨架已彻底清除——桌面 store 不再有 `agents[]`/`selectedAgentId`/`Agent` 描述符（扁平化为 `conversations` + `activeConvId`），serve `/agents` 端点已删（model/capabilities 从 `/health` 与 WS `hello` 下发），EngineBadge/CapChip 组件已删。「可添加 claude connector」路线亦已放弃：claude/codex 经 xihe 的 `external_agent` 工具（[[0040]]）访问。本文的 Provider/Agent 分层、「能力驱动 UI 按 flag 分支」均为历史设计，当前桌面不按 capability 分支 UI。
 
 ## 摘要
 
@@ -51,13 +53,13 @@ electron-vite 把构建拆成三段，职责清晰隔离：
 
 | 段 | 文件 | 职责 |
 |----|------|------|
-| **main** | `src/main/index.ts` | 单个 `BrowserWindow`，生命周期，**无任何 `ipcMain` handler** |
-| **preload** | `src/preload/index.ts` | `contextBridge` 暴露 `window.desktop`（**当前是 stub**） |
+| **main** | `src/main/index.ts` | 单个 `BrowserWindow`，生命周期，**~30 组 `ipcMain` handler**（serve 托管、xiheConfig 读写、git、terminals、fs、workspace、settings…） |
+| **preload** | `src/preload/index.ts` | `contextBridge` 暴露 `window.desktop`（**~33 个桥方法**，`lib/desktop.ts` 是类型面） |
 | **renderer** | `src/renderer/src/*` | 自包含 React app，不碰 Node API |
 
-**main**（`createWindow`）：窗口 `1280×820`（min `960×600`），`show:false`+`ready-to-show` 显窗，`autoHideMenuBar`，`backgroundColor:#0a0a0a`，`title:'xihe desktop'`。`webPreferences`：`preload: ../preload/index.js`、**`contextIsolation:true`**、`sandbox:false`、`nodeIntegration` 未设（默认 false）。外链 `setWindowOpenHandler` 强制 `shell.openExternal` + deny。加载目标：dev 走 `process.env.ELECTRON_RENDERER_URL`（electron-vite 默认 renderer 端口 **5173**），prod 走 `loadFile`。**安全姿态正确**（contextIsolation 开、nodeIntegration 关），但代价是 main 几乎不做事——所有逻辑在 renderer。
+**main**（`createWindow`）：`show:false`+`ready-to-show` 显窗，`autoHideMenuBar`，主题化背景色，`title:'xihe'`。`webPreferences`：`preload`、**`contextIsolation:true`**、`sandbox:false`、`nodeIntegration` 未设（默认 false）。外链 `setWindowOpenHandler` 强制 `shell.openExternal` + deny。加载目标：dev 走 `process.env.ELECTRON_RENDERER_URL`（electron-vite 默认 renderer 端口 **5173**），prod 走 `loadFile`。**安全姿态正确**（contextIsolation 开、nodeIntegration 关）。
 
-**preload**（stub）：`contextBridge.exposeInMainWorld('desktop', { version:'0.0.1', mode:'demo', ping() })`，`ping` 调 `ipcRenderer.invoke('desktop:ping')`——但 main **没有** `ipcMain.handle('desktop:ping')`，调用会挂起。头注释明说：renderer 现在自包含（mock），接 serve 在 P0，这里「先把契约摆出来，留最小可见」。**renderer 当前完全不消费 `window.desktop`**。这是有意为之的占位，不是 bug。
+**preload**（订正 2026-09-14）：早已不是 stub——`desktop:ping` 有 handler，renderer 全面消费 `window.desktop`（serve 状态、配置编辑、文件树、运行面板、终端、通知）。**main 还直接行级补丁读写 `~/.xihe-agent/config.yaml`**（`xiheConfig.ts` + 设置页保存 → `serve:restart` 生效）——「桌面永不触碰 xihe 配置」的旧前提已不成立（api_key 仍只写不读）。
 
 ## 三层模型（设计哲学）
 
@@ -119,24 +121,24 @@ Provider  ──(引擎 / 连接)──  Agent  ──(人格 / 实例)──  S
 
 底栏状态指示 + 重连让「serve 没起 → demo，起了 → 自动 live」成为零配置体验。
 
-## 落地文件（`E:\xihe-desktop`）
+## 落地文件（订正 2026-09-14：仓库内 `desktop/`）
 
-- 入口/外壳：`src/main/index.ts`、`src/preload/index.ts`、`src/renderer/src/{main.tsx,App.tsx,index.css}`
-- 状态：`src/renderer/src/store.ts`
-- 协议客户端：`src/renderer/src/lib/serveClient.ts`、`src/renderer/src/lib/cn.ts`
-- 组件：`src/renderer/src/components/{Sidebar,ChatPanel,ManagePanel,common}.tsx`
-- 配置：`electron.vite.config.ts`、`tailwind.config.cjs`（brand 色 `#6d8cff`，`brand.soft #3a4a7a` **声明未用**）、`postcss.config.cjs`、`tsconfig.json`、`.npmrc`（内部 registry + electron mirror）
+- 入口/外壳：`src/main/index.ts`（+ `serve.ts` 托管 / `xiheConfig.ts` / `git.ts` / `terminals.ts` / `browserPanel.ts`）、`src/preload/index.ts`、`src/renderer/src/{main.tsx,App.tsx,index.css}`
+- 状态：`src/renderer/src/appStore.ts`（单 agent 扁平 store，见 [[0047_desktop-single-agent-collapse]]）
+- 协议客户端：`src/renderer/src/lib/serveClient.ts`、`lib/{desktop,cn,persist,lineDiff,lang}.ts`
+- 组件：`components/{Sidebar,ChatPanel,SettingsPanel,StorePage,KnowledgePage,FileTreePanel,EditorArea,BrowserPanel,TerminalPanel,ShellPanel,TurnTrace,HtmlRenderer,monaco/*}.tsx`（`ManagePanel`/`common.tsx` 已删；`RunPanel` 已由 `ShellPanel` 取代；Markdown 渲染 mermaid / `html type="renderer"` 沙箱块 / xfile 本地图片见 [[0051_visualization-image-render]]）
+- 配置：`electron.vite.config.ts`、`tailwind.config.cjs`、`package.json`（含 electron-builder dist 脚本）；npm 走内部镜像（lockfile 本地重生成，见自动记忆）
 
 ## Roadmap（README §路线 + 代码标记）
 
 | 阶段 | 内容 | 现状 |
 |------|------|------|
 | **P0** | serve 接入（`xihe-ops` 槽真实流式对话） | ✅ **已落地** |
-| **F1** | main 托管 `xihe serve` 生命周期（spawn/health/restart/cleanup）+ 花名册收敛为内置 xihe + 去 "serve" 措辞 | 下一步（[[0026]] 定调） |
-| ~~**P1**~~ | ~~persona 层：一个 xihe 进程挂多 persona（`xihe-research` 占位）~~ | ❌ **废弃**（persona 在 xihe-agent 侧已回退 [[0017]]/[[0018]]；[[0026]] 不再留假槽） |
-| **P2** | claude = **可添加 agent 类型**（connector + 凭据金库）；UI 占位（`claude-dev` → disabled IA 槽） | demo 占位（[[0026]]：现在只锁语义，不实现 connector） |
-| **P3** | 调度 / skill / MCP 管理 UI（`ManagePanel`） | MCP/skills/cron 已**只读接入**（serve `/mcp`/`/skills`/`/cron` + 桌面渲染）；凭据节静态；写入路径未做 |
-| **P4** | CodeBuddy / 远程 provider | 仅 `EngineKind` 枚举值 |
+| **F1** | main 托管 `xihe serve` 生命周期 + 花名册收敛为内置 xihe + 去 "serve" 措辞 | ✅ **已落地**（[[0026]]） |
+| ~~**P1**~~ | ~~persona 层~~ | ❌ **废弃** |
+| **P2** | claude 桌面并列引擎 | ❌ **路线放弃**——claude/codex 改走 xihe 的 `external_agent` 工具（[[0040]]），桌面不设并列入口 |
+| **P3** | 管理 UI | ✅ **读写都接入**（`SettingsPanel`：MCP/skills/cron 只读 + 配置编辑器行级写回 + specialists 可视化 CRUD；`StorePage`/`KnowledgePage` 独立页） |
+| **P4** | CodeBuddy / 远程 provider | ❌ **放弃**（`EngineKind` 枚举已删，[[0047]]） |
 
 ## 设计权衡与未完成项
 
@@ -148,7 +150,7 @@ Provider  ──(引擎 / 连接)──  Agent  ──(人格 / 实例)──  S
 - **`brand.soft` 死 token**：Tailwind 声明了没用。
 - **「添加 Agent」禁用**：无创建流。
 - **无中断 UI**：`ServeStream.interrupt` 已实现但没按钮。
-- **无打包**：README 明说 `electron-builder` 配置待加；scripts 只有 dev/build/preview。
+- **~~无打包~~**（订正 2026-09-14：`electron-builder` dist 脚本已就位——NSIS/portable/AppImage/deb/dmg，见 [[0030_packaging-distribution-strategy]]）。
 - **事件渲染部分**：P0 只渲染 text/complete/error；thought_delta / tool_call / tool_result 待 P1+（store.ts:135 注释）。
 - **`deliberateClose` 从不置 true**：重连逻辑缺优雅关闭路径——目前靠 socket 掉线触发，应用退出时可能留一次无谓重连。
 - **StrictMode 双触发**（dev）：两次握手无害，但 P1 接多人格/多会话时需清理（避免重复 WS）。

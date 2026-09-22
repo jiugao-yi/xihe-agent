@@ -67,12 +67,12 @@ def make_agent(fake_config):
     from core.agent import XiheAgent
 
     def _make(client, **kwargs):
+        defaults = {"is_subagent": True, "system_prompt_override": "Test agent."}
+        defaults.update(kwargs)
         return XiheAgent(
             config=fake_config,
-            client=client,
-            is_subagent=True,
-            system_prompt_override="Test agent.",
-            **kwargs,
+            llm_client=client,
+            **defaults,
         )
 
     return _make

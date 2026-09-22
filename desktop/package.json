@@ -1,7 +1,7 @@
 {
   "name": "xihe-desktop",
   "version": "1.0.0",
-  "description": "xihe desktop — control plane for xihe agents",
+  "description": "xihe desktop — control plane for the built-in xihe agent",
   "main": "./out/main/index.js",
   "author": {
     "name": "maozl",

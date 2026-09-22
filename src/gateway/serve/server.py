@@ -3,7 +3,7 @@
 ServeApp — the mixin-composition shell with the shared state — lives HERE,
 next to run_serve that composes and runs the process (reading "how serve is
 put together" shouldn't hop files). Business handlers live in business-module
-mixins (system / chat / admin / browser), each owning its add_routes."""
+mixins (system / conversations / admin / browser), each owning its add_routes."""
 
 import asyncio
 import logging
@@ -19,11 +19,11 @@ try:
 except ImportError:  # aiohttp < 3.10 kept it in helpers
     from aiohttp.helpers import AccessLogger
 
-from gateway.serve import admin, browser, chat, knowledge, system, terminal
+from gateway.serve import admin, browser, conversations, knowledge, system, terminal
 from gateway.serve._common import _PLATFORM
 from gateway.serve.admin import AdminMixin
 from gateway.serve.browser import BrowserMixin
-from gateway.serve.chat import ChatMixin
+from gateway.serve.conversations import ChatMixin
 from gateway.serve.system import SystemMixin
 
 logger = logging.getLogger(__name__)
@@ -76,6 +76,11 @@ class ServeApp(SystemMixin, AdminMixin, BrowserMixin, ChatMixin):
         # conv_id → asyncio.Lock (the dict itself is event-loop-thread only;
         # the lock guards the await span) — see ChatMixin._turn_lock.
         self._turn_locks: dict[str, asyncio.Lock] = {}
+        # conv_ids with a turn actually running (queued-behind-lock sends are
+        # NOT here — the flag flips only once the turn starts draining). Feeds
+        # list_sessions' `running` field so the desktop sidebar can badge
+        # in-flight conversations. Event-loop thread only, no lock.
+        self._running_convs: set[str] = set()
         # conv_id → WebSocketResponse an in-flight turn streams to (None after
         # the socket died — turn keeps running detached). A reconnected client
         # re-attaches via the `attach` frame. Event-loop thread only, no lock.
@@ -162,7 +167,7 @@ def run_serve(config: dict, host: str = "127.0.0.1", port: int = 7788,
     # its WS. "serve" alias routes `deliver: origin` jobs; explicit
     # `desktop:<conv_id>` targets work too.
     from core.services.scheduler import register_channel
-    from gateway.serve.chat import DesktopChannel
+    from gateway.serve.conversations import DesktopChannel
     _desktop_channel = DesktopChannel(app_obj)
     register_channel("desktop", _desktop_channel)
     register_channel("serve", _desktop_channel)
@@ -172,7 +177,7 @@ def run_serve(config: dict, host: str = "127.0.0.1", port: int = 7788,
     aio.on_shutdown.append(_kill_local_channels)
     aio.router.add_route("OPTIONS", "/{tail:.*}", _options)
     system.add_routes(aio.router, app_obj)
-    chat.add_routes(aio.router, app_obj)
+    conversations.add_routes(aio.router, app_obj)
     admin.add_routes(aio.router, app_obj)
     browser.add_routes(aio.router, app_obj)
     knowledge.add_routes(aio.router)
@@ -182,7 +187,7 @@ def run_serve(config: dict, host: str = "127.0.0.1", port: int = 7788,
                 host, port, _PLATFORM, shared_ctx.main_toolsets)
     print(f"xihe serve → http://{host}:{port}\n"
           f"  ws   /stream                              (send/interrupt → streaming events)\n"
-          f"  get  /health /agents /sessions /convs/{{conv_id}}/messages\n"
+          f"  get  /health /sessions /convs/{{conv_id}}/messages\n"
           f"  get  /mcp /skills /cron /specialists /store   (管理面板/商店)\n"
           f"  get  /memory /kbs /kbs/page; put/del /memory  (记忆/知识库)\n"
           f"  get  /ssh/live; ws /ssh/live/stream; post /ssh/live/connect  (终端面板)\n"

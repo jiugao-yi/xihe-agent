@@ -47,7 +47,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from core.support.proc_utils import kill_tree, list_process_command_line, process_alive
 from core.support.safe_env import build_safe_env, sanitize_error
@@ -195,7 +195,7 @@ def _add_pid(entry: dict) -> None:
     _write_pids(entries)
 
 
-def _remove_pid(pid) -> None:
+def _remove_pid(pid: Any) -> None:
     if not pid:
         return
     _write_pids([e for e in _read_pids() if e.get("pid") != pid])
@@ -278,14 +278,15 @@ def _spawn_cli(bin_resolved: str, args: List[str], cwd: str,
     else:
         # New process group (harmless; taskkill /T walks the tree regardless).
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    return subprocess.Popen(_routed_argv(bin_resolved, args), **popen_kwargs)
+    return subprocess.Popen(_routed_argv(bin_resolved, args), **popen_kwargs)  # type: ignore[call-overload]  # creationflags/start_new_session 平台互斥
 
 
 def _start_stderr_drain(proc: subprocess.Popen, buf: List[str],
                         tag: str) -> threading.Thread:
     """Drain stderr on a daemon thread — an undrained pipe eventually blocks
     the child. Tail lands in *buf* for timeout/error messages."""
-    def _drain():
+    def _drain() -> None:
+        assert proc.stderr is not None  # stderr=PIPE 由 _spawn 保证
         try:
             while True:
                 raw = proc.stderr.readline()
@@ -336,7 +337,7 @@ class CodexDriver(_SweptDriver):
         stderr_buf: List[str] = []
         _start_stderr_drain(proc, stderr_buf, f"codex-{session_key}")
 
-        scratch = {
+        scratch: dict = {
             "thread_id": None,
             "texts": [],           # agent_message item texts, in order
             "done": False,
@@ -353,6 +354,7 @@ class CodexDriver(_SweptDriver):
             # EOF or it hangs at "Reading additional input from stdin...".)
             if spec.debug:
                 _log_traffic(f">>> PROMPT (codex) session={session_key}\n{prompt}")
+            assert proc.stdin is not None and proc.stdout is not None  # PIPE 由 _spawn 保证
             proc.stdin.write(prompt.encode("utf-8"))
             proc.stdin.flush()
             proc.stdin.close()
@@ -547,7 +549,7 @@ class CodexDriver(_SweptDriver):
                                 "args": "", "elapsed": 0})
 
     def _build_result(self, scratch: dict, t0: float,
-                      is_interrupted_fn) -> ExternalAgentResult:
+                      is_interrupted_fn: Callable[[], bool]) -> ExternalAgentResult:
         duration = round(time.monotonic() - t0, 2)
         if scratch["done"]:
             reason = scratch["exit_reason"] or "completed"
@@ -640,6 +642,10 @@ class ClaudeDriver(_SweptDriver):
 
         s = reuse
         self._cancel_idle(s)
+        # _spawn 成功或 warm 复用（上面已把 proc 死/停的会话踢掉重起），
+        # 此处 proc 必在——收窄一次，后面 stdin/stdout 免 union 检查。
+        proc = s.proc
+        assert proc is not None
 
         # Attach the proc to the agent bound around tool dispatch so
         # agent.interrupt → kill_subprocesses unblocks the read loop. Done
@@ -648,10 +654,10 @@ class ClaudeDriver(_SweptDriver):
         # NameError, which _spawn's except swallowed, so /stop never killed
         # anything), and every turn must re-attach anyway: a warm session was
         # unregistered by the previous turn's exit.
-        kill_handle = _TreeKillHandle(s.proc.pid)
+        kill_handle = _TreeKillHandle(proc.pid)
         register_subprocess(kill_handle)
 
-        scratch = {
+        scratch: dict = {
             "tool_blocks": {},      # content_block index → {name, json}
             "tool_use_names": {},   # tool_use id → name
             "streamed_text": False,
@@ -674,8 +680,9 @@ class ClaudeDriver(_SweptDriver):
         if spec.debug:
             _log_traffic(f">>> PROMPT session={session_key}\n{prompt}")
         try:
-            s.proc.stdin.write(line.encode("utf-8"))
-            s.proc.stdin.flush()
+            assert proc.stdin is not None  # PIPE 由会话保证
+            proc.stdin.write(line.encode("utf-8"))
+            proc.stdin.flush()
         except Exception as e:
             scratch["done"] = True
             scratch["exit_reason"] = "failed"
@@ -684,8 +691,9 @@ class ClaudeDriver(_SweptDriver):
         # Read stdout until this turn's result frame (or proc death).
         if not scratch["done"]:
             try:
+                assert proc.stdout is not None  # PIPE 由会话保证
                 while True:
-                    raw = s.proc.stdout.readline()
+                    raw = proc.stdout.readline()
                     if not raw:
                         break  # EOF — proc died (interrupt / crash / teardown)
                     text = raw.decode("utf-8", "replace").strip()
@@ -823,7 +831,7 @@ class ClaudeDriver(_SweptDriver):
         elif t == "result":
             self._on_result(scratch, obj)
 
-    def _on_stream_event(self, scratch: dict, ev) -> None:
+    def _on_stream_event(self, scratch: dict, ev: object) -> None:
         if not isinstance(ev, dict):
             return
         et = ev.get("type")
@@ -877,7 +885,8 @@ class ClaudeDriver(_SweptDriver):
     def _on_result(self, scratch: dict, obj: dict) -> None:
         subtype = obj.get("subtype")
         is_error = bool(subtype) and subtype != "success"
-        text = obj.get("result") if isinstance(obj.get("result"), str) else ""
+        raw_result = obj.get("result")
+        text: str = raw_result if isinstance(raw_result, str) else ""
         if is_error:
             msg = text or f"claude 错误：{subtype}"
             _finalize(scratch, exit_reason="failed", error=msg,
@@ -890,7 +899,7 @@ class ClaudeDriver(_SweptDriver):
         _finalize(scratch, exit_reason="completed", final_text=text)
 
     def _build_result(self, s: _ClaudeSession, scratch: dict, t0: float,
-                      is_interrupted_fn) -> ExternalAgentResult:
+                      is_interrupted_fn: Callable[[], bool]) -> ExternalAgentResult:
         duration = round(time.monotonic() - t0, 2)
         if scratch["done"]:
             reason = scratch["exit_reason"] or "completed"
@@ -949,14 +958,16 @@ class ClaudeDriver(_SweptDriver):
         if s.proc:
             kill_tree(s.proc.pid)
             _remove_pid(s.proc.pid)
-            try:
-                s.proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                s.proc.stdout.close()
-            except Exception:
-                pass
+            if s.proc.stdin:
+                try:
+                    s.proc.stdin.close()
+                except Exception:
+                    pass
+            if s.proc.stdout:
+                try:
+                    s.proc.stdout.close()
+                except Exception:
+                    pass
         with self._map_lock:
             if self._sessions.get(s.session_key) is s:
                 self._sessions.pop(s.session_key, None)

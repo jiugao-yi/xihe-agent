@@ -14,7 +14,7 @@ tags:
   - config
 status: active
 created: 2026-08-17
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/changes/0035_three-layer-roster-unification.md
   - wiki/concepts/0032_specialist-agents.md
@@ -25,6 +25,8 @@ related_pages:
 
 # 三层 Agent 名单模型（主 / 专家 / delegate）
 
+> ⚠️ **base 地板订正（2026-09-14）**：下文「不写/`[]` = **不加载任何工具**」的表述已过时——`XiheAgent.__init__` 会把 **`base` 读面地板强制并入每个受限名单**（`[]` 也一样；纯聊天零工具被判定为 footgun 而放弃）。现行语义：**agent 表面 = (base ∪ roster) − blocked**；`[]` = 只剩 base（12 个读面工具），`None` 仍是全量。`is not None` 不变式不变。另：delegate 默认组是 **6 组无 memory**（files/terminal/dev_tool/http/web/media）；`subagent_blocked` 现行全集里 **external_agent 不在其中**（可委派外部引擎），全集以 `core/toolsets.py` 的 `SUBAGENT_BLOCKED_TOOLS` 文档清单 + 测试为准。
+
 ## 摘要
 
 xihe 有三层 agent，每层的 tool/skill/MCP 名单来源不同，但**主 agent 与专家 agent 共用同一个解析函数** `core.toolsets.resolve_roster(spec)`——主 agent 的 spec 就是 config.yaml 本身（顶层 `toolsets`/`skills` 键，与 `model` 并列），专家的 spec 是 `agents/<slug>.yaml`。**不存在任何 main 专属解析逻辑**（无 `resolve_main_toolsets` 之类分叉；这是用户明确裁决：两者配置项基本一致，语义必须一条路）。delegate 临时子 agent 不走配置，名单是运行时 `toolsets` 参数，与父名单**完全独立**。
@@ -32,7 +34,7 @@ xihe 有三层 agent，每层的 tool/skill/MCP 名单来源不同，但**主 ag
 | 层 | 名单来源 | 解析路径 |
 |---|---|---|
 | 主 agent | config.yaml 顶层 `toolsets` / `skills` | `resolve_roster(config)`，SharedContext 启动时解析一次 |
-| 专家 agent | `agents/<slug>.yaml` 同名键 | `resolve_roster(spec)`，`_parse_def` 内；受 `specialists.enabled` 总闸 |
+| 专家 agent | `agents/<slug>.yaml` 同名键（用户文件受 `specialists.enabled` 总闸；bundled `src/agents/` 不受） | `resolve_roster(spec)`，`_parse_def` 内 |
 | delegate 子 agent | 运行时 `toolsets` 参数三态 | `delegate_tool._resolve_allowed_toolsets`，不经 resolve_roster |
 
 ## 统一名单语义（resolve_roster）
@@ -68,7 +70,7 @@ set(enabled_toolsets) if enabled_toolsets is not None else None
 
 ## 主 agent：config.yaml 顶层键
 
-- `SharedContext.__init__`（`core/context.py`）在 MCP discovery 之后解析一次，存 `main_toolsets` / `main_skills`；三个入口（CLI `init_agent`、gateway `server.py` 每消息 agent、serve `_handle_send` 每轮 agent）都把它传给 `create_agent()`——**一个 xihe 进程内主 agent 名单全局一致**。
+- `SharedContext.__init__`（`core/context.py`）解析一次（经 `merge_mounts` 与商店 mount 并集），存 `main_toolsets` / `main_skills`；三个入口（CLI `init_agent`、gateway `bot.py` 每消息 agent、serve `_handle_send` 每轮 agent）都把它传给 `create_agent()`——**一个 xihe 进程内主 agent 名单全局一致**。
 - `create_agent()` 无参调用（cron 任务、斜杠命令的上下文 agent）**保持全量**，不受主名单影响——定时任务和命令需要完整能力，这是设计而非遗漏。
 - 推荐形态：主 agent 只当协调者（slim 名单 + `request_tools` 按需扩展，见 [[0013]]），专业工具交给专家 / delegate。用户实机：7 组 → 49 工具（32 个来自两个 MCP 服务器）。
 - serve 的 `_capabilities(toolsets)` 能力描述符**按主名单收敛**（走 `get_schemas`，含 check_fn 门控）——slim 主 agent 不虚报 browser/mcp 角标，桌面 capability-driven UI 不误导。
@@ -78,16 +80,16 @@ set(enabled_toolsets) if enabled_toolsets is not None else None
 ## 专家 agent：yaml + 总闸
 
 - `agents/<slug>.yaml` 的 `toolsets`/`skills` 与主 agent **同名同语义**（上表）。与 [[0032]] 记录时的差异：**不再有「默认 `[files, memory]`」**——统一语义下不写就是不加载（告警）；桌面表单预填 files+memory 只是 UI 缺省，非语义缺省。
-- `specialists.enabled`（config.yaml section，**默认 false**）是派发总闸：关 = `register_specialist_agent_tools()` 直接返回，`run_*_agent` 不注册、提示词花名册层自动消失（花名册按实际可调用工具过滤）；yaml 文件仍可编辑（`GET /specialists` 返回 `specialists_enabled` 供客户端区分「配置关」和「待重启」）。普通用户不需要专家委派，agents/ 目录里有文件不等于暴露派发工具。
+- `specialists.enabled`（config.yaml section，**默认 false**）是**用户自定义专家**的派发总闸：关 = 用户 `run_*_agent` 不注册、花名册层只列 bundled（**bundled `src/agents/` 不受闸控**，`register_specialist_agent_tools` 委托 sync 仍注册它们）；yaml 文件仍可编辑（`GET /specialists` 返回 `specialists_enabled`；serve 写入即时生效无「待重启」概念，见 [[0032]]）。普通用户不需要专家委派，agents/ 目录里有文件不等于暴露派发工具。
 - persona 走 `identity_override`，其余分层照常（区别于 delegate 的 wholesale 覆盖，详见 [[0032]]）。
 
 ## delegate 子 agent：运行时三态
 
-- `toolsets` 参数：**缺省/`[]` → `DEFAULT_TOOLSETS`**（files/terminal/dev_tool/http/web/memory/media）；`["*"]` → 全量；指定名单 → 原样尊重（**不与父名单交集**）。全部非法名 → 回退默认。
+- `toolsets` 参数：**缺省/`[]` → `DELEGATE_DEFAULT_TOOLSETS`**（files/terminal/dev_tool/http/web/media——**6 组无 memory**）；`["*"]` → 全量；指定名单 → 原样尊重（**不与父名单交集**）。全部非法名 → 回退默认。子 agent 同样吃 base 地板并入。
 - 独立性是设计决策：主 agent slim 化后，若子 agent 继承父名单会被饿死（父没有的组子也拿不到）；安全性不靠名单继承，靠 `subagent_blocked` 标签。
 - `subagent_blocked=True` 全集（12 类）：delegate_task（递归）、clarify / send_message / send_image（用户交互）、cronjob（副作用调度）、skill_manage（技能变更）、external_agent、`run_*_agent`（跨 agent 派发）、kbs_init（写脚手架；kbs_status/kbs_search 仍可用）、web_record / browser_record（录制）、browser_state_delete。经 `registry.get_schemas(subagent=True)` 过滤。
 - 硬边界：`MAX_DEPTH=2`、max_iterations 硬帽 60。
-- 子 agent **没有技能索引**：`system_prompt_override` 整体替换提示词，短路了 `_build_system_prompt`；技能只能经 `skills` toolset 的 skills_list/skill_view 工具访问，而默认 7 组不含 `skills`。
+- 子 agent **没有技能索引**：`system_prompt_override` 整体替换提示词，短路了 `_build_system_prompt`；但 skills_list/skill_view 在 base 地板里，子 agent 仍可**按名**查技能（只是没有索引推荐）。（订正 2026-09-14：原文「默认 7 组」应为 6 组、且 base 地板使其可见。）
 
 ## 设计裁决记录（为什么主 agent 不单独建模）
 

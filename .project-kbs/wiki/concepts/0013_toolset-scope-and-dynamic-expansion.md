@@ -14,7 +14,7 @@ tags:
   - optimization
 status: active
 created: 2026-07-10
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0002_tool-registry-and-dispatch.md
   - wiki/concepts/0011_gateway-architecture.md
@@ -23,11 +23,15 @@ related_pages:
 
 # Toolset Scope 与按需工具展开
 
-> **⚠️ 目录部分已过时（2026-08-16 订正）**：下文「12 个 toolset 分层表」是历史形态。现行为 **14 个带中文标签的平铺组**——组合预设（debugging/safe/research/coding/full）与 `includes` 递归机制**已删除**（零消费者）、死组 `browser_scripts` 已删除、`core` 四拆为 files/terminal/dev_tool/http、`agent` 拆出 `skills`、`directory_tree` 补列。`DEFAULT_TOOLSETS = [files, terminal, dev_tool, http, memory, communication, agent, skills, ssh]`。本文的**裁剪 + request_tools 按需展开机制仍完全有效**，仅组目录以 [[0033_specialist-toolset-overhaul]] 为准。
+> **⚠️ 目录与配置形态已过时（2026-08-16 订正 + 2026-09-14 再订正）**：下文「12 个 toolset 分层表」是历史形态。现行要点：
+> 1. **18 个平铺组**（14 组之后又增 `base` 读面地板 / `computer` 桌面 / `external_agents` / `meta` 工具自扩展），组目录以 `core/toolsets.py` 与 [[0033_specialist-toolset-overhaul]] 为准。
+> 2. **`DEFAULT_TOOLSETS` 常量已不存在**。主 agent 名单 = config.yaml **顶层 `toolsets`/`skills` 键**：不写或 `[]` = 只剩 `base` 读面地板（12 工具）；`["*"]` = 全量；名单 = 白名单（`mcp`/`mcp-<server>` 永远保留）。CLI **同样**走主名单（无「CLI 始终全量」）；delegate 无请求时默认 `[files, terminal, dev_tool, http, web, media]`。见 [[0034_three-layer-agent-roster]]。
+> 3. 下文的 `session.toolset_scope: smart|all` 配置**从未实现**，忽略。
+> 4. `request_tools` 不再 always-on——注册在 `http`（`meta` 亦有工具自扩展），名单没含它就没有按需展开；其 schema 为静态枚举 `["web","media","scheduler"]`。展开状态 `_expansion_state` 无清空逻辑，靠 gateway/serve 每回合新 agent 自然重置（长生命周期 CLI agent 会累积）。
 
 ## 摘要
 
-xihe 有 ~65 个工具，每轮全部注入 system prompt 约 ~10-15k token。其中 browser 工具族（36 个）占了大头但大部分任务不用。通过 **toolset scope** 机制：gateway 模式默认只加载核心 toolset（~37 工具），agent 通过 `request_tools` 元工具按需展开 web/media/scheduler。省 ~4-6k token/轮。
+工具全量注入 system prompt 的 token 成本可观（browser 族占大头但多数任务不用）。**toolset scope** 机制：主 agent 按 config `toolsets` 名单裁剪暴露面（不写 = 只剩 base 读面地板），agent 通过 `request_tools` 元工具按需展开 web/media/scheduler（名单含 `http` 时可用）。本页的按需展开机制叙述仍有效；分组目录与默认名单见页首订正注记。
 
 ## Toolset 分层
 

@@ -115,8 +115,8 @@ def check_connectivity(base_url: str, api_key: str, timeout: float = 8.0) -> dic
     if resp.status_code == 200:
         try:
             data = resp.json().get("data", [])
-            out["models"] = sorted({m.get("id") for m in data
-                                    if isinstance(m, dict) and m.get("id")})
+            out["models"] = sorted(str(m.get("id")) for m in data
+                                   if isinstance(m, dict) and m.get("id"))
         except Exception:
             pass
     elif resp.status_code in (401, 403):
@@ -148,7 +148,7 @@ def _vision_model_present(config: dict) -> bool:
     return bool(vision.get("model"))
 
 
-def main_agent_names(config: dict):
+def main_agent_names(config: dict) -> tuple[set, list | None, list[str]]:
     """Agent-visible tool names for the main roster, resolved exactly like
     SharedContext does (roster + store mounts + base floor). Returns
     (names, toolsets, warnings)."""
@@ -156,6 +156,8 @@ def main_agent_names(config: dict):
     from core.toolsets import resolve_roster
     from core.services.store import merge_mounts
     warnings: list[str] = []
+    toolsets: list | set | None
+    skills: list | set | None
     toolsets, skills = resolve_roster(config, where="config.yaml",
                                       warnings=warnings)
     toolsets, skills = merge_mounts("main", toolsets, skills)
@@ -169,12 +171,13 @@ def main_agent_names(config: dict):
         eff = set(toolsets) | {"base"} if toolsets else set()
     schemas = registry.get_schemas(toolsets=eff)
     names = {s["function"]["name"] for s in schemas}
-    return names, toolsets, warnings
+    return names, list(toolsets) if toolsets is not None else None, warnings
 
 
-def capability_matrix(config: dict, toolsets, names: set) -> dict:
+def capability_matrix(config: dict, toolsets: list | None,
+                      names: set) -> dict:
     """{capability: {ready, reason}} — reason carries the fix when off."""
-    def cap(ready, reason=None):
+    def cap(ready: object, reason: str | None = None) -> dict:
         return {"ready": bool(ready), "reason": reason}
 
     def roster_lacks(group):

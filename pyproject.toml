@@ -21,9 +21,14 @@ dependencies = [
     "psutil>=5.9",
     "paddleocr>=3.7,<4",
     "paddlepaddle>=3.0",
+    "matplotlib>=3.8",
+    "markdown>=3.5",
+    "openpyxl>=3.1",
+    "python-docx>=1.1",
     # Test dependency. Kept in the main list so `pip install -e .` in a dev
     # environment pulls it; mirrored in requirements.txt.
     "pytest>=7.0",
+    "mypy>=1.0",
 ]
 
 [project.scripts]
@@ -38,6 +43,27 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 python_files = "test_*.py"
 addopts = "-q"
+
+# 渐进式类型化，目标是"类型即文档"而非全量形式化：
+# - 标注给"人读代码"服务——公共 API、跨模块边界、语义不自明的参数必须标；
+#   一眼能看出类型的基础/私有函数允许全裸，但禁止半裸（标一半），避免误导。
+# - check_untyped_defs 让裸函数体照样参与检查；第三方缺 stub 的包豁免。
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["core.*", "core"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = true
+
+[[tool.mypy.overrides]]
+module = ["tools.*", "gateway.*", "cli.*", "app.*", "tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = true
 
 [build-system]
 requires = ["setuptools>=68.0"]

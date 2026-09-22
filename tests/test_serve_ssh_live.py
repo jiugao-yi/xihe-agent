@@ -12,19 +12,11 @@ import pytest
 
 from gateway.serve import terminal as sr
 from tools import _ssh_tap as tap_mod
-from tools.ssh_tool import SSHSession, tool_result
 
 
 class FakeRequest:
-    def __init__(self, query=None, body=None, body_raises=False):
+    def __init__(self, query=None):
         self.query = query or {}
-        self._body = body
-        self._body_raises = body_raises
-
-    async def json(self):
-        if self._body_raises:
-            raise ValueError("no json")
-        return self._body
 
 
 def _payload(resp):
@@ -67,7 +59,7 @@ def _tap(name="t1", prefill="", channel=None):
     # registry key = session_key|alias, like ssh_tool._skey produces
     key = f"agent:main:serve:dm:c1|{name}"
     tap = tap_mod.attach(key, channel=channel, meta={
-        "host": "h", "user": "u", "mode": "shell", "origin": "agent",
+        "host": "h", "user": "u", "mode": "shell",
         "alias": name, "session_key": "agent:main:serve:dm:c1",
         "cols": 100, "rows": 30,
     })
@@ -84,56 +76,8 @@ def test_ssh_live_lists_sessions():
     _tap("live1", prefill="hello\n[user@h ~]$ ")
     p = _payload(asyncio.run(sr.ssh_live(FakeRequest())))
     row = next(r for r in p["sessions"] if r["name"] == "live1")
-    assert row["mode"] == "shell" and row["origin"] == "agent"
+    assert row["mode"] == "shell"
     assert row["alive"] is True and row["closed"] is False
-
-
-# ---------------------------------------------------------------------------
-# POST /ssh/live/connect
-
-def test_connect_requires_name_and_secret():
-    r = asyncio.run(sr.ssh_live_connect(FakeRequest(body={"host": "h"})))
-    assert r.status == 400
-    r = asyncio.run(sr.ssh_live_connect(
-        FakeRequest(body={"name": "n", "host": "h", "user": "u"})))
-    assert r.status == 400
-
-
-def test_connect_requires_int_port():
-    r = asyncio.run(sr.ssh_live_connect(FakeRequest(
-        body={"name": "n", "host": "h", "user": "u", "token": "x",
-              "port": "abc"})))
-    assert r.status == 400
-
-
-def test_connect_routes_through_ssh_tool_with_desktop_origin(monkeypatch):
-    from tools import ssh_tool
-    captured = {}
-
-    def fake_connect(args, **kw):
-        captured.update(args=args, kw=kw)
-        return tool_result(success=True, session=args["name"], mode="shell",
-                           message="Connected")
-
-    monkeypatch.setattr(ssh_tool, "_ssh_connect", fake_connect)
-    body = {"name": "bastion", "host": "h", "user": "u", "token": "secret-tok",
-            "session_key": "agent:main:serve:dm:c1"}
-    resp = asyncio.run(sr.ssh_live_connect(FakeRequest(body=body)))
-    p = _payload(resp)
-    assert p["ok"] is True and p["session"] == "bastion"
-    assert captured["kw"]["origin"] == "desktop"
-    assert captured["kw"]["context"]["session_key"] == body["session_key"]
-    assert captured["args"]["token"] == "secret-tok"
-    assert "secret-tok" not in resp.text      # secret never echoes
-
-
-def test_connect_maps_tool_error_to_ok_false(monkeypatch):
-    from tools import ssh_tool
-    monkeypatch.setattr(ssh_tool, "_ssh_connect",
-                        lambda args, **kw: '{"error": "auth failed"}')
-    p = _payload(asyncio.run(sr.ssh_live_connect(FakeRequest(
-        body={"name": "n", "host": "h", "user": "u", "token": "x"}))))
-    assert p["ok"] is False and p["error"] == "auth failed"
 
 
 # ---------------------------------------------------------------------------
@@ -317,4 +261,4 @@ def test_add_routes_registers_ssh_live():
     app = web.Application()
     sr.add_routes(app.router)
     paths = {r.resource.canonical for r in app.router.routes()}
-    assert paths >= {"/ssh/live", "/ssh/live/stream", "/ssh/live/connect"}
+    assert paths >= {"/ssh/live", "/ssh/live/stream", "/local/live"}

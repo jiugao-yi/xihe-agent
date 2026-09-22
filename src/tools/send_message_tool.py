@@ -145,6 +145,87 @@ def _send_image(args: dict, **kw) -> str:
             return tool_error(f"Failed to send image: {e}")
 
 
+def _send_file(args: dict, **kw) -> str:
+    """Send a file to the current chat (queued for the gateway to drain after
+    chat() returns) or a specific chat (direct adapter send_document)."""
+    context = kw.get("context", {}) or {}
+    chat_id = args.get("chat_id") or context.get("chat_id", "")
+    file_path = args.get("file_path", "")
+    caption = args.get("caption", "")
+
+    if not file_path:
+        return tool_error("file_path is required")
+
+    p = Path(file_path).expanduser()
+    if not p.is_absolute():
+        p = (Path.cwd() / p).resolve()
+    if not p.exists():
+        return tool_error(f"File not found: {p}")
+    file_path = str(p)
+
+    current_chat = context.get("chat_id", "")
+    is_current_chat = (not chat_id) or (chat_id == current_chat)
+
+    if is_current_chat:
+        with _pending_media_lock:
+            _pending_media.append({
+                "type": "file",
+                "path": file_path,
+                "caption": caption,
+                "reply_to_msg_id": context.get("msg_id", ""),
+            })
+        return tool_result(success=True, file_path=file_path,
+                           note="File will be sent after response")
+
+    if not _adapter:
+        return tool_error("Platform adapter not available")
+    if not hasattr(_adapter, 'send_document'):
+        return tool_error("Current platform does not support sending files")
+
+    try:
+        result = _run_async(_adapter.send_document(chat_id, file_path, caption=caption))
+        success = getattr(result, 'success', False)
+        if success:
+            return tool_result(success=True, chat_id=chat_id, file_path=file_path)
+        error = getattr(result, 'error', 'unknown error')
+        return tool_error(f"Failed to send file: {error}")
+    except Exception as e:
+        logger.exception("Failed to send file")
+        return tool_error(f"Failed to send file: {e}")
+
+
+registry.register(
+    name="send_file",
+    schema={
+        "type": "function",
+        "function": {
+            "name": "send_file",
+            "description": (
+                "Send a local file (report.xlsx / report.docx / archive...) to "
+                "the current chat or a specific chat. If chat_id is not "
+                "provided, sends to the current conversation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string",
+                                  "description": "Local path of the file to send"},
+                    "chat_id": {"type": "string",
+                                "description": "Target chat ID (optional, uses current chat if not provided)"},
+                    "caption": {"type": "string",
+                                "description": "Optional caption sent before the file"},
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
+    handler=lambda args, **kw: _send_file(args, **kw),
+    path_params=("file_path",),
+    check_fn=_check_send_message,
+    toolset="communication",
+    subagent_blocked=True,
+)
+
 registry.register(
     name="send_message",
     schema={
@@ -204,6 +285,46 @@ registry.register(
     },
     handler=lambda args, **kw: _send_image(args, **kw),
     path_params=("image_path",),
+    check_fn=_check_send_message,
+    toolset="communication",
+    subagent_blocked=True,
+)
+
+registry.register(
+    name="send_file",
+    schema={
+        "type": "function",
+        "function": {
+            "name": "send_file",
+            "description": (
+                "Send a local file (document/archive/office doc/audio/video/any "
+                "non-image file) to the current chat or a specific chat as a "
+                "file attachment. For images prefer send_image (inline preview); "
+                "for rendered charts/diagrams prefer image_render + send_image. "
+                "If chat_id is not provided, delivers after the current reply."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute or cwd-relative path of the local file to send"
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Target chat ID (optional, uses current chat if not provided)"
+                    },
+                    "caption": {
+                        "type": "string",
+                        "description": "Optional caption / one-line description of the file"
+                    },
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
+    handler=lambda args, **kw: _send_file(args, **kw),
+    path_params=("file_path",),
     check_fn=_check_send_message,
     toolset="communication",
     subagent_blocked=True,

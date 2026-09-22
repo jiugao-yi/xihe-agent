@@ -3,6 +3,7 @@ import {
   ChevronLeft,
   Folder,
   FolderPlus,
+  Loader2,
   MessageSquare,
   PanelLeftClose,
   PanelLeftOpen,
@@ -23,10 +24,12 @@ import logoUrl from '../assets/logo.png'
 const MIN_SIDEBAR_W = 208
 
 export function Sidebar() {
-  const agents = useStore((s) => s.agents)
-  const selectedId = useStore((s) => s.selectedAgentId)
+  const conversations = useStore((s) => s.conversations)
+  const activeConvId = useStore((s) => s.activeConvId)
   const serveConnected = useStore((s) => s.serveConnected)
   const serveVersion = useStore((s) => s.serveVersion)
+  const serveModel = useStore((s) => s.serveModel)
+  const xiheConfig = useStore((s) => s.xiheConfig)
   const xiheStatus = useStore((s) => s.xiheStatus)
   const newConversation = useStore((s) => s.newConversation)
   const selectConversation = useStore((s) => s.selectConversation)
@@ -51,20 +54,15 @@ export function Sidebar() {
   const [sidebarW, setSidebarW] = usePanelSize('sidebarWidth', 256, MIN_SIDEBAR_W)
   const asideRef = useRef<HTMLElement>(null)
 
-  // In workspace view the sidebar scopes to one workspace's conversations.
-  // Those convs live under the selected agent (xihe); convWorkspace is what
-  // filters them down to this workspace.
+  // In workspace view the sidebar scopes to one workspace's conversations;
+  // convWorkspace is what filters them down to this workspace.
   const activeWsObj = activeWorkspaceId
     ? workspaces.find((w) => w.id === activeWorkspaceId)
     : undefined
-  const wsAgent = activeWorkspaceId ? agents.find((a) => a.id === selectedId) : undefined
-  const boundConvs =
-    activeWorkspaceId && wsAgent
-      ? wsAgent.conversations.filter((c) => convWorkspace[c.id] === activeWorkspaceId)
-      : []
-  // Single built-in agent (xihe) — its conversations are shown directly at the
-  // top, no agent grouping/selection layer.
-  const selAgent = agents.find((a) => a.id === selectedId) ?? agents[0]
+  const boundConvs = activeWorkspaceId
+    ? conversations.filter((c) => convWorkspace[c.id] === activeWorkspaceId)
+    : []
+  const modelLabel = serveModel || xiheConfig.model
 
   return (
     <aside
@@ -79,8 +77,7 @@ export function Sidebar() {
             setRailTab('convs')
             setCollapsed(false)
             // Inside a workspace the railTab branch is masked by
-            // activeWorkspaceId — navigating to 对话 must leave the view,
-            // same as select() does when picking an agent.
+            // activeWorkspaceId — navigating to 对话 must leave the view.
             if (activeWorkspaceId) exitWorkspace()
           }}
           title="对话"
@@ -127,9 +124,9 @@ export function Sidebar() {
         <div className="flex items-center gap-2">
           <img src={logoUrl} alt="xihe" draggable={false} className="h-6 w-6 rounded-md object-cover" />
           <div className="text-xs font-semibold">xihe</div>
-          {selAgent?.model && (
-            <div className="truncate text-[10px] text-ink-4" title={selAgent.model}>
-              {selAgent.model}
+          {modelLabel && (
+            <div className="truncate text-[10px] text-ink-4" title={modelLabel}>
+              {modelLabel}
             </div>
           )}
         </div>
@@ -170,13 +167,11 @@ export function Sidebar() {
               <ConversationRow
                 key={c.id}
                 conv={c}
-                active={!!wsAgent && c.id === wsAgent.activeConvId}
-                onSelect={() => wsAgent && selectConversation(wsAgent.id, c.id)}
-                onRename={(t) => wsAgent && void renameConversation(wsAgent.id, c.id, t)}
-                onRefresh={() => wsAgent && void refreshConversation(wsAgent.id, c.id)}
-                onDelete={() => {
-                  if (wsAgent) void deleteConversation(wsAgent.id, c.id)
-                }}
+                active={c.id === activeConvId}
+                onSelect={() => selectConversation(c.id)}
+                onRename={(t) => void renameConversation(c.id, t)}
+                onRefresh={() => void refreshConversation(c.id)}
+                onDelete={() => void deleteConversation(c.id)}
               />
             ))}
             {boundConvs.length === 0 && (
@@ -230,45 +225,37 @@ export function Sidebar() {
           </>
         ) : (
           <>
-            {selAgent && (
-              <>
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={() => newConversation(selAgent.id)}
-                    className="flex flex-1 items-center gap-1.5 rounded-md border border-dashed border-line-strong/70 px-2.5 py-1.5 text-left text-xs text-ink-4 transition hover:border-ink-4 hover:text-ink-2"
-                  >
-                    <Plus className="h-3 w-3" /> 新对话
-                  </button>
-                  {selAgent.serveBacked && (
-                    <button
-                      onClick={() => void refreshConversation(selAgent.id)}
-                      title="从xihe重新拉取会话列表"
-                      className="rounded-md p-1.5 text-ink-4 transition hover:bg-elevated hover:text-ink-2"
-                    >
-                      <RefreshCw className="h-3 w-3" />
-                    </button>
-                  )}
-                </div>
-                {selAgent.conversations.map((c) => (
-                  <ConversationRow
-                    key={c.id}
-                    conv={c}
-                    active={c.id === selAgent.activeConvId}
-                    onSelect={() => selectConversation(selAgent.id, c.id)}
-                    onRename={(t) => void renameConversation(selAgent.id, c.id, t)}
-                    onRefresh={
-                      selAgent.serveBacked
-                        ? () => void refreshConversation(selAgent.id, c.id)
-                        : undefined
-                    }
-                    refreshTitle="从xihe同步该会话历史"
-                    onDelete={() => void deleteConversation(selAgent.id, c.id)}
-                  />
-                ))}
-                {selAgent.conversations.length === 0 && (
-                  <div className="px-2.5 py-1.5 text-xs text-ink-4">暂无会话</div>
-                )}
-              </>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => newConversation()}
+                className="flex flex-1 items-center gap-1.5 rounded-md border border-dashed border-line-strong/70 px-2.5 py-1.5 text-left text-xs text-ink-4 transition hover:border-ink-4 hover:text-ink-2"
+              >
+                <Plus className="h-3 w-3" /> 新对话
+              </button>
+              {serveConnected && (
+                <button
+                  onClick={() => void refreshConversation()}
+                  title="从xihe重新拉取会话列表"
+                  className="rounded-md p-1.5 text-ink-4 transition hover:bg-elevated hover:text-ink-2"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                </button>
+              )}
+            </div>
+            {conversations.map((c) => (
+              <ConversationRow
+                key={c.id}
+                conv={c}
+                active={c.id === activeConvId}
+                onSelect={() => selectConversation(c.id)}
+                onRename={(t) => void renameConversation(c.id, t)}
+                onRefresh={serveConnected ? () => void refreshConversation(c.id) : undefined}
+                refreshTitle="从xihe同步该会话历史"
+                onDelete={() => void deleteConversation(c.id)}
+              />
+            ))}
+            {conversations.length === 0 && (
+              <div className="px-2.5 py-1.5 text-xs text-ink-4">暂无会话</div>
             )}
           </>
         )}
@@ -329,7 +316,7 @@ export function Sidebar() {
 /** A single conversation row in the sidebar: the title (click to open), with a
  *  hover toolbar of rename / sync / delete. Rename swaps the title for an inline
  *  input — Enter or blur commits, Escape cancels. Extracted so the workspace
- *  view and the agent-centric view share one implementation. */
+ *  view and the plain conversation list share one implementation. */
 function ConversationRow({
   conv,
   active,
@@ -413,7 +400,10 @@ function ConversationRow({
               : 'text-ink-3 hover:bg-elevated/50 hover:text-ink'
           )}
         >
-          <span className="truncate pr-12">{conv.title}</span>
+          {conv.running && (
+            <Loader2 className="h-3 w-3 shrink-0 animate-spin text-brand" aria-label="处理中" />
+          )}
+          <span className="min-w-0 flex-1 truncate pr-12">{conv.title}</span>
         </button>
       )}
       {!editing && (

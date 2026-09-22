@@ -14,10 +14,10 @@ later concern.
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Union
 
 
-def agent_base_dir(parent_agent) -> Optional[Path]:
+def agent_base_dir(parent_agent: Optional[Any]) -> Optional[Path]:
     """Best-effort absolute working directory for *parent_agent*.
 
     First absolute candidate wins, checked in priority order:
@@ -48,7 +48,8 @@ def agent_base_dir(parent_agent) -> Optional[Path]:
     return None
 
 
-def resolve_path(path, parent_agent) -> Path:
+def resolve_path(path: Union[str, os.PathLike],
+                 parent_agent: Optional[Any]) -> Path:
     """Resolve a user-supplied path against the agent's working directory.
 
     * Absolute paths pass through unchanged (cwd is a default base, not a

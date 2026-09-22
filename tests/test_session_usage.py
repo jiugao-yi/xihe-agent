@@ -72,17 +72,18 @@ def test_load_messages_usage_stays_internal_and_json():
 
 
 def test_rewrite_without_usage_column_data_is_fine():
-    """Messages lacking _usage (e.g. a fresh in-memory list) write NULL."""
+    """Messages lacking _usage (e.g. a fresh in-memory list) write no meta row."""
     db = _mk_db()
     sid = db.get_or_create_session(SessionSource(platform="serve", chat_id="c2"))
     db.rewrite_messages(sid, [{"role": "user", "content": "x"}])
     rows = db._execute(
-        "SELECT usage FROM messages WHERE session_id = ?", (sid,)).fetchall()
+        "SELECT mt.usage FROM messages m LEFT JOIN message_meta mt "
+        "ON mt.message_id = m.id WHERE m.session_id = ?", (sid,)).fetchall()
     assert rows == [(None,)]
 
 
 def test_reshape_history_folds_usage():
-    from gateway.serve.chat import _reshape_history
+    from gateway.serve.conversations import _reshape_history
 
     rows = [
         {"id": 1, "role": "user", "content": "hi"},

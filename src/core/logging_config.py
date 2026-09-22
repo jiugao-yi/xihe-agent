@@ -3,6 +3,7 @@
 import logging
 import sys
 from pathlib import Path
+from typing import Optional, Union
 
 from core.config import AGENT_HOME
 
@@ -11,8 +12,9 @@ FILE_FORMAT = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
 DATE_FORMAT = "%H:%M:%S"
 
 
-def setup_logging(level=logging.WARNING, also_file=False,
-                  log_file: str | Path = None, file_level=None):
+def setup_logging(level: int = logging.WARNING, also_file: bool = False,
+                  log_file: Optional[Union[str, Path]] = None,
+                  file_level: Optional[int] = None) -> None:
     """Configure logging — always works regardless of call order.
 
     Args:

@@ -72,7 +72,9 @@ CMD_SUBSCRIBE = "aibot_subscribe"
 CMD_CALLBACK = "aibot_msg_callback"
 CMD_SEND = "aibot_send_msg"
 CMD_RESPONSE = "aibot_respond_msg"
+CMD_RESPOND_UPDATE = "aibot_respond_update_msg"
 CMD_PING = "ping"
+CMD_EVENT_CALLBACK = "aibot_event_callback"
 CMD_UPLOAD_INIT = "aibot_upload_media_init"
 CMD_UPLOAD_CHUNK = "aibot_upload_media_chunk"
 CMD_UPLOAD_FINISH = "aibot_upload_media_finish"
@@ -85,6 +87,10 @@ HEARTBEAT_INTERVAL = 30.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 DEDUP_WINDOW = 300
 DEDUP_MAX = 500
+# template_card 发送无 ack 通道（实测：vote/button 均可能不回执）：短暂
+# 等一下真 ack（若实际有），超时按已发出处理。0.5s 足够真 ack 返回，
+# 白等部分直接阻塞的是审批/澄清回调，越短越好。
+CARD_ACK_WINDOW = 0.5
 
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 VOICE_MAX_BYTES = 2 * 1024 * 1024
@@ -93,6 +99,126 @@ ABSOLUTE_MAX_BYTES = FILE_MAX_BYTES
 UPLOAD_CHUNK_SIZE = 512 * 1024
 MAX_UPLOAD_CHUNKS = 100
 VOICE_SUPPORTED_MIMES = {"audio/amr"}
+
+
+# ---- 中继卡（template_card）payload 构造 ----
+# 协议实测结论（2026-09）：毒字段/卡型 schema/事件结构/更新机制见各构造器
+# docstring 与 wiki insight 0056。
+
+def build_approval_card(summary: str, task_id: str) -> dict:
+    """审批按钮卡（button_interaction）。毒字段红线（实测整卡静默不渲染）：
+    无 source 字段、task_id 只用字母数字与连字符（调用方经 encode_task_id
+    编码 approval-<id>，协议层当不透明字符串透传）。按钮无宽度字段，三按钮
+    等宽平分一行——语义完整优先于显示完整（用户已确认接受截断）。"""
+    return {
+        "card_type": "button_interaction",
+        "main_title": {"title": "⚠️ 危险操作待确认",
+                       "desc": str(summary or "")[:MAX_MESSAGE_LENGTH]},
+        "button_list": [
+            {"text": "批准", "style": 1, "key": "y"},
+            {"text": "拒绝", "style": 2, "key": "n"},
+            {"text": "总是允许", "style": 3, "key": "a"},
+        ],
+        "task_id": str(task_id),
+    }
+
+
+def build_clarify_card(question: str, options: list, task_id: str,
+                       multi_select: bool = False) -> dict:
+    """澄清选择题卡（vote_interaction，官方 schema：选项在 checkbox 子对象
+    + 必配 submit_button——顶层 option_list 是无效结构，静默不渲染，实测
+    2026-09）。mode 由模型在 clarify 调用里声明（multi_select）。选项 id
+    用 o1/o2/… 序号编码（事件回传于 selected_items.selected_item[].
+    option_ids.option_id，解析见 _on_event_callback），提交按钮 key 固定
+    "submit"（event_key）。
+
+    选项文案不截断（用户确认语义完整优先；vote 行对超长文本整行省略）。
+    desc 只放问题——曾试过把带编号的选项清单也拼进 desc，与 checkbox 的
+    选项重复渲染、视觉冗长，已撤。"""
+    opts = [str(o or "").strip() for o in (options or []) if str(o or "").strip()][:20]
+    return {
+        "card_type": "vote_interaction",
+        "main_title": {"title": "❓ 需要澄清",
+                       "desc": str(question or "")[:MAX_MESSAGE_LENGTH]},
+        "checkbox": {
+            "question_key": "answer",
+            "option_list": [
+                {"id": f"o{i + 1}", "text": o}
+                for i, o in enumerate(opts)
+            ],
+            "mode": 1 if multi_select else 0,
+        },
+        "submit_button": {"text": "提交", "key": "submit"},
+        "task_id": str(task_id),
+    }
+
+
+def build_clarify_result_card(answer_text: str, task_id: str) -> dict:
+    """澄清终态卡（respond_update_msg 载荷）：与选项卡同族
+    （vote_interaction），title 变已收到回答，desc 带答案。checkbox.disable
+    在更新时生效锁死选项区（官方语义）；SubmitButton 无 disable 字段——
+    提交按钮改状态文案，残余点击由行为层静默吞（bot.py stale-click）。
+    task_id 必须传原卡的 task_id（服务端按它匹配目标卡）。"""
+    return {
+        "card_type": "vote_interaction",
+        "main_title": {"title": "💬 已收到回答",
+                       "desc": str(answer_text or "")[:MAX_MESSAGE_LENGTH]},
+        "checkbox": {"question_key": "answered", "disable": True,
+                     "option_list": [{"id": "done", "text": "已回答"}]},
+        "submit_button": {"text": "已回答", "key": "settled"},
+        "task_id": str(task_id),
+    }
+
+
+def _extract_selected_ids(tc: dict) -> "list[str]":
+    """vote/multiple 卡提交事件里的选中项抽取（XML 风格嵌套数组实测结构：
+    selected_items.selected_item[].option_ids.option_id = [id, ...]）。
+    按钮卡事件无此字段，返回空表。"""
+    items = tc.get("selected_items") or {}
+    items = items.get("selected_item") if isinstance(items, dict) else None
+    out: list = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        ids = item.get("option_ids") or {}
+        vals = ids.get("option_id") if isinstance(ids, dict) else None
+        if isinstance(vals, list):
+            out.extend(str(v) for v in vals if v)
+    return out
+
+
+def build_approval_result_card(summary: str, event_key: str,
+                               task_id: str = "") -> dict:
+    """审批终态卡（aibot_respond_update_msg 的 template_card 载荷）：保留
+    三按钮布局，选中按钮 style 1 高亮、其余 style 3 灰态。终态读 title
+    （带 ✅/❌）。按钮文字不加 emoji 前缀（实测渲染不出）；超 2 字截断
+    显示——用户确认语义完整优先。task_id 必须传原卡的 task_id（官方
+    update 示例原样保留——换新 id 服务端匹配不到目标卡）。同审批卡，
+    无 source 字段。按钮无 disable 字段（Button 结构体没有）——防重复
+    点击靠路由表已裁决塌缩（card_click 返回 False → 回"该确认已处理"）。"""
+    if event_key == "y":
+        verdict = "✅ 已批准，继续执行"
+    elif event_key == "n":
+        verdict = "❌ 已拒绝"
+    else:
+        verdict = "✅ 已批准，本会话总是允许"
+
+    def _btn(key, selected_text, idle_text):
+        selected = key == event_key
+        return {"text": selected_text if selected else idle_text,
+                "style": 1 if selected else 3, "key": key}
+
+    return {
+        "card_type": "button_interaction",
+        "main_title": {"title": verdict,
+                       "desc": str(summary or "")[:MAX_MESSAGE_LENGTH]},
+        "button_list": [
+            _btn("y", "已批准", "批准"),
+            _btn("n", "已拒绝", "拒绝"),
+            _btn("a", "总是允许", "总是允许"),
+        ],
+        "task_id": str(task_id),
+    }
 
 
 class WeComAdapter(BasePlatformAdapter):
@@ -127,6 +253,13 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_outbound: collections.deque = collections.deque(maxlen=50)
         self._ws_connected: asyncio.Event = asyncio.Event()
         self._flush_task: asyncio.Task = None
+
+        # Card button events (aibot_event_callback): handler set by the
+        # gateway; (task_id, event_key) dedup — the same payload can arrive
+        # twice (WS redelivery), and double-clicks collapse at the routing
+        # table, but we still don't want to see the raw event twice.
+        self._on_card_event = None
+        self._seen_card_events: dict[tuple, float] = {}
 
     async def start(self) -> bool:
         if not self._bot_id or not self._secret:
@@ -216,6 +349,58 @@ class WeComAdapter(BasePlatformAdapter):
                 logger.info("[WeCom] WS send failed (%s), queued text to %s (queue=%d)",
                             type(e).__name__, chat_id, len(self._pending_outbound))
                 return SendResult(success=True)
+            return SendResult(success=False, error=str(e))
+
+    async def send_card(self, chat_id: str, card: dict,
+                        reply_to_msg_id: str = None,
+                        group: bool = False) -> SendResult:
+        """Send a template_card via aibot_send_msg. chat_type 必填语义
+        （官方文档：1 单聊 / 2 群聊，不填按群聊优先解析——用 userid 冒充
+        群 chatid 会被静默丢弃，实测 spike 即栽在这里）。reply 路径走
+        aibot_respond_msg（透传回调 req_id），同样支持 template_card。
+
+        实测（2026-09）：template_card 的 ack 可能不返回（等待即 Timeout），
+        短窗等 ack 后按已发出处理；渲染成败由降级探测兜（bot.py card_stats）。
+        """
+        if not chat_id:
+            return SendResult(success=False, error="chat_id is required")
+        if not self._ws or self._ws.closed:
+            return SendResult(success=False, error="WebSocket not connected")
+        try:
+            body = {"msgtype": "template_card", "template_card": card}
+            reply_req_id = self._reply_req_ids.get(reply_to_msg_id) if reply_to_msg_id else None
+            if reply_req_id:
+                await self._send_reply_request(reply_req_id, body,
+                                               timeout=CARD_ACK_WINDOW)
+            else:
+                await self._send_request(CMD_SEND, {
+                    "chatid": chat_id,
+                    "chat_type": 2 if group else 1,
+                    **body,
+                }, timeout=CARD_ACK_WINDOW)
+            return SendResult(success=True)
+        except asyncio.TimeoutError:
+            # 无 ack 也可能是被服务端静默拒绝——留 WARNING 便于与 markdown
+            # 路径（有 ack）对照定位。
+            logger.warning("[WeCom] Card send ack timeout (card=%s)",
+                           card.get("task_id"))
+            return SendResult(success=True)  # 无 ack 通道：发出即视为成功
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def update_card(self, event_req_id: str, card: dict) -> SendResult:
+        """更新已点击的卡片：aibot_respond_update_msg，req_id 透传卡片点击
+        事件的 req_id，须在收到事件后 5 秒内发出（官方文档）——所以本方法
+        只在事件处理路径上调用，不跨线程等待。"""
+        if not self._ws or self._ws.closed:
+            return SendResult(success=False, error="WebSocket not connected")
+        try:
+            await self._send_request(CMD_RESPOND_UPDATE, {
+                "response_type": "update_template_card",
+                "template_card": card,
+            }, req_id=str(event_req_id), timeout=5.0)
+            return SendResult(success=True)
+        except Exception as e:
             return SendResult(success=False, error=str(e))
 
     async def send_stream(self, chat_id: str, content: str, stream_id: str,
@@ -527,18 +712,14 @@ class WeComAdapter(BasePlatformAdapter):
             text = "\n".join(parts)
 
         # Append image paths for image-tool access even when text exists.
-        # Pick the available tool (vision_analyze when configured, else image_ocr)
-        # so the agent isn't hinted toward a hidden tool.
+        # WHICH image tool to apply is the agent's own call (it knows its
+        # loaded roster) — only state the fact, never name tools here.
         if media_urls and text:
             image_paths = [url for i, url in enumerate(media_urls)
                           if (media_types[i] if i < len(media_types) else "").startswith("image/")]
             if image_paths:
-                from tools.vision_tools import pick_image_tool
-                tool = pick_image_tool()
-                if tool:
-                    parts = [f"[图片路径，可用{tool}查看: {p}]" for p in image_paths]
-                else:
-                    parts = [f"[图片路径: {p}（无可用图片识别工具）]" for p in image_paths]
+                parts = [f"[图片路径: {p}，请按需用你可用的图片工具处理]"
+                         for p in image_paths]
                 text += "\n" + "\n".join(parts)
 
         logger.info("[WeCom] %s from %s: %s (media=%d)",
@@ -578,6 +759,60 @@ class WeComAdapter(BasePlatformAdapter):
             self._msg_queue.put_nowait(event)
         else:
             await self._emit_message(event)
+
+    def set_card_event_handler(self, handler) -> None:
+        """Register the card-button-event handler (set by the gateway).
+        Signature: async (task_id: str, event_key: str, event_req_id: str,
+                           chat_id: str, selected_ids: list[str]) -> None.
+        event_req_id 是事件回调的 req_id——5 秒内以它回 aibot_respond_update_msg
+        才能更新被点击的卡片。selected_ids 仅 vote/multiple 卡的提交事件非空。"""
+        self._on_card_event = handler
+
+    async def _on_event_callback(self, payload: dict):
+        """Card button events. 事件载荷嵌在 body.event（官方文档 eventtype
+        = template_card_event 为卡片按钮；disconnected_event 等生命周期事
+        件同走此 cmd）。"""
+        body = payload.get("body")
+        if not isinstance(body, dict):
+            return
+        ev = body.get("event") if isinstance(body.get("event"), dict) else {}
+        if str(ev.get("eventtype") or "") != "template_card_event":
+            logger.debug("[WeCom] Non-card event: %s",
+                         json.dumps(body, ensure_ascii=False)[:200])
+            return
+        # 实测：按钮数据再嵌一层 event.template_card_event（2026-09 spike
+        # 日志 keys=['eventtype','template_card_event']）。vote/multiple 卡
+        # 的提交事件还带 selected_items（XML 风格嵌套数组），按钮卡没有。
+        tc = ev.get("template_card_event")
+        tc = tc if isinstance(tc, dict) else {}
+        task_id = str(tc.get("task_id") or ev.get("task_id") or "")
+        event_key = str(tc.get("event_key") or ev.get("event_key") or "")
+        if not task_id or not event_key:
+            logger.warning("[WeCom] Card event missing task_id/event_key: %s",
+                           sorted(ev.keys()))
+            return
+        selected_ids = _extract_selected_ids(tc)
+        key = (task_id, event_key)
+        now = time.time()
+        if len(self._seen_card_events) > DEDUP_MAX:
+            self._seen_card_events = {
+                k: v for k, v in self._seen_card_events.items()
+                if v > now - DEDUP_WINDOW}
+        if key in self._seen_card_events:
+            return
+        self._seen_card_events[key] = now
+        event_req_id = self._payload_req_id(payload)
+        chat_id = str(body.get("chatid") or
+                      (body.get("from") or {}).get("userid") or "")
+        if self._on_card_event is None:
+            logger.warning("[WeCom] Card event but no handler registered")
+            return
+        try:
+            await self._on_card_event(task_id, event_key,
+                                      str(event_req_id or ""), chat_id,
+                                      selected_ids)
+        except Exception as e:
+            logger.warning("[WeCom] Card event handler failed: %s", e, exc_info=True)
 
     async def _dispatch_loop(self):
         """Route queued messages to per-session queues.
@@ -912,6 +1147,17 @@ class WeComAdapter(BasePlatformAdapter):
             return
         if cmd == CMD_CALLBACK:
             await self._on_callback(payload)
+        elif cmd == CMD_EVENT_CALLBACK:
+            await self._on_event_callback(payload)
+        else:
+            # 未知 cmd 此前静默丢弃——协议能力探测（spike/新事件类型）时这
+            # 是抓瞎点。无 cmd 无 body 的帧是心跳 ack，降到 debug。
+            if cmd or isinstance(payload.get("body"), dict):
+                logger.info("[WeCom] Unhandled cmd '%s' (keys=%s)",
+                            cmd, sorted((payload.get("body") or {}).keys())
+                            if isinstance(payload.get("body"), dict) else "-")
+            else:
+                logger.debug("[WeCom] Frame without cmd (heartbeat ack?)")
 
     async def _send_json(self, payload: dict):
         if not self._ws or self._ws.closed:
@@ -919,10 +1165,11 @@ class WeComAdapter(BasePlatformAdapter):
         await self._ws.send_json(payload)
 
     async def _send_request(self, cmd: str, body: dict,
-                             timeout: float = REQUEST_TIMEOUT) -> dict:
+                             timeout: float = REQUEST_TIMEOUT,
+                             req_id: str = None) -> dict:
         if not self._ws or self._ws.closed:
             raise RuntimeError("WebSocket not connected")
-        req_id = self._new_req_id(cmd)
+        req_id = str(req_id) if req_id else self._new_req_id(cmd)
         future = asyncio.get_event_loop().create_future()
         self._pending_responses[req_id] = future
         try:

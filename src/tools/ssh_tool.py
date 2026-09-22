@@ -83,7 +83,6 @@ class SSHSession:
     last_activity: float = 0.0
     tap: Optional[object] = None     # _ssh_tap.SessionTap (viewer + input sharing)
     session_key: str = ""            # conversation that owns/last-used this session
-    origin: str = "agent"            # "agent" | "desktop" — who connected
 
 
 _sessions: dict[str, SSHSession] = {}
@@ -210,9 +209,8 @@ def _ssh_connect(args: dict, **kw) -> str:
 
     ctx = kw.get("context") or {}
     session_key = str(ctx.get("session_key") or "")
-    origin = str(kw.get("origin") or "agent")
     key = _skey(session_key, name)
-    meta = {"host": host, "user": user, "origin": origin, "alias": name,
+    meta = {"host": host, "user": user, "alias": name,
             "session_key": session_key, "cols": SHELL_COLS, "rows": SHELL_ROWS}
 
     with _ssh_lock:
@@ -311,7 +309,7 @@ def _ssh_connect(args: dict, **kw) -> str:
     session = SSHSession(
         name=name, client=client, host=host, port=port, user=user,
         mode=mode, channel=channel, connected_at=now, last_activity=now,
-        session_key=session_key, origin=origin,
+        session_key=session_key,
     )
     if tap is None:
         # exec mode: passive tap — no pump, _exec_mode publishes its chunks

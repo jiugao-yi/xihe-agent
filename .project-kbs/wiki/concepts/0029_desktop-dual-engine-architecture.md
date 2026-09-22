@@ -12,9 +12,9 @@ tags:
   - xihe
   - claude
   - transport
-status: active
+status: deprecated
 created: 2026-08-12
-updated: 2026-08-12
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0024_desktop-serve-protocol.md
   - wiki/concepts/0025_desktop-control-plane.md
@@ -24,6 +24,8 @@ related_pages:
 ---
 
 # 桌面端双引擎架构总览（xihe serve + claude，统一 ServeEvent）
+
+> ⚠️ **已过时（2026-09-14）**：「双引擎并列」架构已不存在——桌面端 ClaudeRunner（claude STDIO 引擎）整体删除，桌面只剩 `xihe serve` 一个引擎；claude/codex 改经 xihe 内核的 `external_agent` 工具访问（[[0040_external-agent-adapter-protocol]]）。本页中仍有效的部分：统一 `ServeEvent` 归约（renderer `handleEvent` 按 `conv_id` 引擎无关路由——`by` 归因字段仍用于 external_agent 子活动）、ServeSupervisor 生命周期。多 agent 骨架清除与 store 扁平化见 [[0047_desktop-single-agent-collapse]]。**双引擎对照表 / ClaudeRunner 编排 / 两路传输描述不再反映当前代码。**
 
 ## 摘要
 

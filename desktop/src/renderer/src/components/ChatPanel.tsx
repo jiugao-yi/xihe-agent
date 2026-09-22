@@ -5,21 +5,25 @@ import {
   Eye,
   FileText,
   Navigation,
+  Paperclip,
   Pencil,
   Play,
   Plus,
   RefreshCw,
+  Map,
   RotateCcw,
   Send,
   Settings,
   ShieldAlert,
   Square,
+  X,
 } from 'lucide-react'
-import { useStore, type Agent, type Message, type PendingApproval } from '../appStore'
+import { useStore, type Message, type PendingApproval, type PendingClarify } from '../appStore'
 import { cn } from '../lib/cn'
 import { desktop } from '../lib/desktop'
 import { detectLanguage } from '../lib/lang'
 import { copyText } from '../lib/clipboard'
+import { localImgUrl } from '../lib/localImage'
 import { TurnTrace } from './TurnTrace'
 import { Markdown } from './Markdown'
 import logoUrl from '../assets/logo.png'
@@ -162,13 +166,26 @@ function resolveApprovalPath(rawPath: string): string | null {
     return rawPath
   }
   const s = useStore.getState()
-  const agent = s.agents.find((a) => a.id === s.selectedAgentId) ?? s.agents[0]
-  const convId = agent?.activeConvId
+  const convId = s.activeConvId
   const wsId = convId ? s.convWorkspace[convId] : undefined
   const workdir = wsId ? s.workspaces.find((w) => w.id === wsId)?.workdir : undefined
   if (!workdir) return null
   const sep = workdir.includes('\\') ? '\\' : '/'
   return workdir.endsWith(sep) ? workdir + rawPath : workdir + sep + rawPath
+}
+
+const RESET_REASON_LABEL: Record<string, string> = {
+  manual: '手动',
+  idle: '闲置超时',
+  daily: '每日重置',
+}
+
+/** Reset divider shown before the first message of a post-reset round (or as
+ *  a trailing marker when the new round has no messages yet). Takes the place
+ *  of the time divider — stacking both reads as noise. */
+function resetDividerLabel(reason?: string): string {
+  const label = RESET_REASON_LABEL[reason ?? ''] ?? (reason ? reason : '')
+  return label ? `⟲ 上下文已重置（${label}）` : '⟲ 上下文已重置'
 }
 
 const PREVIEW_MAX_CHARS = 256 * 1024
@@ -364,6 +381,85 @@ function ApprovalCard({ ap, running, onApprove }: {
   )
 }
 
+/** Clarify card — the agent asks the user a question mid-turn and WAITS:
+ *  the answer (option click or free text) resolves the pending question
+ *  server-side and the turn continues with it. Settled/expired cards stay as
+ *  a record with the delivered answer. */
+function ClarifyCard({ cl, running, onAnswer }: {
+  cl: PendingClarify
+  running: boolean
+  onAnswer: (id: string, answer: string) => void
+}) {
+  const [draft, setDraft] = useState('')
+  const live = cl.status === 'pending' && running
+  return (
+    <div className="w-fit max-w-md rounded-xl border border-sky-400/40 bg-sky-400/10 px-3 py-2.5 text-sm">
+      <div className="flex items-center gap-1.5 font-medium text-sky-300">
+        <Navigation className="h-4 w-4 rotate-0" />
+        需要澄清
+      </div>
+      <div className="mt-1 whitespace-pre-wrap break-all text-ink-2">{cl.question}</div>
+      {live ? (
+        <>
+          {cl.options.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {cl.options.map((opt) => (
+                <button
+                  key={opt}
+                  onClick={() => onAnswer(cl.id, opt)}
+                  className="rounded-lg border border-sky-400/50 px-2.5 py-1 text-xs text-sky-200 transition hover:bg-sky-400/20"
+                >
+                  {opt}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="mt-2 flex gap-1.5">
+            <input
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && draft.trim()) {
+                  e.preventDefault()
+                  onAnswer(cl.id, draft)
+                  setDraft('')
+                }
+              }}
+              placeholder="或输入自定义回答…"
+              className="w-56 rounded-lg border border-line bg-panel px-2 py-1 text-xs text-ink outline-none focus:border-sky-400/60"
+            />
+            <button
+              onClick={() => {
+                if (!draft.trim()) return
+                onAnswer(cl.id, draft)
+                setDraft('')
+              }}
+              disabled={!draft.trim()}
+              className="rounded-lg bg-sky-500 px-3 py-1 text-xs font-medium text-white hover:opacity-90 disabled:opacity-30"
+            >
+              回答
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="mt-2">
+          {cl.status === 'answered' ? (
+            <span className="rounded-md bg-sky-400/10 px-1.5 py-0.5 text-[10px] text-sky-300">
+              已回答：{cl.answer ?? '（另一个客户端）'}
+            </span>
+          ) : cl.status === 'pending' ? (
+            <span className="text-xs text-ink-4">等待回答（回合已结束，无法答复）</span>
+          ) : (
+            <span className="rounded-md bg-elevated/60 px-1.5 py-0.5 text-[10px] text-ink-4">
+              未收到回答
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /** Stable-callback bundle shared by the memoized rows — the object identity is
  *  preserved across renders (useMemo in ChatPanel), so unchanged rows skip
  *  re-render entirely during a streaming turn. */
@@ -378,7 +474,8 @@ interface UserRowCbs {
 
 interface AssistantRowCbs {
   onApprove: (id: string, approved: boolean, always?: boolean) => void
-  onLoadTrace: (anchor: number) => void
+  onAnswerClarify: (id: string, answer: string) => void
+  onLoadTrace: (anchor: string) => void
   onToggleRaw: (id: string) => void
   onCopy: (m: Message) => void
   onRegenerate: (index: number) => void
@@ -460,14 +557,82 @@ const UserRow = memo(function UserRow({ m, i, editing, editText, copied, disable
           >
             <RotateCcw className="h-3.5 w-3.5" />
           </HoverIconBtn>
-          <div className="whitespace-pre-wrap rounded-2xl rounded-br-sm bg-contrast px-3.5 py-2 text-sm text-white">
-            {m.content}
+          <div className="flex max-w-full flex-col items-end gap-1">
+            {!!m.attachments?.length && (
+              <div className="flex max-w-full flex-wrap justify-end gap-1">
+                {m.attachments.map((a) => {
+                  const isImg = /\.(png|jpe?g|gif|webp|bmp)$/i.test(a.path)
+                  return isImg ? (
+                    <img
+                      key={a.path}
+                      src={localImgUrl(a.path)}
+                      alt={a.name}
+                      title={a.desc || a.path}
+                      className="max-h-40 max-w-[240px] rounded-lg border border-line object-cover"
+                    />
+                  ) : (
+                    <span
+                      key={a.path}
+                      className="inline-flex items-center gap-1 rounded-lg border border-line bg-panel px-2 py-1 text-xs text-ink-3"
+                      title={a.path}
+                    >
+                      <FileText className="h-3.5 w-3.5 shrink-0" />
+                      <span className="max-w-[180px] truncate">{a.name}</span>
+                    </span>
+                  )
+                })}
+              </div>
+            )}
+            <div className="whitespace-pre-wrap rounded-2xl rounded-br-sm bg-contrast px-3.5 py-2 text-sm text-white">
+              {m.content}
+            </div>
           </div>
         </div>
       )}
     </div>
   )
 })
+
+/** 重新生成 truncates this turn AND everything after it — destructive enough
+ *  to deserve a two-step confirm (click → armed with a timeout → click again
+ *  to fire). Later turns the user hasn't read may vanish. */
+function RegenButton({ index, pending, onRegenerate }: {
+  index: number
+  pending: boolean
+  onRegenerate: (index: number) => void
+}) {
+  const [armed, setArmed] = useState(false)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (timerRef.current) clearTimeout(timerRef.current)
+  }, [])
+  const click = (): void => {
+    if (armed) {
+      if (timerRef.current) clearTimeout(timerRef.current)
+      setArmed(false)
+      onRegenerate(index)
+      return
+    }
+    setArmed(true)
+    timerRef.current = setTimeout(() => setArmed(false), 3_000)
+  }
+  return (
+    <button
+      onClick={click}
+      disabled={pending}
+      title="重新生成本轮回答；该轮之后的对话将被删除"
+      className={cn(
+        'flex select-none items-center gap-1 text-[10px] transition disabled:opacity-30',
+        armed
+          ? 'rounded bg-warning/15 px-1.5 py-0.5 text-warning'
+          : 'text-ink-4 hover:text-ink-2'
+      )}
+    >
+      <RefreshCw className="h-3 w-3" />
+      {armed ? '确认删除后续对话并重新生成？' : '重新生成'}
+    </button>
+  )
+}
 
 const AssistantRow = memo(function AssistantRow({ m, i, running, pending, isRaw, copied, cbs }: {
   m: Message
@@ -483,6 +648,16 @@ const AssistantRow = memo(function AssistantRow({ m, i, running, pending, isRaw,
   const hasThought = m.trace?.some((t) => t.kind === 'thought')
   const hasSteer = m.trace?.some((t) => t.kind === 'steer')
   const showTrace = !!total || !!hasThought || !!hasSteer || !!m.hasReasoning
+  // Absolute image paths written in the reply TEXT render as an attachment
+  // strip under the message — single source of truth: content is persisted,
+  // so live turns and reloaded history behave identically (image_render's
+  // result hint makes the model mention the path in plain text).
+  const renderImages = !pending
+    ? [...new Set(
+        m.content.match(
+          /[A-Za-z]:[\\/][^\s`()（）[\]]+?\.(?:png|jpe?g|gif|webp|bmp)/gi) ?? []
+      )]
+    : []
   return (
     <div className="group flex items-start justify-start">
       <div className="flex max-w-[80%] flex-col gap-1">
@@ -501,6 +676,13 @@ const AssistantRow = memo(function AssistantRow({ m, i, running, pending, isRaw,
             ap={m.pendingApproval}
             running={running}
             onApprove={cbs.onApprove}
+          />
+        )}
+        {m.pendingClarify && (
+          <ClarifyCard
+            cl={m.pendingClarify}
+            running={running}
+            onAnswer={cbs.onAnswerClarify}
           />
         )}
         <div
@@ -543,6 +725,21 @@ const AssistantRow = memo(function AssistantRow({ m, i, running, pending, isRaw,
             <span className="ml-1 text-warning">正在停止…</span>
           )}
         </div>
+        {renderImages.length > 0 && (
+          <div className="flex flex-col gap-1.5">
+            {renderImages.map((p) => (
+              <img
+                key={p}
+                src={localImgUrl(p)}
+                alt="image_render"
+                onError={(e) => {
+                  e.currentTarget.style.display = 'none'
+                }}
+                className="max-h-96 max-w-full self-start rounded-lg border border-line"
+              />
+            ))}
+          </div>
+        )}
         {!m.pending && m.error && /api_key|配置/.test(m.content) && (
           <button
             onClick={cbs.onGoSettings}
@@ -566,14 +763,7 @@ const AssistantRow = memo(function AssistantRow({ m, i, running, pending, isRaw,
               {copied ? <Check className="h-3 w-3 text-success" /> : <Copy className="h-3 w-3" />}
               {copied ? '已复制' : '复制'}
             </button>
-            <button
-              onClick={() => cbs.onRegenerate(i)}
-              disabled={pending}
-              className="flex select-none items-center gap-1 text-[10px] text-ink-4 hover:text-ink-2 disabled:opacity-30"
-            >
-              <RefreshCw className="h-3 w-3" />
-              重新生成
-            </button>
+            <RegenButton index={i} pending={pending} onRegenerate={cbs.onRegenerate} />
           </div>
         )}
         {m.interrupted && (
@@ -670,9 +860,12 @@ function HoverTimestamp({ iso, side }: { iso: string; side: 'left' | 'right' }) 
   )
 }
 
-export function ChatPanel({ agent }: { agent: Agent }) {
+export function ChatPanel() {
+  const activeConvId = useStore((s) => s.activeConvId)
+  const resetConversation = useStore((s) => s.resetConversation)
+  const convCount = useStore((s) => s.conversations.length)
   const messages = useStore((s) =>
-    agent.activeConvId ? s.sessions[agent.activeConvId] ?? [] : []
+    s.activeConvId ? s.sessions[s.activeConvId] ?? [] : []
   )
   const sendMessage = useStore((s) => s.sendMessage)
   const newConversation = useStore((s) => s.newConversation)
@@ -682,12 +875,21 @@ export function ChatPanel({ agent }: { agent: Agent }) {
   const regenerateMessage = useStore((s) => s.regenerateMessage)
   const editAndResendMessage = useStore((s) => s.editAndResendMessage)
   const approve = useStore((s) => s.approve)
+  const answerClarify = useStore((s) => s.answerClarify)
   const loadTrace = useStore((s) => s.loadTrace)
   const serveConnected = useStore((s) => s.serveConnected)
   const xiheConfig = useStore((s) => s.xiheConfig)
   const xiheStatus = useStore((s) => s.xiheStatus)
   const setTab = useStore((s) => s.setTab)
   const [input, setInput] = useState('')
+  // 已上传待发送的附件（serve 已落盘，带服务器端 path）。选文件即上传，
+  // 发送时随 send 帧的 attachments 字段回传；chip 可单个移除。
+  const [pendingFiles, setPendingFiles] = useState<{ name: string; path: string; size: number }[]>([])
+  const [uploading, setUploading] = useState(false)
+  // Plan mode: sends run read-only planning + an approval card; approval
+  // auto-starts the execution turn (serve-side). Sticky — stays armed until
+  // toggled off, for consecutive planning tasks.
+  const [planMode, setPlanMode] = useState(false)
   // User-message edit: the bubble in edit mode (editingId) swaps to a
   // textarea; confirm rolls the conversation back to before it and sends the
   // edited text as a fresh turn.
@@ -718,11 +920,25 @@ export function ChatPanel({ agent }: { agent: Agent }) {
   // bottom. Opening/switching a conversation re-arms the follow.
   const stickRef = useRef(true)
 
+  // Bottom sentinel: jump/follow scroll THIS node into view instead of
+  // scrollTo(scrollHeight) — scrollHeight at call time is stale when async
+  // content (image attachments) loads afterwards and grows the list, leaving
+  // the view stranded mid-way. Anchoring to the sentinel re-resolves on every
+  // layout change, including late image loads.
+  const bottomRef = useRef<HTMLDivElement>(null)
+
   useEffect(() => {
     stickRef.current = true
     setEditingId(null)
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
-  }, [agent.activeConvId])
+    // Jump after the new conv's DOM commits (double-rAF: commit → layout →
+    // paint), so the sentinel exists at its final position.
+    const raf = requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        bottomRef.current?.scrollIntoView({ block: 'end' })
+      })
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [activeConvId])
 
   useEffect(() => {
     if (!stickRef.current) return
@@ -730,7 +946,7 @@ export function ChatPanel({ agent }: { agent: Agent }) {
     // during a stream; aligning the scroll to paint avoids stacking layout
     // reads between commits.
     const raf = requestAnimationFrame(() => {
-      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
+      bottomRef.current?.scrollIntoView({ block: 'end' })
     })
     return () => cancelAnimationFrame(raf)
   }, [messages])
@@ -745,17 +961,19 @@ export function ChatPanel({ agent }: { agent: Agent }) {
   const seenConvRef = useRef(false)
   const seenLenRef = useRef(false)
   useEffect(() => {
-    const c = agent.conversations.find((x) => x.id === agent.activeConvId)
+    // conversations read as a snapshot on purpose (not a dep): list syncs
+    // must not re-fire this and yank focus from an in-progress sidebar rename.
+    const c = useStore.getState().conversations.find((x) => x.id === activeConvId)
     const first = !seenConvRef.current
     seenConvRef.current = true
     if (c && (!c.synced || !first)) inputRef.current?.focus()
-  }, [agent.activeConvId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activeConvId]) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const first = !seenLenRef.current
     seenLenRef.current = true
     if (!first && document.activeElement === document.body)
       inputRef.current?.focus()
-  }, [agent.conversations.length]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [convCount]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-grow the composer with its content (capped by max-h-32, then it
   // scrolls inside). Without this a multi-line paste shows only the last line.
@@ -764,16 +982,29 @@ export function ChatPanel({ agent }: { agent: Agent }) {
     if (!ta) return
     ta.style.height = 'auto'
     ta.style.height = `${ta.scrollHeight}px`
-  }, [input, agent.activeConvId])
+  }, [input, activeConvId])
 
   const onScroll = () => {
     const el = scrollRef.current
     if (!el) return
-    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    // A rollback (重新生成/重新发送 truncates the list) makes scrollHeight
+    // collapse below scrollTop for one frame — that programmatic jump must
+    // not read as "user scrolled up to read". Content shrunk, so distance
+    // would exceed the container height; a real upward scroll is a smaller,
+    // bounded distance.
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight
+    stickRef.current = distance < 80 || distance > el.clientHeight
   }
 
   // Hooks must ALL run before this point — the early return below would
   // otherwise change the hook count between renders (React crashes the tree).
+  // 上传失败提示（chip 位置短暂显示）：3.5s 自动消失。
+  const [uploadErrors, setUploadErrors] = useState<{ name: string }[]>([])
+  const pushUploadError = useCallback((name: string) => {
+    setUploadErrors((cur) => [...cur, { name }])
+    setTimeout(() => setUploadErrors((cur) => cur.filter((e) => e.name !== name)), 3500)
+  }, [])
+
   const copyMessage = useCallback(async (m: Message) => {
     if (!(await copyText(m.content))) return
     setCopiedId(m.id)
@@ -781,7 +1012,7 @@ export function ChatPanel({ agent }: { agent: Agent }) {
   }, [])
 
   // Stable callback bundles feeding the memoized rows (identity held by
-  // useMemo, deps all stable store fns / agentId / convId).
+  // useMemo, deps all stable store fns / convId).
   const userCbs = useMemo<UserRowCbs>(() => ({
     onStartEdit: (m) => {
       setEditingId(m.id)
@@ -793,35 +1024,36 @@ export function ChatPanel({ agent }: { agent: Agent }) {
       if (!t) return
       setEditingId(null)
       setEditText('')
-      void editAndResendMessage(agent.id, index, t)
+      void editAndResendMessage(index, t)
     },
     onCancelEdit: () => {
       setEditingId(null)
       setEditText('')
     },
     onCopy: (m) => void copyMessage(m),
-    onResend: (index) => void resendMessage(agent.id, index),
-  }), [agent.id, editAndResendMessage, resendMessage, copyMessage])
+    onResend: (index) => void resendMessage(index),
+  }), [editAndResendMessage, resendMessage, copyMessage])
 
   const assistantCbs = useMemo<AssistantRowCbs>(() => ({
-    onApprove: (id, approved, always) => approve(agent.id, id, approved, always),
+    onApprove: (id, approved, always) => approve(id, approved, always),
+    onAnswerClarify: (id, answer) => answerClarify(id, answer),
     onLoadTrace: (anchor) => {
-      const c = agent.activeConvId
+      const c = activeConvId
       if (c) void loadTrace(c, anchor)
     },
     onToggleRaw: toggleRaw,
     onCopy: (m) => void copyMessage(m),
-    onRegenerate: (index) => void regenerateMessage(agent.id, index),
+    onRegenerate: (index) => void regenerateMessage(index),
     onGoSettings: () => setTab('manage'),
     // 继续 = 往同一会话发一条续跑指令。serve 每轮加载持久化历史并修复
     // 悬空 tool_calls，所以已执行的工具记录随上下文复用，模型从中断处
     // 接着做而不重跑。
     onContinue: () => void sendMessage(
-      agent.id, '继续上一轮中断的任务（已执行的工具调用结果已保留，不要重复已完成的工作）'),
-  }), [agent, approve, loadTrace, toggleRaw, copyMessage, regenerateMessage, setTab, sendMessage])
+      '继续上一轮中断的任务（已执行的工具调用结果已保留，不要重复已完成的工作）'),
+  }), [activeConvId, approve, answerClarify, loadTrace, toggleRaw, copyMessage, regenerateMessage, setTab, sendMessage])
 
   // Early return is after the last hook — hooks above must always run.
-  if (!agent.activeConvId) {
+  if (!activeConvId) {
     if (xiheStatus?.state === 'not_found') {
       return (
         <div className="flex h-full flex-col items-center justify-center text-center">
@@ -841,7 +1073,7 @@ export function ChatPanel({ agent }: { agent: Agent }) {
         <BrandMark className="h-14 w-14" />
         <div className="text-sm text-ink-4">还没有对话</div>
         <button
-          onClick={() => newConversation(agent.id)}
+          onClick={() => newConversation()}
           className="inline-flex items-center gap-1.5 rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white hover:opacity-90"
         >
           <Plus className="h-4 w-4" />
@@ -853,16 +1085,45 @@ export function ChatPanel({ agent }: { agent: Agent }) {
 
   const submit = () => {
     const text = input.trim()
-    if (!text) return
-    sendMessage(agent.id, text)
+    if (!text && !pendingFiles.length) return
+    sendMessage(
+      text,
+      planMode || undefined,
+      undefined,
+      pendingFiles.length ? pendingFiles : undefined
+    )
     setInput('')
+    setPendingFiles([])
   }
 
   const steerSubmit = () => {
     const text = input.trim()
     if (!text) return
-    steer(agent.id, text)
+    steer(text)
     setInput('')
+  }
+
+  // 选文件 → 立即上传到 serve（拿到服务器端 path）→ 显示 chip。发送时
+  // 附件已在服务器上，send 帧只带元数据。上传失败提示文件名（超限/网络）。
+  const pickAndUpload = async () => {
+    const convId = activeConvId
+    if (!convId || uploading) return
+    const paths = await desktop.openFiles()
+    if (!paths.length) return
+    setUploading(true)
+    try {
+      const { uploadAttachment } = await import('../lib/serveClient')
+      for (const p of paths) {
+        const up = await uploadAttachment(convId, p)
+        if (up) {
+          setPendingFiles((cur) => [...cur, { name: up.name, path: up.path, size: up.size }])
+        } else {
+          pushUploadError(p.split(/[\\/]/).pop() || p)
+        }
+      }
+    } finally {
+      setUploading(false)
+    }
   }
 
   // While a turn runs, Enter steers it (non-interrupting redirect). Idle →
@@ -890,15 +1151,24 @@ export function ChatPanel({ agent }: { agent: Agent }) {
           </div>
         )}
         {messages.map((m, i) => {
-          const divider = needsDivider(messages, i)
+          const showReset = m.roundStart || m.dividerOnly
+          const divider = showReset
+            ? resetDividerLabel(m.resetReason)
+            : needsDivider(messages, i)
           return (
             <div key={m.id}>
               {divider && (
                 <div className="py-1.5 text-center text-[10px] text-ink-5">
-                  {divider}
+                  {showReset ? (
+                    <span className="inline-flex items-center gap-1 rounded-md bg-elevated/60 px-2 py-0.5 text-ink-4">
+                      {divider}
+                    </span>
+                  ) : (
+                    divider
+                  )}
                 </div>
               )}
-              {m.role === 'user' ? (
+              {m.dividerOnly ? null : m.role === 'user' ? (
                 <UserRow
                   m={m}
                   i={i}
@@ -922,8 +1192,53 @@ export function ChatPanel({ agent }: { agent: Agent }) {
             </div>
           )
         })}
+        <div ref={bottomRef} className="h-px" />
       </div>
       <div className="border-t border-line p-3">
+        {!!uploadErrors.length && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {uploadErrors.map((er) => (
+              <span
+                key={er.name}
+                className="inline-flex items-center gap-1 rounded-lg border border-danger/40 bg-danger/10 px-2 py-1 text-xs text-danger"
+              >
+                <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+                <span className="max-w-[200px] truncate" title={er.name}>
+                  {er.name}
+                </span>
+                上传失败
+              </span>
+            ))}
+          </div>
+        )}
+        {!!pendingFiles.length && !running && (
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {pendingFiles.map((f) => {
+              const isImg = /\.(png|jpe?g|gif|webp|bmp)$/i.test(f.path)
+              return (
+                <span
+                  key={f.path}
+                  className="group/att inline-flex items-center gap-1 rounded-lg border border-line bg-panel px-2 py-1 text-xs text-ink-3"
+                  title={f.path}
+                >
+                  {isImg ? (
+                    <img src={localImgUrl(f.path)} alt="" className="h-6 w-6 rounded object-cover" />
+                  ) : (
+                    <FileText className="h-3.5 w-3.5 shrink-0" />
+                  )}
+                  <span className="max-w-[160px] truncate">{f.name}</span>
+                  <button
+                    onClick={() => setPendingFiles((cur) => cur.filter((x) => x.path !== f.path))}
+                    className="rounded p-0.5 text-ink-5 hover:bg-elevated hover:text-ink-2"
+                    title="移除"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </span>
+              )
+            })}
+          </div>
+        )}
         <div
           onClick={(e) => {
             // The visible input bar has padding the textarea doesn't cover, so
@@ -935,14 +1250,72 @@ export function ChatPanel({ agent }: { agent: Agent }) {
           }}
           className="flex items-end gap-2 rounded-xl bg-panel px-3 py-2"
         >
+          <button
+            onClick={() => activeConvId && void resetConversation(activeConvId)}
+            disabled={!serveConnected || !activeConvId || running}
+            title="重置上下文：保留对话历史，清空 agent 对本轮之前内容的记忆（历史中会出现分隔线）"
+            className="mb-0.5 rounded-lg p-1.5 text-ink-4 transition hover:bg-elevated hover:text-warning disabled:opacity-30 disabled:hover:bg-transparent"
+          >
+            <RotateCcw className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => void pickAndUpload()}
+            disabled={!serveConnected || !activeConvId || running || uploading}
+            title={uploading ? '上传中…' : '添加附件（文件随消息发送给 agent）'}
+            className="mb-0.5 rounded-lg p-1.5 text-ink-4 transition hover:bg-elevated hover:text-ink disabled:opacity-30 disabled:hover:bg-transparent"
+          >
+            <Paperclip className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => setPlanMode((v) => !v)}
+            disabled={!serveConnected || running}
+            title="plan 模式：消息只读探查并产出计划，批准后自动开始执行；再次点击关闭"
+            className={cn(
+              'mb-0.5 rounded-lg p-1.5 transition disabled:opacity-30',
+              planMode
+                ? 'bg-contrast text-sky-300'
+                : 'text-ink-4 hover:bg-elevated hover:text-ink'
+            )}
+          >
+            <Map className="h-4 w-4" />
+          </button>
           <textarea
             ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onPaste={(e) => {
+              const cd = e.clipboardData
+              // 剪贴板带文件（截图 Ctrl+V、复制的文件）→ 直接上传成附件
+              // chip，字节已在 File 里，不经 preload 读盘桥；阻止默认行为
+              // 免得文件名被当文本粘进输入框。
+              if (cd && cd.files?.length) {
+                e.preventDefault()
+                const convId = activeConvId
+                const files = Array.from(cd.files)
+                if (!convId || uploading) return
+                setUploading(true)
+                void (async () => {
+                  try {
+                    const { uploadFile } = await import('../lib/serveClient')
+                    for (const f of files) {
+                      const up = await uploadFile(convId, f)
+                      if (up) {
+                        setPendingFiles((cur) => [
+                          ...cur,
+                          { name: up.name, path: up.path, size: up.size },
+                        ])
+                      } else {
+                        pushUploadError(f.name || 'clipboard file')
+                      }
+                    }
+                  } finally {
+                    setUploading(false)
+                  }
+                })()
+                return
+              }
               // 复制消息/历史时常带尾随换行，粘贴进输入框后多出空行；去掉尾部
               // 空白，保留中间内容与行内格式。无尾随空白时走默认粘贴。
-              const cd = e.clipboardData
               const text = cd ? cd.getData('text') : ''
               if (!text) return
               const cleaned = text.replace(/\s+$/, '')
@@ -986,7 +1359,7 @@ export function ChatPanel({ agent }: { agent: Agent }) {
                 </button>
               )}
               <button
-                onClick={() => interrupt(agent.id)}
+                onClick={() => interrupt()}
                 title="停止生成"
                 className="rounded-lg bg-contrast p-2 text-white hover:brightness-125"
               >
@@ -996,7 +1369,7 @@ export function ChatPanel({ agent }: { agent: Agent }) {
           ) : (
             <button
               onClick={submit}
-              disabled={!input.trim() || !serveConnected}
+              disabled={(!input.trim() && !pendingFiles.length) || !serveConnected}
               title={!serveConnected ? 'xihe未连接' : undefined}
               className="rounded-lg bg-brand p-2 text-white disabled:opacity-30"
             >

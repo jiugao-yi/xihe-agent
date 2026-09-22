@@ -13,7 +13,7 @@ tags:
   - agent
 status: active
 created: 2026-07-22
-updated: 2026-07-22
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0002_tool-registry-and-dispatch.md
   - wiki/concepts/0007_skills-system.md
@@ -24,6 +24,8 @@ related_pages:
 # 工具/技能/角色分层架构（workflow 是 skill 的编排用法）— ⚠️ 角色层已废弃
 
 > **角色层已废弃（2026-07-22）**：角色化方案回退（见 [[0017]]）。当前架构回归 **tool / skill 两层 + ad-hoc delegate**（主 agent 按需 `request_tools` + `skill_view`，真需隔离才 `delegate_task` 无 role）。本文角色层内容（角色配置/主子差别）作历史记录；`subagent_blocked` 标签 + `is_subagent` 属性（子 agent 边界）仍保留。
+>
+> **订正（2026-09-14）**：①文中示例 skill（cmdb-query-variable / security-ticket-monitor / workflows/ 分类）是当时部署的实例，当前 bundled skill 集为 diagramming / software-development / ssh-access / web-record-to-skill；②常驻专家的现行机制是 [[0032_specialist-agents]]（agents/*.yaml），与本文角色层不同物。
 
 ## 摘要
 
@@ -94,7 +96,7 @@ xihe 能力体系**三层**，正交组合：
 
 ## 子 agent 的 tool 边界（`subagent_blocked` 标签 + `is_subagent`）
 
-tool 注册时声明 `subagent_blocked`（默认 False，少数危险 tool 标 True）：`delegate_task`（递归）、`skill_manage`（改全局 skill）、`send_message`/`send_image`/`clarify`（无对话通道）、`cronjob`（不该动调度）。`registry.get_schemas(subagent=True)` 按标签过滤——**一套机制**，不再 toolset+tool 两套 block 列表。加新 blocked tool 只需注册时标 `subagent_blocked=True`。
+tool 注册时声明 `subagent_blocked`（默认 False，少数危险 tool 标 True）：`delegate_task`（递归）、`skill_manage`（改全局 skill）、`send_message`/`send_image`/`clarify`（无对话通道）、`cronjob`（不该动调度）、`kbs_init`、浏览器 state 删除、录制族（`web_record`/`browser_record*`）、专家 `run_*_agent`。`registry.get_schemas(subagent=True)` 按标签过滤——**一套机制**，不再 toolset+tool 两套 block 列表。加新 blocked tool 只需注册时标 `subagent_blocked=True`（现行全集见 `core/toolsets.py` 的 `SUBAGENT_BLOCKED_TOOLS` 文档清单）。
 
 主/子判断用 `XiheAgent.is_subagent`（构造属性，子 agent 构造时传 `True`，主 agent 默认 `False`）。与 `delegate_depth`（递归深度）独立——depth 管 `MAX_DEPTH` 防递归，is_subagent 是身份属性管主/子行为（skip/过滤）。
 

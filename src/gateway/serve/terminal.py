@@ -3,11 +3,7 @@ sessions — stateless module functions, no ServeApp state.
 
 Sessions live in the SERVE process (ssh_tool's registry, tapped by _ssh_tap);
 the panel is just a viewer + second keyboard on the same channels.
-
-POST /ssh/live/connect routes through the same _ssh_connect the agent uses,
-so the session lands in the shared registry and the agent can drive it
-afterwards. The token/password stays in this process's memory: it is passed
-to _ssh_connect and never echoed back or logged."""
+Connections are agent-initiated only — there is no desktop connect path."""
 
 import asyncio
 import json
@@ -38,52 +34,6 @@ async def ssh_live(request):
     return web.json_response({"sessions": await run(_ssh_tap.live_snapshot)})
 
 
-async def ssh_live_connect(request):
-    from tools import ssh_tool
-
-    try:
-        body = await request.json()
-    except Exception:
-        return err(400, "invalid json")
-    if not isinstance(body, dict):
-        return err(400, "body must be a mapping")
-
-    try:
-        port = int(body.get("port") or 22)
-        timeout = int(body.get("timeout") or 15)
-    except (TypeError, ValueError):
-        return err(400, "port/timeout must be integers")
-
-    args = {
-        "name": str(body.get("name") or "").strip(),
-        "host": str(body.get("host") or "").strip(),
-        "port": port,
-        "user": str(body.get("user") or "").strip(),
-        "mode": str(body.get("mode") or "shell"),
-        "timeout": timeout,
-    }
-    secret = str(body.get("token") or body.get("password") or "")
-    if secret:
-        args["token"] = secret
-    if not args["name"]:
-        return err(400, "name is required")
-    if not secret:
-        # clarify is an agent-turn interaction; over REST there is nobody to
-        # ask — demand the token upfront
-        return err(400, "token/password is required")
-
-    ctx = {"session_key": str(body.get("session_key") or "")}
-    raw = await run(lambda: ssh_tool._ssh_connect(args, context=ctx,
-                                                  origin="desktop"))
-    try:
-        payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
-    except Exception:
-        logger.warning("ssh live connect: unparseable result for %s", args["name"])
-        return err(500, "connect returned an unexpected result")
-    payload["ok"] = bool(payload.get("success"))
-    return web.json_response(payload)
-
-
 async def _ssh_stream_sender(ws, tap, q, cursor: int):
     """Writer half of /ssh/live/stream: backlog from ``cursor``, then live
     data by polling the ring at the sender's own cursor. The subscriber
@@ -96,7 +46,7 @@ async def _ssh_stream_sender(ws, tap, q, cursor: int):
         await ws.send_json({
             "t": "meta", "key": tap.name, "name": tap.meta.get("alias", tap.name),
             "host": tap.meta.get("host", ""), "user": tap.meta.get("user", ""),
-            "mode": tap.meta.get("mode", ""), "origin": tap.meta.get("origin", ""),
+            "mode": tap.meta.get("mode", ""),
             "session_key": tap.meta.get("session_key", ""),
             "cols": tap.meta.get("cols"), "rows": tap.meta.get("rows"),
             "offset": cursor, "base": tap.ring.base,
@@ -243,16 +193,10 @@ async def local_live_stream(request):
     if not key:
         return err(400, "key is required")
 
-    def _resolve():
-        ch = _local_tap.get(key)
-        if ch is None and key.startswith("conv:"):
-            # A viewer may open a conversation's console before any terminal
-            # run created it — create it empty and wait.
-            ch = _local_tap.conv_channel(key[len("conv:"):])
-        return ch
-
-    ch = await run(_resolve)
+    ch = await run(lambda: _local_tap.get(key))
     if ch is None:
+        # Channels are created by tool runs, never by viewers — browsing
+        # conversations with the panel open must not spawn empty tabs.
         return err(404, f"no such channel: {key}")
 
     raw_from = request.query.get("from")
@@ -298,7 +242,6 @@ async def local_live_stop(request):
 def add_routes(router):
     router.add_get("/ssh/live", ssh_live)
     router.add_get("/ssh/live/stream", ssh_live_stream)
-    router.add_post("/ssh/live/connect", ssh_live_connect)
     router.add_get("/local/live", local_live)
     router.add_get("/local/live/stream", local_live_stream)
     router.add_post("/local/live/stop", local_live_stop)

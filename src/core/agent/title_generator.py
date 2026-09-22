@@ -7,7 +7,7 @@ a daemon thread so it never adds latency to the user-facing reply.
 
 import logging
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,8 @@ _TITLE_PROMPT_EXCHANGE = (
 
 
 def generate_title(user_message: str, assistant_response: str = "",
-                   aux=None, timeout: float = None) -> Optional[str]:
+                   aux: Optional[Any] = None,
+                   timeout: Optional[float] = None) -> Optional[str]:
     """Generate a session title.
 
     With only ``user_message`` (the default — assistant_response empty) the
@@ -40,6 +41,8 @@ def generate_title(user_message: str, assistant_response: str = "",
     it is derived from the first exchange (exchange path). Returns the title
     string or None on failure.
     """
+    if aux is None:
+        return None
     user_snippet = user_message[:500] if user_message else ""
     assistant_snippet = assistant_response[:500] if assistant_response else ""
     if assistant_snippet:
@@ -86,8 +89,9 @@ def generate_title(user_message: str, assistant_response: str = "",
         return None
 
 
-def maybe_auto_title(session_db, session_id, user_message, aux,
-                     conversation_history: list = None) -> None:
+def maybe_auto_title(session_db: Any, session_id: str, user_message: str,
+                     aux: Any,
+                     conversation_history: Optional[list] = None) -> None:
     """Fire-and-forget title generation on the session's first user message.
 
     Gate: this is the session's first user message (the loaded history contains
@@ -113,7 +117,8 @@ def maybe_auto_title(session_db, session_id, user_message, aux,
     thread.start()
 
 
-def _auto_title_thread(session_db, session_id, user_message, aux):
+def _auto_title_thread(session_db: Any, session_id: str,
+                       user_message: str, aux: Any) -> None:
     """Background thread: generate a title from the opening message + save it."""
     try:
         existing = session_db.get_session_title(session_id)

@@ -500,18 +500,6 @@ def test_screenshot_diff_vs_previous(monkeypatch):
     assert third["diff"]["changed"] is False
 
 
-@requires_win
-def test_screenshot_describe_fallback(monkeypatch):
-    import tools.vision_tools as vision_tools
-    monkeypatch.setattr(vision_tools, "describe_image_sync",
-                        lambda path, prompt=None: "(vision not available)")
-    monkeypatch.setattr(ct, "ImageGrab",
-                        FakeImageGrab(Image.new("RGB", (100, 80), "black")))
-    data = json.loads(ct._computer_screenshot({"describe": True}))
-    assert data["description"] is None
-    assert "image_ocr" in data["hint"]
-
-
 def test_screenshot_retina_grid_maps_to_click_space(mac, pag, monkeypatch):
     # Retina：捕获 200x100 物理像素，点击网格是 100x50 逻辑点
     pag._size = (100, 50)

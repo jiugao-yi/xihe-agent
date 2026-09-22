@@ -273,7 +273,7 @@ def _shell_session(name="bastion", prefill=""):
     sent = []
     session_key = "agent:main:desktop:dm:c1"
     tap = tap_mod.attach(name, channel=None, meta={
-        "host": "h", "user": "u", "mode": "shell", "origin": "agent",
+        "host": "h", "user": "u", "mode": "shell",
         "session_key": session_key, "cols": 100, "rows": 30,
     })
     tap.bind_sender(sent.append)
@@ -453,9 +453,8 @@ def test_live_snapshot_shape():
     _shell_session(name="snap")
     rows = tap_mod.live_snapshot()
     row = next(r for r in rows if r["name"] == "snap")
-    assert row["origin"] == "agent"
     assert row["session_key"] == "agent:main:desktop:dm:c1"
     assert row["mode"] == "shell"
     assert row["alive"] is True
-    assert set(row) >= {"name", "host", "user", "mode", "origin",
+    assert set(row) >= {"name", "host", "user", "mode",
                         "session_key", "cols", "rows", "alive", "offset"}

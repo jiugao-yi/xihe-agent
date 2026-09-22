@@ -14,6 +14,9 @@ senders) poll the ring at their own cursor under the channel lock.
 """
 
 import atexit
+import codecs
+import locale
+import re
 import threading
 import time
 
@@ -26,6 +29,73 @@ RING_MAX_CHARS = 200_000
 # is the only copy of the logs.
 CHANNEL_CAP = 16
 IDLE_EVICT_AFTER_S = 30 * 60
+
+_CMD_HEADER_MAX = 160
+
+
+def fmt_command(command: str) -> str:
+    """One-line, bounded rendering of a command for a console header — the
+    raw command lives on in the channel's command field for tooltips."""
+    one = re.sub(r"\r\n|\r|\n", " ⏎ ", command)
+    if len(one) > _CMD_HEADER_MAX:
+        one = one[: _CMD_HEADER_MAX - 1] + "…"
+    return one
+
+
+# Legacy native tools on Windows emit the host codepage (GBK here) no matter
+# what chcp said; a stream that turns out not to be utf-8 switches to it.
+# getencoding, not getpreferredencoding — the latter reports utf-8 whenever
+# Python's UTF-8 mode is on, which is exactly when the fallback is needed.
+_FALLBACK_ENC = getattr(locale, "getencoding", locale.getpreferredencoding)()
+
+
+class StreamDecoder:
+    """Incremental utf-8 decoder with a one-way fallback to the host's
+    preferred encoding. A strict UnicodeDecodeError means the child isn't
+    speaking utf-8 — an incomplete multibyte tail only buffers, never raises —
+    so the rest of the stream re-decodes there (replace). At most the ≤3-byte
+    tail buffered inside the strict decoder is lost at the switch point."""
+
+    def __init__(self):
+        self._dec = codecs.getincrementaldecoder("utf-8")("strict")
+        self._switched = False
+
+    def decode(self, data: bytes) -> str:
+        if not self._switched:
+            try:
+                return self._dec.decode(data)
+            except UnicodeDecodeError:
+                self._dec = codecs.getincrementaldecoder(_FALLBACK_ENC)("replace")
+                self._switched = True
+        return self._dec.decode(data)
+
+
+class LineTap:
+    """Feeds one child pipe's decoded output into a channel and a capture
+    list, holding back the partial text after the last \\n/\\r: complete lines
+    stay whole when a conversation's two reader threads (stdout + stderr)
+    interleave in its shared console, and \\r progress bars keep their live
+    overwrite. The held tail goes out with the next feed, or at flush (EOF)."""
+
+    def __init__(self, channel: "Channel", sink: list):
+        self._ch = channel
+        self._sink = sink
+        self._held = ""
+
+    def feed(self, s: str) -> None:
+        if not s:
+            return
+        self._sink.append(s)
+        self._held += s
+        cut = max(self._held.rfind("\n"), self._held.rfind("\r"))
+        if cut >= 0:
+            self._ch.publish(self._held[: cut + 1])
+            self._held = self._held[cut + 1:]
+
+    def flush(self) -> None:
+        if self._held:
+            self._ch.publish(self._held)
+            self._held = ""
 
 
 class Channel:
@@ -50,13 +120,17 @@ class Channel:
     # ---- conv channels (terminal tool) ----
 
     def begin(self, command: str, cwd: str | None) -> None:
-        header = f"\r\n\x1b[90m—— agent $ {command}\x1b[0m\r\n"
-        if cwd:
-            header += f"\x1b[90m   ({cwd})\x1b[0m\r\n"
+        # One-line header; the cwd repeats only when it CHANGES (tracked in
+        # self.cwd — left alone on a None so the comparison stays meaningful).
         with self.lock:
+            header = f"\r\n\x1b[90m—— $ {fmt_command(command)}"
+            if cwd and cwd != self.cwd:
+                header += f"   ({cwd})"
+            header += "\x1b[0m\r\n"
             self.active += 1
             self.command = command
-            self.cwd = cwd
+            if cwd:
+                self.cwd = cwd
             self.last_touch = time.time()
             self.ring.append(header)
 

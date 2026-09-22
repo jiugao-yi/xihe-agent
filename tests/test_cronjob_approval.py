@@ -97,7 +97,7 @@ def test_approval_card_roundtrip_reply_resolves_agent(monkeypatch, make_agent):
     while not adapter.sent and time.time() < deadline:
         time.sleep(0.02)
     # 卡片带上任务名，回复指引 y/n/a
-    assert adapter.sent and "deploy" in adapter.sent[0][1] and "不再询问" in adapter.sent[0][1]
+    assert adapter.sent and "deploy" in adapter.sent[0][1] and "总是允许" in adapter.sent[0][1]
     # 该聊天上的整词回复折给挂起的审批
     assert _approvals.resolve_pending_reply("wecom", "chat-9", "a") is True
     t.join(5)

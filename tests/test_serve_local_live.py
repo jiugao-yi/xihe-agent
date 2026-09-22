@@ -103,11 +103,10 @@ def test_unknown_proc_key_is_404():
             # ws.prepare — the 404 escapes as a normal response
             r = await client.get("/local/live/stream?key=proc:nope:zzz")
             assert r.status == 404
-            # a conv key may not exist yet — the viewer creates it empty
-            ws = await client.ws_connect("/local/live/stream?key=conv:t-live-d")
-            meta = await _recv_json(ws)
-            assert meta["t"] == "meta"
-            await ws.close()
+            # viewers never create channels — a conv key with no tool run
+            # behind it is the same plain 404
+            r = await client.get("/local/live/stream?key=conv:t-live-d")
+            assert r.status == 404
         finally:
             await client.close()
 

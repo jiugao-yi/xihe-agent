@@ -30,7 +30,7 @@ from core.version import VERSION
 
 
 def cmd_chat(args):
-    from cli.chat import run_chat
+    from cli.cli import run_chat
     return run_chat(args)
 
 

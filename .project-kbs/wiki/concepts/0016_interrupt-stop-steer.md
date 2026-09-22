@@ -18,7 +18,7 @@ tags:
   - tools
 status: active
 created: 2026-07-17
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0011_gateway-architecture.md
   - wiki/concepts/0002_tool-registry-and-dispatch.md
@@ -62,7 +62,7 @@ gateway 模式下，agent 一轮可能跑很久（搜索、SSH、子进程）。
 |---|---|---|---|
 | 纯 Python 循环 | `interruptible_iter(iter, every=32)` | 包迭代器，每 N 项查 `is_interrupted()`，中断即停 yield；调用方查标志返回部分结果 | `search_files`（4 处循环）|
 | 子进程 | `register_subprocess(proc)` / `run_interruptible(...)` | Popen 后注册到 per-agent 表，`interrupt()` 时 `proc.kill()` → `wait/communicate` 立即返回 | `terminal`、`execute_code`、`maven`（`subprocess.run`→`run_interruptible`）|
-| shell recv 循环 | 直接轮询 `is_interrupted()` | — | `ssh_tool._read_until_prompt` |
+| shell recv 循环 | 直接轮询 `is_interrupted()` | — | `_ssh_tap.read_until_prompt`（从 ssh_tool 拆出） |
 | 单次阻塞调用（http/browser/mcp/vision）| 无 | 靠各自 timeout；中途打断需 per-library（低 ROI）| — |
 
 `run_interruptible` 是 `subprocess.run` 的直接替代（同签名），自动注册/注销，工具不用传 `parent_agent`（走 contextvar）。`interruptible_iter` 也是 contextvar 自动绑定——新循环工具 `for x in interruptible_iter(...)` 一行接入。
@@ -81,7 +81,7 @@ gateway 模式下，agent 一轮可能跑很久（搜索、SSH、子进程）。
 ## 收尾 UX
 
 - `/stop` 立刻回 `⏹ 已发送停止信号，正在中断当前任务…`（`_handle_stop_intent`）。
-- 被中断轮真正结束后回 `✅ 任务已停止。`（handle_message 检测 `response=="[interrupted]"`）。
+- 被中断轮真正结束后回 `✅ 任务已停止。`（检测 `agent._last_exit_reason == "interrupted"`）。steer 入口先折批复待决审批（裸 y/n/a 优先当审批答复，见 [[0037_approval-permission-system]]）；轮询中断的工具面已扩展到 process/browser 录制等。
 - 无活跃轮时回 `没有正在运行的任务。`
 
 ## 关键坑（演进过程中踩的）

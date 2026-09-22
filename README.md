@@ -32,9 +32,11 @@ Point it at any OpenAI-compatible endpoint (Zhipu, Volcano Ark, DeepSeek, OpenAI
 
 **🖱️ It can drive the desktop itself.** Beyond the browser, the `computer_*` toolset lets the agent operate your local desktop like a person — especially useful for local software that has no API: screenshots (with a before/after diff that verifies an action took effect), mouse clicks, keyboard input (clipboard-based, CJK-safe), window and app management, clipboard — Windows and macOS both. Locating controls is text-first: `computer_uia` reads the accessibility tree into an element list with coordinates, faster and more precise than screenshot + vision; self-drawn UI falls back to screenshot + vision/OCR. Fling the mouse into a screen corner to halt at any moment.
 
-**👀 Transparent process, yours to interrupt.** Thinking and replies render as separate streams — the desktop app traces every step live (thinking stream, tool cards, mid-turn steering); in WeCom a live feed of thinking gists and tool lines scrolls in real time, then gets replaced wholesale when the reply arrives — fold-like, clean. `/stop` interrupts at any moment; a message sent while a turn is running arrives as a steer at the next iteration boundary — no interruption, just course correction.
+**👀 Transparent process, yours to interrupt.** Thinking and replies render as separate streams — the desktop app traces every step live (thinking stream, tool cards, mid-turn steering); in WeCom a live feed of thinking gists, tool lines, and interactive approval/clarify cards scrolls in real time, then gets replaced wholesale when the reply arrives — fold-like, clean. `/stop` interrupts at any moment; a message sent while a turn is running arrives as a steer at the next iteration boundary — no interruption, just course correction.
 
-**🛡️ Dangerous operations get a human gate.** Dangerous-command patterns plus high-risk argument tables and an LLM semantic judge, with one consistent confirmation UX everywhere: desktop approval card, chat reply (`y|n|a`), or CLI prompt. `deny`/`allow` glob rules and a per-session "approve and don't ask again" memory keep the gate from becoming noise.
+**🖥️ You watch it work, in real terminals.** Every command the agent runs streams into a live per-conversation console in the desktop app — a long build pops the terminal drawer open mid-run (short commands never disturb you), resident processes get their own tabs, and an SSH session it opens is shared: you can type into the very same session, with badges showing who typed what. Your own multi-tab local terminal is right there too — interactive, independent of any conversation.
+
+**🛡️ Dangerous operations get a human gate.** Dangerous-command patterns plus high-risk argument tables and an LLM semantic judge, with one consistent confirmation UX everywhere: desktop approval card, WeCom interactive button card, chat reply (`y|n|a`), or CLI prompt. `deny`/`allow` glob rules and a per-session "approve and don't ask again" memory keep the gate from becoming noise.
 
 **🎬 Record once, it knows.** `browser_record` turns a browser session into actions with role/name metadata and a runnable Playwright script; the `web-record-to-skill` skill goes further and distills the recording into a replayable skill. The agent can record its own exploration too (`browser_record_start/stop`) — human and agent actions hit the same recorder.
 
@@ -163,6 +165,8 @@ Inbound images are auto-described via vision/OCR before reaching a text-only mai
 xihe                          # interactive REPL in the current directory
 xihe chat -s bug-hunt -q "find flaky tests and propose fixes"
 xihe chat -r                  # resume a previous session
+/plan <task>                  # plan mode: read-only exploration, then an
+                              # approval card — approval starts execution
 ```
 
 The agent's working directory is where you launched it; `CLAUDE.md` / `xihe.md` / `AGENTS.md` / `.cursorrules` in that directory are injected into the system prompt when present (toggle via `session.*`).
@@ -275,11 +279,12 @@ The instance file is the single config source for that process; its optional `ag
 ```
 src/
 ├── core/          root contracts (config · sessions · registry · toolsets) + agent/ engine
-│                  (loop, prompts, compressor) + services/ feature domains (store,
-│                  specialists, diagnostics, external agents) + support/ zero-dep machinery
+│                  (loop, prompts, compressor, turn_layers, turn_runner) + services/
+│                  feature domains (store, specialists, diagnostics, external agents)
+│                  + support/ zero-dep machinery
 ├── tools/         tool modules — each self-registers into the registry at import
-├── gateway/       bot.py (messaging gateway) · platforms/ (WeCom & Feishu adapters) · serve/ (HTTP+WS service, one module per business: chat/admin/browser/terminal/knowledge) · stream consumer · slash commands
-├── cli/           chat REPL + doctor (CLI mode)
+├── gateway/       bot.py (messaging gateway) · platforms/ (WeCom & Feishu adapters) · serve/ (HTTP+WS service, one module per business: conversations/admin/browser/terminal/knowledge) · stream consumer · slash commands
+├── cli/           cli.py REPL + doctor (CLI mode)
 ├── app/           the xihe launcher — argparse dispatch into the three run modes
 └── skills/        bundled skills
 desktop/           Electron control plane (separate Node toolchain)
@@ -288,6 +293,8 @@ tests/             pytest suite — L0 pure functions, L1 tools w/ mocked IO,
 ```
 
 Agent-loop invariants worth knowing before contributing: read-only tool calls run concurrently, any write tool forces sequential dispatch; messages persist to SQLite after every iteration; a nudge/warning injects at 70%/90% of `max_iterations`; oversized tool results spill to a side-store instead of inline history; `agent.interrupt()` stops the loop from another thread and propagates to children.
+
+The three run modes share one orchestration layer: each entrypoint parses its own protocol into an `AgentTurnParams` + `TurnCallbacks` pair and hands them to `AgentTurnRunner` (core/agent/turn_runner.py), which builds the per-turn agent from `SharedContext` and runs `XiheAgent.chat`. Turn-scoped prompt layers (plan mode, the regenerate hint) are injected at the API boundary and never persisted. Plan mode physically restricts the turn's tool surface to the read-only floor; the user approves the plan on a clarify card and the execution turn starts automatically.
 
 ## Development
 

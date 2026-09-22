@@ -2,7 +2,10 @@
 
 Each command handler receives (args, ctx) where:
   - args: str — the text after the command (e.g., "glm-5-tc" for "/model glm-5-tc")
-  - ctx: dict — {"agent": XiheAgent, "session_key": str, "platform_adapter": ...}
+  - ctx: dict — {"db": SessionDB, "config": dict, "session_key": str,
+                  "platform_adapter": ...}. No agent instance: commands touch
+    the DB and the model catalog only, and per-session model overrides live
+    in the DB (session_model rows), not on any agent.
 """
 
 import os
@@ -51,12 +54,76 @@ def is_stop_intent(text: str) -> bool:
     return t.rstrip("。.!！?？~…,，;；").strip().lower() in _STOP_PHRASES
 
 
-def _get_session_id(agent, sk: str) -> str:
+def _effective_model(db, config, session_key) -> str:
+    """The session's model: DB override if set, else config's."""
+    override = None
+    try:
+        override = db.get_session_model(session_key)
+    except Exception:
+        pass
+    return override or config.get("model", "?")
+
+
+def _list_models(config) -> list[dict]:
+    from core.agent import model_catalog
+    models_cfg = config.get("models", {})
+    entries: dict[str, dict] = {}
+    for name, meta in models_cfg.items():
+        meta = meta if isinstance(meta, dict) else {}
+        entries[name] = {
+            "name": name,
+            "context_length": (
+                meta.get("context_length")
+                or model_catalog.lookup_context_length(name, models_cfg)
+                or 128000),
+            "description": meta.get("description", ""),
+            "source": "config",
+        }
+    for mid in model_catalog.discover_models(
+            config.get("base_url", ""), config.get("api_key", "")):
+        if mid not in entries:
+            entries[mid] = {
+                "name": mid,
+                "context_length": (
+                    model_catalog.lookup_context_length(mid, models_cfg) or 128000),
+                "description": "",
+                "source": "discovered",
+            }
+    current = config.get("model", "")
+    result = [{**e, "current": e["name"] == current} for e in entries.values()]
+    if not result:
+        result.append({
+            "name": current,
+            "context_length": model_catalog.lookup_context_length(current, models_cfg) or 128000,
+            "description": "(default)",
+            "current": True,
+            "source": "default",
+        })
+    return result
+
+
+def _switch_model(db, config, session_key, model_name) -> bool:
+    from core.agent import model_catalog
+    try:
+        db.set_session_model(session_key, model_name)
+    except Exception as e:
+        logger.warning("Failed to persist session model: %s", e)
+        return False
+    return True
+
+
+def _context_length(config, model_name) -> int:
+    from core.agent import model_catalog
+    return (model_catalog.lookup_context_length(model_name, config.get("models"))
+            or 128000)
+
+
+def _get_session_id(db, sk: str) -> str:
     """Get session_id from session_key, creating if needed."""
-    entry = agent.db.get_entry(sk)
+    entry = db.get_entry(sk)
     if entry:
         return entry.session_id
-    row = agent.db._conn.execute(
+    row = db._conn.execute(
         "SELECT session_id FROM sessions WHERE session_key = ?", (sk,)
     ).fetchone()
     return row[0] if row else None
@@ -68,12 +135,13 @@ def handle_command(text: str, ctx: dict) -> str | None:
     cmd = parts[0].lower()
     args = parts[1].strip() if len(parts) > 1 else ""
 
-    agent = ctx.get("agent")
+    db = ctx.get("db")
+    config = ctx.get("config") or {}
     sk = ctx.get("session_key", "default")
     adapter = ctx.get("platform_adapter")
 
     if cmd in ("/new", "/reset"):
-        agent.db.reset_session(sk)
+        db.reset_session(sk)
         return "Session reset."
 
     elif cmd in ("/stop", "/cancel"):
@@ -87,12 +155,12 @@ def handle_command(text: str, ctx: dict) -> str | None:
         return "没有正在运行的任务。"
 
     elif cmd == "/title":
-        session_id = _get_session_id(agent, sk)
+        session_id = _get_session_id(db, sk)
         if not args:
-            title = agent.db.get_session_title(session_id) or "(untitled)" if session_id else "(no session)"
+            title = db.get_session_title(session_id) or "(untitled)" if session_id else "(no session)"
             return f"Current title: {title}"
         if session_id:
-            agent.db.set_session_title(session_id, args.strip())
+            db.set_session_title(session_id, args.strip())
             return f"Title set: {args.strip()}"
         return "No active session."
 
@@ -102,6 +170,7 @@ def handle_command(text: str, ctx: dict) -> str | None:
             "",
             "常用:",
             "/new, /reset      - 重置会话",
+            "/plan <task>      - 规划模式：只读探查出计划，批准后自动执行",
             "/stop             - 停止当前任务（也可直接说：停 / 停止 / 取消）",
             "/status           - 会话与模型信息",
             "/tools            - 查看可用工具",
@@ -123,30 +192,30 @@ def handle_command(text: str, ctx: dict) -> str | None:
 
     elif cmd == "/model":
         if not args:
-            models = agent.list_models()
+            models = _list_models(config)
             lines = ["Available models:"]
             for m in models:
                 marker = " *" if m["current"] else ""
                 desc = f" ({m['description']})" if m["description"] else ""
                 lines.append(f"  {m['name']}{desc}{marker}")
-            lines.append(f"\nCurrent: {agent._effective_model(sk)}")
+            lines.append(f"\nCurrent: {_effective_model(db, config, sk)}")
             return "\n".join(lines)
 
         model_name = args.strip()
-        available = {m["name"] for m in agent.list_models()}
+        available = {m["name"] for m in _list_models(config)}
         if available and model_name not in available:
             return f"Unknown: {model_name}\nAvailable: {', '.join(sorted(available))}"
 
-        agent.switch_model(model_name, session_key=sk)
-        ctx_len = agent._get_context_length(model_name)
+        _switch_model(db, config, sk, model_name)
+        ctx_len = _context_length(config, model_name)
         return f"Switched to {model_name} (context: {ctx_len // 1000}K)"
 
     elif cmd == "/status":
-        model = agent._effective_model(sk)
-        ctx_len = agent._get_context_length(model)
+        model = _effective_model(db, config, sk)
+        ctx_len = _context_length(config, model)
         platform_name = adapter.name if adapter else "cli"
-        session_id = _get_session_id(agent, sk)
-        title = agent.db.get_session_title(session_id) or "(untitled)" if session_id else "(no session)"
+        session_id = _get_session_id(db, sk)
+        title = db.get_session_title(session_id) or "(untitled)" if session_id else "(no session)"
         lines = [
             f"Session: {sk}",
             f"Title: {title}",
@@ -172,10 +241,9 @@ def handle_command(text: str, ctx: dict) -> str | None:
         return "\n".join(lines)
 
     elif cmd == "/history":
-        session_id = _get_session_id(agent, sk)
-        if not session_id:
-            return "No conversation history."
-        messages = agent.db.load_messages(session_id)
+        # Transcript spans reset rounds — pre-reset messages stay visible;
+        # the agent's own context remains scoped to the current round.
+        messages = db.load_transcript(sk)
         if not messages:
             return "No conversation history."
         # /history [N] — how many recent messages to show (default 20; caps
@@ -184,7 +252,16 @@ def handle_command(text: str, ctx: dict) -> str | None:
         if args.strip().isdigit():
             limit = max(1, min(int(args.strip()), 200))
         lines = []
+        marks = db.reset_marks(sk)
+        prev_sid = None
         for msg in messages:
+            sid = msg.get("session_id")
+            if sid and prev_sid and sid != prev_sid:
+                label = {"idle": "闲置超时", "daily": "每日重置",
+                         "manual": "手动"}.get(marks.get(sid) or "", "")
+                lines.append("──── 上下文已重置%s ────" % (f"（{label}）" if label else ""))
+            if sid:
+                prev_sid = sid
             role = msg.get("role", "?")
             content = msg.get("content", "")
             if not content:
@@ -202,9 +279,9 @@ def handle_command(text: str, ctx: dict) -> str | None:
     elif cmd == "/sessions":
         # Scope to the current user's sessions (gateway sets user_id=sender_id);
         # CLI sessions have user_id=None → no filter (single-user admin view).
-        entry = agent.db.get_entry(sk)
+        entry = db.get_entry(sk)
         cur_user = entry.origin.user_id if (entry and entry.origin) else None
-        rows = agent.db.list_sessions(limit=30, user_id=cur_user)
+        rows = db.list_sessions(limit=30, user_id=cur_user)
         if not rows:
             return "No sessions."
         lines = ["Sessions (most recent first):"]
@@ -224,7 +301,7 @@ def handle_command(text: str, ctx: dict) -> str | None:
             return "/resume 仅在 CLI 可用。"
         # Only sessions with a real chat_id are resumable (CLI resume rebuilds
         # the key from chat_id); legacy rows with empty chat_id can't switch.
-        rows = [r for r in agent.db.list_sessions(limit=30, platform="cli") if r.get("chat_id")]
+        rows = [r for r in db.list_sessions(limit=30, platform="cli") if r.get("chat_id")]
         if not rows:
             return "没有可恢复的 CLI 会话。"
 
@@ -256,23 +333,26 @@ def handle_command(text: str, ctx: dict) -> str | None:
 
         from core.session import SessionSource
         new_source = SessionSource(platform="cli", chat_id=target, chat_type="dm")
-        new_key = agent.db.build_key(new_source)
+        new_key = db.build_key(new_source)
         ctx["cli_source"] = new_source
         ctx["session_key"] = new_key
-        entry = agent.db.get_entry(new_key)
-        title = agent.db.get_session_title(entry.session_id) if entry else None
+        entry = db.get_entry(new_key)
+        title = db.get_session_title(entry.session_id) if entry else None
         return f"✅ 已切换到 [{target}] {title or '(未命名)'}。下一条消息起在这段历史里继续。"
 
     elif cmd == "/compress":
-        session_id = _get_session_id(agent, sk)
+        compressor = ctx.get("compressor")
+        if compressor is None:
+            return "Compressor unavailable."
+        session_id = _get_session_id(db, sk)
         if not session_id:
             return "No messages to compress."
-        messages = agent.db.load_messages(session_id)
+        messages = db.load_messages(session_id)
         if not messages:
             return "No messages to compress."
-        if agent.compressor.should_compress(messages):
-            compressed = agent.compressor.compress(messages, session_key=sk)
-            agent.db.rewrite_messages(session_id, compressed)
+        if compressor.should_compress(messages):
+            compressed = compressor.compress(messages, session_key=sk)
+            db.rewrite_messages(session_id, compressed)
             return f"Compressed: {len(messages)} -> {len(compressed)} messages."
         return "No compression needed (context within limits)."
 

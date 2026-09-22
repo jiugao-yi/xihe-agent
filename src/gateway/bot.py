@@ -99,6 +99,72 @@ def steer_session(session_key: str, text: str) -> bool:
         return False
 
 
+# ---- 审批中继卡（template_card）：task_id 编码契约 + 通道健康探测 ----
+
+_CARD_KINDS = ("approval", "clarify")
+
+
+def encode_task_id(kind: str, card_id: str) -> str:
+    """task_id = "<kind>-<id>"。连字符分隔——实测冒号使卡片静默不渲染；
+    card_id（MidturnHub uuid hex）自身不含连字符，partition 反解安全。"""
+    return f"{kind}-{card_id}"
+
+
+def _parse_task_id(task_id: str) -> "tuple[str | None, str]":
+    """反解 encode_task_id。kind 必须在白名单内（防 id 含连字符时被
+    partition 截断出错误路由），不认识返回 (None, "")。"""
+    kind, sep, card_id = task_id.partition("-")
+    if sep and kind in _CARD_KINDS:
+        return kind, card_id
+    return None, ""
+
+
+class CardChannelHealth:
+    """卡片通道健康状态。按钮事件是否回流过（通道活着的唯一证据）落盘
+    <AGENT_HOME>/wecom_cards.json——渲染成败发送侧永远看不见（errcode=0
+    不等于渲染成功），且验证结果不该每个进程重新付一遍双发噪音。行为：
+    未证实期卡与文本同发（探测）；证实（事件回流）后卡片单发；发满
+    PROBE_MIN 张无事件 → 停用回落纯文本。文本 y/n/a 通道永远并存。"""
+
+    PROBE_MIN = 2
+
+    def __init__(self, state_path) -> None:
+        self._path = state_path
+        self.sent = 0
+        self.events = 0
+        self.disabled = False
+        try:
+            data = json.loads(state_path.read_text("utf-8"))
+            self.events = int(data.get("events") or 0)
+        except Exception:
+            pass
+
+    def alive(self, adapter) -> bool:
+        return hasattr(adapter, "send_card") and not self.disabled
+
+    def note_event(self) -> None:
+        self.events += 1
+        try:
+            self._path.write_text(json.dumps({"events": self.events}), "utf-8")
+        except Exception:
+            pass
+
+    def note_sent(self) -> None:
+        self.sent += 1
+
+    def note_settled(self) -> None:
+        """一次以非按钮方式了结的审批（文本/超时）：若通道从未证实且探测
+        卡发满，判通道死亡并停用。"""
+        if self.disabled or self.events > 0:
+            return
+        if self.sent >= self.PROBE_MIN:
+            self.disabled = True
+            logger.warning(
+                "[cards] %d cards sent, 0 button events received — card "
+                "channel presumed dead; falling back to plain text",
+                self.sent)
+
+
 def _split_response(text: str, max_len: int = 3500) -> list[str]:
     if len(text) <= max_len:
         return [text]
@@ -120,31 +186,10 @@ def _split_response(text: str, max_len: int = 3500) -> list[str]:
 
 
 def _describe_image(image_path: str) -> str:
-    """Auto-describe an image, or hint the agent to read it when vision is off.
-
-    When a vision model is configured, auto-describes via vision_analyze (as
-    before). When it is not, we do NOT run OCR automatically (the agent decides
-    whether text extraction is worth it); instead we return a hint pointing at
-    the available tool and the image path, so the agent can call it on demand.
-    """
-    from tools.vision_tools import pick_image_tool
-    tool = pick_image_tool()
-
-    if tool == "vision_analyze":
-        try:
-            from tools.vision_tools import _vision_analyze
-            result = json.loads(_vision_analyze({
-                "image": image_path,
-                "prompt": "简短描述这张图片的内容，包括文字、物体、场景等关键信息。",
-            }))
-            return result.get("analysis", "图片分析失败")
-        except Exception as e:
-            logger.warning("Vision auto-describe failed for %s: %s", image_path, e)
-            return f"图片分析失败: {e}"
-
-    if tool == "image_ocr":
-        return f"（图片未自动识别，路径: {image_path}，可用 image_ocr 工具读取其中的文字）"
-    return f"（图片未自动识别，路径: {image_path}，无可用图片识别工具）"
+    """入站图片自动描述——与 serve 桌面上传共用同一实现（core 层基础设施，
+    无 vision 时只陈述路径事实，用哪个图片工具由 agent 自行判断）。"""
+    from core.agent.auxiliary_client import describe_image
+    return describe_image(shared_ctx.aux, image_path)
 
 
 def _extract_media_from_response(text: str) -> tuple[list[str], str]:
@@ -223,6 +268,60 @@ def run_gateway(args):
                       chat_id, getattr(result, 'error', 'unknown'))
         return False
 
+    # ---- 审批中继卡（template_card）----
+    card_health = CardChannelHealth(AGENT_HOME / "wecom_cards.json")
+
+    async def _handle_card_event(task_id: str, event_key: str,
+                                 event_req_id: str, chat_id: str,
+                                 selected_ids=None):
+        """WeCom card button click → precise routing-table verdict + 5 秒窗口
+        内就地更新卡片终态（aibot_respond_update_msg 只认事件 req_id，跨到
+        工具线程的结果回调必超窗——所以更新必须在点击路径上完成）。
+        selected_ids：vote/multiple 卡提交事件携带的选项 id（按钮卡为空）。"""
+        from core.support.approvals import card_click, card_meta
+        card_health.note_event()
+        kind, card_id = _parse_task_id(task_id)
+        if kind is None:
+            logger.warning("[cards] Malformed task_id %r", task_id)
+            return
+        # clarify：选项 id 折回原文作答（多选拼接），经路由表送达 resolve。
+        # 折算在本层完成——路由层收到的已是最终答案。
+        if kind == "clarify" and selected_ids:
+            meta = card_meta("clarify", card_id)
+            opts = meta.get("options") or []
+            texts = []
+            for sid in selected_ids:
+                if sid.startswith("o") and sid[1:].isdigit():
+                    idx = int(sid[1:]) - 1
+                    texts.append(opts[idx] if 0 <= idx < len(opts) else sid)
+                else:
+                    texts.append(sid)
+            event_key = "；".join(texts) if texts else event_key
+        if not card_click(kind, card_id, event_key):
+            # 已裁决/过期的卡再点：静默吞掉。终态卡上的按钮（已回答/已处理、
+            # 置灰选项）点了必然走到这里——回"该确认已处理"是对无意义点击
+            # 的打扰；真正有用的场景（旧卡翻出来误点）卡面终态本身已说明
+            # 一切。审批文本兜底 y/n/a 通道不受影响（不走这里）。
+            logger.info("[cards] Stale click ignored (kind=%s id=%s key=%s)",
+                        kind, card_id, event_key)
+            return
+        # 点击即裁决：resolve 已送达。task_id 原样回传——服务端靠它匹配
+        # 目标卡（2026-09：换新 id 更新无效，卡面不重绘）。
+        try:
+            from gateway.platforms.wecom import (
+                build_approval_result_card, build_clarify_result_card)
+            if kind == "clarify":
+                await platform_adapter.update_card(
+                    event_req_id, build_clarify_result_card(event_key, task_id))
+            else:
+                await platform_adapter.update_card(
+                    event_req_id,
+                    build_approval_result_card(
+                        card_meta("approval", card_id).get("summary", ""),
+                        event_key, task_id))
+        except Exception as e:
+            logger.warning("Card update-in-place failed: %s", e)
+
     async def _handle_stop_intent(event: MessageEvent):
         """Out-of-band stop: interrupt the active turn (if any) and reply.
 
@@ -262,6 +361,12 @@ def run_gateway(args):
             from core.support.approvals import try_resolve_steer
             if try_resolve_steer(agent, event.text):
                 logger.info("Approval resolved from inbound message (session=%s)",
+                            session_key)
+                return True
+            # 澄清优先级低于审批批复（裸 y/n/a 更像批复）：整条文本就是答案。
+            from tools.clarify_tool import try_resolve_clarify
+            if try_resolve_clarify(agent, event.text):
+                logger.info("Clarify resolved from inbound message (session=%s)",
                             session_key)
                 return True
         # 后台（cron）挂起的审批：该会话没有活动 turn，y/n/a 折给等着的任务。
@@ -321,11 +426,24 @@ def run_gateway(args):
         # Slash commands (use a lightweight agent just for command context).
         # In normal gateway operation the adapter intercepts stop intents
         # before this point; /stop here is a fallback for platforms/modes
-        # that route it as an ordinary message.
-        if text.startswith("/"):
-            agent = shared_ctx.create_agent()
+        # that route it as an ordinary message. /plan is intercepted first:
+        # it needs the FULL turn machinery (plan-mode roster + approval +
+        # auto-execution), not a command-context agent.
+        plan_requested = False
+        if text[:5].lower() == "/plan" and (len(text) == 5 or text[5:6] == " "):
+            task = text[5:].strip()
+            if not task:
+                await platform_adapter.send(
+                    event.chat_id, "Usage: /plan <task>",
+                    reply_to_msg_id=event.msg_id)
+                return
+            text = task
+            plan_requested = True
+        elif text.startswith("/"):
             cmd_ctx = {
-                "agent": agent,
+                "db": shared_ctx.db,
+                "config": shared_ctx.config,
+                "compressor": shared_ctx.compressor,
                 "session_key": session_key,
                 "platform_adapter": platform_adapter,
             }
@@ -345,13 +463,15 @@ def run_gateway(args):
             except Exception as e:
                 logger.warning("Welcome send failed: %s", e)
 
-        # Per-message agent instance — shared heavy state, fresh XiheAgent.
-        # Main-agent roster from config.yaml top-level toolsets/skills;
-        # web/media/scheduler stay expandable via request_tools when http
-        # (which owns request_tools) is in the roster.
-        agent = shared_ctx.create_agent(
-            enabled_toolsets=shared_ctx.main_toolsets,
-            skills_allowed=shared_ctx.main_skills)
+        # Per-message agent instance — shared heavy state, fresh XiheAgent,
+        # built through the same AgentTurnRunner facade serve uses. Main-agent
+        # roster from config.yaml top-level toolsets/skills; web/media/scheduler
+        # stay expandable via request_tools when http is in the roster.
+        from core.agent.agent import TurnCallbacks
+        from core.agent.turn_runner import AgentTurnParams, AgentTurnRunner
+        runner = AgentTurnRunner(shared_ctx, AgentTurnParams(
+            source=source, text=text, plan=plan_requested), None)
+        agent = runner.agent
         logger.info("Main agent roster: toolsets=%s skills=%s",
                     shared_ctx.main_toolsets,
                     "*" if shared_ctx.main_skills is None
@@ -409,21 +529,61 @@ def run_gateway(args):
             _loop = asyncio.get_running_loop()
 
             def _approval_request_cb(info: dict):
-                msg = (f"⚠️ 危险操作待确认\n{info.get('summary', '')}\n\n"
-                       f"回复 y 批准 / n 拒绝 / a 本会话不再询问")
                 if stream_consumer:
                     # Freeze the progress message here so post-approval frames
                     # open a fresh message below the cards instead of mutating
                     # the one above them (chronological chat order).
                     stream_consumer.cut()
-                fut = asyncio.run_coroutine_threadsafe(
-                    platform_adapter.send(event.chat_id, msg,
-                                          reply_to_msg_id=event.msg_id),
-                    _loop)
-                fut.result(timeout=30)
+                summary = str(info.get("summary", ""))
+                card_id = str(info.get("id", ""))
+                card_sent = False
+                if card_health.alive(platform_adapter):
+                    from gateway.platforms.wecom import build_approval_card
+                    from core.support.approvals import register_card
+                    card = build_approval_card(summary, encode_task_id("approval", card_id))
+                    fut = asyncio.run_coroutine_threadsafe(
+                        platform_adapter.send_card(
+                            event.chat_id, card, reply_to_msg_id=event.msg_id),
+                        _loop)
+                    try:
+                        if fut.result(timeout=30).success:
+                            card_sent = True
+                            card_health.note_sent()
+                            # summary 随卡登记：点击时终态卡整卡替换，
+                            # desc 靠它才能显示"批准/拒绝了什么"
+                            register_card("approval", card_id, lambda choice:
+                                agent.resolve_approval(
+                                    card_id,
+                                    approved=choice is not False,
+                                    always=choice == "always"),
+                                meta={"summary": summary})
+                    except Exception as e:
+                        logger.warning("approval card send failed: %s", e)
+                # 卡片通道未证实前（send_card 是发出即成功语义，渲染与否
+                # 发送侧永远看不见），文本提示必须同发，否则探测期的审批
+                # 会无声挂到超时。通道证实（有按钮事件回流）后本分支不再
+                # 进入、卡片单发——所以文本里永远不提"点击卡片按钮"：能读
+                # 到这句的场合必然无卡。
+                if not card_sent or card_health.events == 0:
+                    msg = (f"⚠️ 危险操作待确认\n{summary}\n\n"
+                           f"回复 y 批准 / n 拒绝 / a 总是允许")
+                    fut = asyncio.run_coroutine_threadsafe(
+                        platform_adapter.send(event.chat_id, msg,
+                                              reply_to_msg_id=event.msg_id),
+                        _loop)
+                    fut.result(timeout=30)
 
             def _approval_result_cb(info: dict, approved: bool, reason: str):
-                verdict = "✅ 已批准，继续执行" if approved else f"❌ 未批准（{reason}）"
+                # 卡片路径的终态回写已在点击事件 5 秒窗口内就地完成；这里
+                # 只对文本路径（未点卡、卡未渲染）发裁决文本。
+                from core.support.approvals import unregister_card
+                card_id = str(info.get("id", ""))
+                disposition = unregister_card("approval", card_id)
+                card_health.note_settled()
+                if disposition == "clicked":
+                    return
+                verdict = ("✅ 已批准，继续执行" if approved
+                           else f"❌ 未批准（{reason}）")
                 fut = asyncio.run_coroutine_threadsafe(
                     platform_adapter.send(event.chat_id, verdict,
                                           reply_to_msg_id=event.msg_id),
@@ -433,22 +593,100 @@ def run_gateway(args):
                 except Exception as e:
                     logger.warning("approval verdict send failed: %s", e)
 
+            def _clarify_request_cb(info: dict):
+                question = str(info.get("question", ""))
+                options = [str(o) for o in (info.get("options") or [])]
+                multi_select = bool(info.get("multi_select"))
+                q_id = str(info.get("id", ""))
+                card_sent = False
+                if stream_consumer:
+                    # 与审批回调同款：先定格进度帧再发卡——cut 阻塞等旧帧
+                    # 刷完，保证卡片不可能排在思考帧之前（渲染顺序=发送顺序）。
+                    stream_consumer.cut()
+                if card_health.alive(platform_adapter) and options:
+                    from gateway.platforms.wecom import build_clarify_card
+                    from core.support.approvals import register_card
+                    # 选项原文随卡登记：提交事件回传 option id（o1/o2/…），
+                    # 点击路径按登记还原成原文作答（与文本路径"整条文本
+                    # 作答"同一语义，模型读到的答案一致）。
+                    opts = list(options)
+                    card = build_clarify_card(
+                        question, opts, encode_task_id("clarify", q_id),
+                        multi_select=multi_select)
+                    # 主动推送（不带 reply_to）：reply 引用消息在企微客户端
+                    # 会被锚到会话上方，压过思考进度帧——推送消息按发送
+                    # 顺序落在进度帧之后，时间线连贯。
+                    fut = asyncio.run_coroutine_threadsafe(
+                        platform_adapter.send_card(event.chat_id, card),
+                        _loop)
+                    try:
+                        if fut.result(timeout=30).success:
+                            card_sent = True
+                            card_health.note_sent()
+
+                            def _resolve_choice(choice, _id=q_id, _opts=opts):
+                                return agent.resolve_clarification(_id, choice)
+
+                            register_card("clarify", q_id, _resolve_choice,
+                                          meta={"question": question,
+                                                "options": opts})
+                    except Exception as e:
+                        logger.warning("clarify card send failed: %s", e)
+                if not card_sent or card_health.events == 0:
+                    # 与审批同款跨线程发送；选项编号列出，用户回复整条文本
+                    # 作答（点不到按钮的渠道，编号/原文/自由输入都能对上）。
+                    lines = [f"❓ {question}"]
+                    for i, opt in enumerate(options, start=1):
+                        lines.append(f"{i}. {opt}")
+                    lines.append("直接回复你的答案")
+                    fut = asyncio.run_coroutine_threadsafe(
+                        platform_adapter.send(event.chat_id, "\n".join(lines),
+                                              reply_to_msg_id=event.msg_id),
+                        _loop)
+                    fut.result(timeout=30)
+                    return
+
+            def _clarify_result_cb(info: dict):
+                # 卡片路径的终态回写已在点击事件 5 秒窗口内就地完成；这里
+                # 只对文本路径发结果（与审批回调同款 disposition 判据）。
+                from core.support.approvals import unregister_card
+                disposition = unregister_card(
+                    "clarify", str(info.get("id", "")))
+                if disposition == "clicked":
+                    return
+                if info.get("status") == "answered":
+                    verdict = f"💬 已收到回答：{info.get('answer') or ''}"
+                else:
+                    verdict = f"💬 未收到回答（{info.get('status')}），按未回答处理"
+                fut = asyncio.run_coroutine_threadsafe(
+                    platform_adapter.send(event.chat_id, verdict,
+                                          reply_to_msg_id=event.msg_id),
+                    _loop)
+                try:
+                    fut.result(timeout=30)
+                except Exception as e:
+                    logger.warning("clarify verdict send failed: %s", e)
+
+            def _tool_done_log(name, args, elapsed):
+                logger.info("Tool %s completed (%.1fs)", name, elapsed)
+
             def _run_agent():
                 nonlocal agent_result, agent_exception
                 try:
-                    agent_result = agent.chat(
-                        source=source,
-                        user_message=text,
-                        stream_delta_callback=stream_consumer.on_delta if stream_consumer else None,
-                        tool_call_start_callback=(
+                    runner.callbacks = TurnCallbacks(
+                        stream_delta=stream_consumer.on_delta if stream_consumer else None,
+                        tool_call_start=(
                             stream_consumer.on_tool_start if stream_consumer else None),
-                        tool_result_callback=(
+                        tool_result=(
                             stream_consumer.on_tool_result if stream_consumer else None),
-                        tool_call_callback=lambda name, args, elapsed: logger.info(
-                            "Tool %s completed (%.1fs)", name, elapsed),
-                        approval_request_callback=_approval_request_cb,
-                        approval_result_callback=_approval_result_cb,
+                        tool_call=_tool_done_log,
+                        approval_request=_approval_request_cb,
+                        approval_result=_approval_result_cb,
+                        clarify_request=_clarify_request_cb,
+                        clarify_result=_clarify_result_cb,
                     )
+                    result = runner.run()
+                    agent_result = result.text
                 except Exception as e:
                     agent_exception = e
 
@@ -578,10 +816,32 @@ def run_gateway(args):
                     else:
                         result = await platform_adapter.send_document(
                             event.chat_id, item["path"],
+                            caption=item.get("caption"),
                             reply_to_msg_id=reply_to)
                         logger.info("Document send result: success=%s", result.success)
                 except Exception as e:
                     logger.exception("Failed to send queued media %s", item["path"])
+
+            # Approved plan → persist + auto-start the execution turn as a
+            # fresh message (full tool surface, plan as the contract).
+            outcome = runner.plan_outcome() if plan_requested else None
+            if outcome:
+                try:
+                    plan_path = outcome.path
+                    await platform_adapter.send(
+                        event.chat_id, f"📄 计划已保存：{plan_path}\n▶ 开始按计划执行…",
+                        reply_to_msg_id=event.msg_id)
+                except Exception:
+                    plan_path = None
+                _exec_event = MessageEvent(
+                    text=outcome.exec_text,
+                    chat_id=event.chat_id,
+                    msg_id=f"plan-exec-{time.monotonic_ns()}",
+                    sender_id=event.sender_id,
+                    is_group=event.is_group,
+                    chat_type=event.chat_type,
+                )
+                asyncio.create_task(handle_message(_exec_event))
 
         except Exception as e:
             logger.exception("Agent error")
@@ -635,6 +895,9 @@ def run_gateway(args):
     # Register the steer handler so a message arriving mid-turn is injected
     # into the active turn instead of queueing as a new one.
     platform_adapter.set_steer_handler(_handle_steer)
+    # Card button events (WeCom relay cards) → precise routing-table verdict.
+    if hasattr(platform_adapter, "set_card_event_handler"):
+        platform_adapter.set_card_event_handler(_handle_card_event)
 
     # Create shared context (heavy state: db, aux client, compressor), then
     # the one explicit process bootstrap: tools + MCP + specialists + cron

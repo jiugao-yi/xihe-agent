@@ -6,19 +6,41 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Optional
 
 import httpx
 from openai import OpenAI
 
 from core.agent.auxiliary_client import AuxiliaryClient
 from core.agent.compressor import ContextCompressor
+from core.agent.turn_layers import (
+    PLAN_SUBMIT_OPTIONS,
+    PLAN_MODE_LAYER,
+    REGENERATE_HINT,
+)
 from core.config import load_config
 from core.agent import model_catalog
 from core.session import SessionDB, SessionSource
 from core.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class TurnCallbacks:
+    """The UI-facing callbacks a mode hands to ``XiheAgent.chat``. All
+    optional — None = that interaction degrades (documented per field).
+    Serve builds one Emitter-backed instance; CLI/gateway build closures."""
+    stream_delta: Callable[[str | None], None] | None = None
+    tool_call: Callable[[str, str, float], None] | None = None
+    tool_call_start: Callable[[str, str, str], None] | None = None
+    tool_result: Callable[[str, str, float, str], None] | None = None
+    approval_request: Callable[[dict], None] | None = None
+    approval_result: Callable[[dict, bool, str], None] | None = None
+    clarify_request: Callable[[dict], None] | None = None
+    clarify_result: Callable[[dict], None] | None = None
+
+
 
 
 _PRINTED_SYSTEM_PROMPT_ONCE = False
@@ -33,7 +55,7 @@ _EMPTY_RESPONSE_WARNING = (
 )
 
 
-def _strip_budget_warnings(messages: list[dict]):
+def _strip_budget_warnings(messages: list[dict]) -> None:
     """Remove stale budget warnings from tool results in history.
 
     Budget warnings are turn-scoped signals. If left in replayed history,
@@ -56,19 +78,19 @@ def _strip_budget_warnings(messages: list[dict]):
 class XiheAgent:
     """Minimal tool-calling agent backed by OpenAI-compatible API."""
 
-    def __init__(self, config: dict = None, *,
+    def __init__(self, config: Optional[dict] = None, *,
                  enabled_toolsets: list[str] | None = None,
                  delegate_depth: int = 0,
                  is_subagent: bool = False,
                  system_prompt_override: str | None = None,
                  identity_override: str | None = None,
-                 skills_allowed: set = None,
+                 skills_allowed: Optional[Iterable[str]] = None,
                  project_context: bool = True,
-                 shared_db: 'SessionDB' = None,
-                 shared_aux: 'AuxiliaryClient' = None,
-                 shared_compressor: 'ContextCompressor' = None,
+                 shared_db: Optional['SessionDB'] = None,
+                 shared_aux: Optional['AuxiliaryClient'] = None,
+                 shared_compressor: Optional['ContextCompressor'] = None,
                  cwd: str | None = None,
-                 client=None):
+                 llm_client: Optional[Any] = None):
         # Deferred from module import time: loading registers tools — that
         # must not fire while the caller is still checking the api_key gate
         # (bad configs used to spew errors before any guidance could print).
@@ -78,7 +100,7 @@ class XiheAgent:
         load_all_tools()
         self.config = config or load_config()
         # Injectable for tests (FakeChatClient); defaults to a real OpenAI client.
-        self.client = client or OpenAI(
+        self.llm_client = llm_client or OpenAI(
             api_key=self.config["api_key"],
             base_url=self.config["base_url"],
             timeout=httpx.Timeout(120.0, connect=10.0),
@@ -103,6 +125,13 @@ class XiheAgent:
         # unrestricted) exposes everything anyway and stays untouched.
         if self.enabled_toolsets is not None:
             self.enabled_toolsets.add("base")
+        # Turn-scoped prompt layer (core/agent/turn_layers.py); None on normal
+        # turns. Set at chat() entry, injected at the API boundary, cleared in
+        # its finally. plan_approved/_plan_mode_live: the structured approval
+        # state for plan turns (see resolve_clarification).
+        self._turn_layer: str | None = None
+        self.plan_approved = False
+        self._plan_mode_live = False
         self.delegate_depth = delegate_depth
         self.is_subagent = is_subagent
         self.system_prompt_override = system_prompt_override
@@ -142,7 +171,7 @@ class XiheAgent:
         self._last_exit_reason: str | None = None
 
         self._interrupt_requested = False
-        self._active_children = []
+        self._active_children: list["XiheAgent"] = []
         self._active_children_lock = threading.Lock()
 
         # Steer state — non-interrupting mid-turn input. The gateway appends
@@ -165,11 +194,17 @@ class XiheAgent:
         # 命令 / gateway steer / CLI 输入）只能拿到顶层 agent —— 共享引用
         # 让 resolve 打通到任意深度。写工具顺序执行，同时至多一个 pending。
         self._approval_shared: dict = {
-            "pending": None,
-            "lock": threading.Lock(),
             "request_cb": None,
             "result_cb": None,
         }
+        # Mid-turn asks（审批/澄清）共用的等待骨架：单 pending + 中断/超时
+        # 感知。业务语义（verdict/记忆、自由文本答案）在各自流程层。
+        # is_interrupted 走闭包晚绑定（测试会替换实例属性）。
+        from core.support.interaction import MidturnHub
+        self._midturn = MidturnHub(lambda: self.is_interrupted())
+        # 澄清通道回调（与审批同款注入模式；clarify 对子代理 blocked，
+        # 只有顶层 turn 会挂起澄清，无需子代理共享）。
+        self._clarify_shared: dict = {"request_cb": None, "result_cb": None}
 
         if shared_compressor:
             self.compressor = shared_compressor
@@ -181,7 +216,8 @@ class XiheAgent:
                 aux=self.aux,
             )
 
-    def _build_system_prompt(self, platform: str = "", session_key: str = None) -> str:
+    def _build_system_prompt(self, platform: str = "",
+                             session_key: str | None = None) -> str:
         """Build system prompt from modular layers."""
         from core.agent.prompts import build_system_prompt
 
@@ -285,7 +321,7 @@ class XiheAgent:
             })
         return result
 
-    def switch_model(self, model_name: str, session_key: str = None) -> bool:
+    def switch_model(self, model_name: str, session_key: str | None = None) -> bool:
         if session_key:
             with self._lock:
                 self._session_models[session_key] = model_name
@@ -309,7 +345,7 @@ class XiheAgent:
             logger.info("Global model switched to %s (context=%d)", model_name, new_len)
         return True
 
-    def _effective_model(self, session_key: str = None) -> str:
+    def _effective_model(self, session_key: str | None = None) -> str:
         if session_key:
             with self._lock:
                 override = self._session_models.get(session_key)
@@ -390,24 +426,23 @@ class XiheAgent:
     def pending_approval(self) -> Optional[dict]:
         """当前等待人工审批的操作（无则 None）。浅拷贝、不含 Event，
         供 serve/gateway/CLI 的路由层查询与展示。"""
-        with self._approval_shared["lock"]:
-            p = self._approval_shared["pending"]
-            if p is None:
-                return None
-            return {"id": p["id"], "tool": p["tool"], "summary": p["summary"]}
+        p = self._midturn.pending
+        if p is None or p.get("kind") != "approval":
+            return None
+        return {"id": p["id"], "tool": p.get("tool"), "summary": p.get("summary")}
 
     def request_approval(self, tool: str, summary: str,
                          args: str = "") -> tuple[bool, str, bool]:
         """请求人工批准一个危险操作，阻塞至决议/超时/中断。
 
-        由 dispatch 汇聚点在工具 handler 执行前调用（工具线程）。无回调
-        （cron 等无人值守场景）立即拒绝，不空等超时。
+        由 dispatch 汇聚点在工具 handler 执行前调用（工具线程）。等待骨架
+        在 MidturnHub（与澄清共用）；本方法只保留审批业务：无回调立即拒
+        绝（cron 等无人值守场景，不空等超时）、超时按 timeout_action。
         ``args`` 是原始参数 JSON 串（调用方已截断）——桌面审批卡用它渲染
         待执行的变更预览；CLI/gateway 消费方忽略它。
         Returns (approved, reason, always)——always=True 表示用户选了
         "批准且本会话不再询问"，由调用方写入会话记忆。
         """
-        shared = self._approval_shared
         cfg = (self.config.get("approvals") or {})
         try:
             timeout = float(cfg.get("timeout") or 300)
@@ -415,50 +450,35 @@ class XiheAgent:
             timeout = 300.0
         timeout_allows = str(cfg.get("timeout_action") or "deny").strip().lower() == "allow"
 
-        info = {"id": uuid.uuid4().hex, "tool": tool, "summary": summary, "args": args}
-        pending = {**info, "event": threading.Event(),
-                   "approved": None, "reason": "", "always": False}
-        with shared["lock"]:
-            if shared["pending"] is not None:
-                return False, "已有另一个待审批操作", False
-            shared["pending"] = pending
+        payload = {"tool": tool, "summary": summary, "args": args}
+        q = self._midturn.request(
+            "approval", payload,
+            on_request=self._approval_shared["request_cb"],
+            timeout=timeout)
+        info = {"id": q.id, **payload}
 
-        cb = shared["request_cb"]
-        if cb is None:
-            with shared["lock"]:
-                shared["pending"] = None
+        if q.status == "busy":
+            return False, q.reason, False
+        if q.status == "no_callback":
             reason = "无人值守环境（无审批回调），已拒绝"
             self._notify_approval_result(info, False, reason)
             return False, reason, False
-        try:
-            cb(info)
-        except Exception:
-            logger.warning("approval request callback failed (tool=%s)", tool,
-                           exc_info=True)
-            with shared["lock"]:
-                shared["pending"] = None
+        if q.status == "callback_error":
             reason = "审批通知发送失败，已拒绝"
             self._notify_approval_result(info, False, reason)
             return False, reason, False
 
-        deadline = time.monotonic() + timeout
-        while True:
-            if pending["event"].wait(timeout=0.3):
-                break
-            if self.is_interrupted():
-                pending["approved"], pending["reason"] = False, "被停止指令打断"
-                break
-            if time.monotonic() >= deadline:
-                pending["approved"] = timeout_allows
-                pending["reason"] = ("超时未确认，已按配置放行" if timeout_allows
-                                     else "超时未确认，已自动拒绝")
-                break
+        if q.status == "answered":
+            ans = dict(q.answer or {})  # type: ignore[call-overload]  # answer 由 resolve_approval 构造为 dict
+            approved = bool(ans.get("approved"))
+            always = bool(ans.get("always"))
+            reason = ans.get("note") or ("用户批准" if approved else "用户拒绝")
+        elif q.status == "interrupted":
+            approved, always, reason = False, False, q.reason
+        else:  # timeout
+            approved, always = timeout_allows, False
+            reason = "超时未确认，已按配置放行" if timeout_allows else "超时未确认，已自动拒绝"
 
-        with shared["lock"]:
-            shared["pending"] = None
-        approved = bool(pending["approved"])
-        always = bool(pending.get("always"))
-        reason = pending["reason"] or ("用户批准" if approved else "用户拒绝")
         self._notify_approval_result(info, approved, reason)
         logger.info("approval resolved: tool=%s approved=%s always=%s reason=%s",
                     tool, approved, always, reason)
@@ -471,22 +491,13 @@ class XiheAgent:
         CLI 输入经 try_resolve_steer 调用）。approval_id 为空时匹配当前唯一
         pending；always=True 随"批准"一起传（"本会话不再询问"）。
         Returns True 表示决议已送达。"""
-        shared = self._approval_shared
-        with shared["lock"]:
-            pending = shared["pending"]
-            if pending is None:
-                return False
-            if approval_id and pending["id"] != approval_id:
-                return False
-            if pending["event"].is_set():
-                return False
-            pending["approved"] = bool(approved)
-            pending["reason"] = note or ("用户批准" if approved else "用户拒绝")
-            pending["always"] = bool(always)
-            pending["event"].set()
-            return True
+        return self._midturn.resolve(
+            approval_id,
+            {"approved": bool(approved), "always": bool(always),
+             "note": note or ("用户批准" if approved else "用户拒绝")})
 
-    def _notify_approval_result(self, info: dict, approved: bool, reason: str):
+    def _notify_approval_result(self, info: dict, approved: bool,
+                                reason: str) -> None:
         cb = self._approval_shared["result_cb"]
         if cb is None:
             return
@@ -495,12 +506,70 @@ class XiheAgent:
         except Exception:
             logger.warning("approval result callback failed", exc_info=True)
 
-    def register_subprocess(self, proc) -> None:
+    # ---- clarify（澄清提问）——与审批共用 MidturnHub 骨架，业务是自由文
+    # 本答案。返回 (status, answer_or_reason)：status == "answered" 时第二
+    # 项是用户的回答原文，其余为不可回答的原因。
+
+    @property
+    def pending_clarify(self) -> Optional[dict]:
+        """当前等待用户回答的澄清问题（无则 None），供路由层查询。"""
+        p = self._midturn.pending
+        if p is None or p.get("kind") != "clarify":
+            return None
+        return {"id": p["id"], "question": p.get("question"),
+                "options": p.get("options") or [],
+                "multi_select": bool(p.get("multi_select"))}
+
+    def request_clarification(self, question: str,
+                              options: list | None = None,
+                              multi_select: bool = False) -> tuple[str, str]:
+        cfg = (self.config.get("clarify") or {})
+        try:
+            timeout = float(cfg.get("timeout") or 300)
+        except (TypeError, ValueError):
+            timeout = 300.0
+
+        q = self._midturn.request(
+            "clarify", {"question": question, "options": options or [],
+                        "multi_select": bool(multi_select)},
+            on_request=self._clarify_shared["request_cb"],
+            timeout=timeout)
+
+        if q.status == "answered":
+            self._notify_clarify_result(q.id, "answered", str(q.answer or ""))
+            return "answered", str(q.answer or "")
+        reason = q.reason or q.status
+        self._notify_clarify_result(q.id, q.status, None)
+        return q.status, reason
+
+    def resolve_clarification(self, question_id: str | None = None,
+                              answer: str = "") -> bool:
+        """Deliver the user's answer (serve clarify frame / gateway inbound /
+        CLI input). Empty id matches the single pending."""
+        answer = str(answer).strip()
+        # Plan-mode approval: a structured click on the submit options, while
+        # a plan turn is live — recorded as a flag, never parsed from model
+        # text.
+        if self._plan_mode_live and answer == PLAN_SUBMIT_OPTIONS[0]:
+            self.plan_approved = True
+        return self._midturn.resolve(question_id, answer)
+
+    def _notify_clarify_result(self, qid: str, status: str,
+                               answer: str | None) -> None:
+        cb = self._clarify_shared["result_cb"]
+        if cb is None:
+            return
+        try:
+            cb({"id": qid, "status": status, "answer": answer})
+        except Exception:
+            logger.warning("clarify result callback failed", exc_info=True)
+
+    def register_subprocess(self, proc: Any) -> None:
         """Register a subprocess spawned by a tool so interrupt() can kill it."""
         with self._subprocesses_lock:
             self._subprocesses.add(proc)
 
-    def unregister_subprocess(self, proc) -> None:
+    def unregister_subprocess(self, proc: Any) -> None:
         with self._subprocesses_lock:
             self._subprocesses.discard(proc)
 
@@ -544,7 +613,7 @@ class XiheAgent:
         return self.compressor.should_compress(messages)
 
     @staticmethod
-    def _notify_compressing(stream_delta_callback) -> None:
+    def _notify_compressing(stream_delta_callback: Callable | None) -> None:
         """Compression runs a multi-second aux-LLM summary synchronously inside
         the turn — surface it as a 思考 delta so the client shows why the turn
         went quiet instead of reading as a stall."""
@@ -646,58 +715,71 @@ class XiheAgent:
         return messages
 
     def chat(self, source: SessionSource, user_message: str,
-             max_iterations: int = None,
-             stream_delta_callback: Callable[[str], None] = None,
-             tool_call_callback: Callable[[str, str, float], None] = None,
-             tool_call_start_callback: Callable[[str, str], None] = None,
-             tool_result_callback: Optional[Callable[[str, str, float], None]] = None,
-             approval_request_callback: Optional[Callable[[dict], None]] = None,
-             approval_result_callback: Optional[Callable[[dict, bool, str], None]] = None,
-             approval_key: str = None) -> str:
+             callbacks: TurnCallbacks | None = None,
+             max_iterations: int | None = None,
+             approval_key: str | None = None,
+             plan_mode: bool = False,
+             turn_layer: str | None = None,
+             attachments: list | None = None) -> str:
         """Run a full conversation turn and return the final response.
 
-        Args:
-            source: SessionSource describing where the message comes from.
-                    Used to generate a deterministic session key and route responses.
-            stream_delta_callback: When provided, use streaming API and call
-                this callback with each text delta. Used for progressive output.
-            tool_call_callback: When provided, called as (tool_name, args_summary, elapsed)
-                after each tool call completes. Used for CLI progress display.
-            tool_call_start_callback: When provided, called as (tool_name, args_summary)
-                just before each tool runs — gives immediate feedback during long ops
-                instead of silence until completion.
-            tool_result_callback: When provided, called as (tool_name, raw_result, elapsed)
-                with the raw (pre-persist) result string after each tool completes. The
-                consumer truncates as needed; receives the full output, not the context
-                substitution that oversized results get replaced with.
-            approval_request_callback: When provided, called with {id, tool, summary}
-                when a dangerous operation needs manual approval — the mode's UI
-                sends the prompt to the user. None (cron/headless) = requests are
-                denied immediately instead of waiting out the timeout.
-            approval_result_callback: When provided, called with
-                (info, approved, reason) when the wait ends (reply/timeout/interrupt)
-                so the UI can settle its approval card.
-            approval_key: Overrides the approval-memory bucket for this turn
-                (default: the session key). Callers with a coarser dimension
-                pass their own key — cron jobs cron_job:<任务名>, workspace-
-                bound serve conversations ws:<目录> — so "批准且不再询问"
-                memory is shared at that dimension. History and persistence
-                stay keyed by session; only the approval bucket moves.
+        Thin entry: arms the plan-mode roster swap, then runs _chat_turn (the
+        turn body — context preparation, the tool-call loop, finalize). The
+        turn-scoped prompt layer (plan layer / regenerate hint) is injected at
+        the API boundary, never persisted. ``attachments`` (serve/desktop
+        uploads) is metadata persisted alongside the user row; the model sees
+        the hint block built from it only via API-boundary injection, so the
+        stored user message stays the user's literal input.
         """
+        self._turn_layer = PLAN_MODE_LAYER if plan_mode else turn_layer
+        self.plan_approved = False
+        self._plan_mode_live = plan_mode
+        if plan_mode:
+            saved_toolsets = self.enabled_toolsets
+            self.enabled_toolsets = {"base"}
+        try:
+            return self._chat_turn(
+                source, user_message,
+                callbacks=callbacks or TurnCallbacks(),
+                max_iterations=max_iterations,
+                approval_key=approval_key,
+                attachments=attachments)
+        finally:
+            self._turn_layer = None
+            self._plan_mode_live = False
+            if plan_mode:
+                self.enabled_toolsets = saved_toolsets
+
+    def _chat_turn(self, source: SessionSource, user_message: str,
+                   callbacks: TurnCallbacks,
+                   max_iterations: int | None = None,
+                   approval_key: str | None = None,
+                   attachments: list | None = None) -> str:
+        """The turn body — context preparation, the tool-call loop, finalize.
+
+        Split from chat() so the plan-mode roster swap can wrap it; every
+        return path persists the in-progress messages first (crash/interrupt
+        safety).
+        """
+        cb = callbacks
         # Stash the active callbacks so long-running tools (e.g. external_agent)
         # can stream their progress back to the user mid-turn. Only read inside
         # this loop; overwritten on the next chat() call, so no finally needed.
-        self._active_stream_delta_cb = stream_delta_callback
-        self._active_tool_call_cb = tool_call_callback
-        self._active_tool_call_start_cb = tool_call_start_callback
-        self._active_tool_result_cb = tool_result_callback
+        self._active_stream_delta_cb = cb.stream_delta
+        self._active_tool_call_cb = cb.tool_call
+        self._active_tool_call_start_cb = cb.tool_call_start
+        self._active_tool_result_cb = cb.tool_result
         # 审批回调进 shared dict（子代理与其共享同一引用）。只在传入非 None
         # 时覆盖：delegate/specialist 子代理的 chat() 不带回调，不能把父代理
         # 已注入的回调清掉。
-        if approval_request_callback is not None:
-            self._approval_shared["request_cb"] = approval_request_callback
-        if approval_result_callback is not None:
-            self._approval_shared["result_cb"] = approval_result_callback
+        if cb.approval_request is not None:
+            self._approval_shared["request_cb"] = cb.approval_request
+        if cb.approval_result is not None:
+            self._approval_shared["result_cb"] = cb.approval_result
+        if cb.clarify_request is not None:
+            self._clarify_shared["request_cb"] = cb.clarify_request
+        if cb.clarify_result is not None:
+            self._clarify_shared["result_cb"] = cb.clarify_result
 
         session_id = self.db.get_or_create_session(source)
         session_key = self.db.build_key(source)
@@ -752,11 +834,9 @@ class XiheAgent:
             # freezing the text in the session row was a stronger guarantee
             # than needed and pinned stale prompts.
             system_prompt = self._build_system_prompt(source.platform, session_key)
-        system_msg = {"role": "system", "content": system_prompt}
-        if not messages or messages[0].get("role") != "system":
-            messages.insert(0, system_msg)
-        elif messages[0].get("content") != system_prompt:
-            messages[0]["content"] = system_prompt
+        # system prompt is never persisted (rebuilt per turn) — always insert
+        # at the head of the in-memory list here.
+        messages.insert(0, {"role": "system", "content": system_prompt})
 
         # Recalled memory for this turn, injected into the system message at the
         # API boundary and never persisted — the stored user message must remain
@@ -768,10 +848,11 @@ class XiheAgent:
                 self._turn_memory_inject = tools.memory_tool.build_memory_prompt() or None
             except Exception:
                 logger.debug("memory prompt inject skipped", exc_info=True)
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": user_message,
+                         **({"_attachments": attachments} if attachments else {})})
 
         if self._should_compress(messages):
-            self._notify_compressing(stream_delta_callback)
+            self._notify_compressing(cb.stream_delta)
             messages = self.compressor.compress(messages, session_key=session_key)
             # Reset file dedup cache — original content is lost after compression
             try:
@@ -779,7 +860,9 @@ class XiheAgent:
                 reset_file_dedup()
             except Exception:
                 logger.debug("file dedup reset skipped", exc_info=True)
-            # Rebuild system prompt after compression (memory snapshot may be stale)
+            # Rebuild system prompt after compression (memory snapshot may be stale).
+            # Turn-scoped layers (plan/regenerate) are NOT baked in here —
+            # they re-inject at the API boundary.
             if not self.system_prompt_override:
                 new_prompt = self._build_system_prompt(source.platform, session_key)
                 if messages and messages[0].get("role") == "system":
@@ -801,7 +884,7 @@ class XiheAgent:
         iteration = 0
         empty_retries = 0
         iter_limit = max_iterations if max_iterations is not None else self.max_iterations
-        use_streaming = stream_delta_callback is not None
+        use_streaming = cb.stream_delta is not None
 
         while iteration < iter_limit:
             iteration += 1
@@ -849,11 +932,11 @@ class XiheAgent:
             try:
                 if use_streaming:
                     content, tool_calls, reasoning = self._streaming_call(
-                        effective_model, messages, tool_schemas, stream_delta_callback)
+                        effective_model, messages, tool_schemas, cb.stream_delta)
                 else:
                     content, tool_calls, reasoning = self._non_streaming_call(
                         effective_model, messages, tool_schemas,
-                        stream_delta_callback)
+                        cb.stream_delta)
             except TimeoutError as e:
                 logger.error("API call timed out: %s", e)
                 self._last_exit_reason = "api_timeout"
@@ -891,9 +974,11 @@ class XiheAgent:
             # otherwise "sanitises" the empty string into a
             # "[System: Empty message content sanitised to satisfy protocol]" note
             # that leaks into the chat stream.
+            assistant_msg: dict = {"role": "assistant", "content": None}
             if tool_calls and not content.strip():
-                content = None
-            assistant_msg = {"role": "assistant", "content": content}
+                assistant_msg["content"] = None
+            else:
+                assistant_msg["content"] = content
             if reasoning:
                 assistant_msg["_reasoning"] = reasoning
 
@@ -907,148 +992,16 @@ class XiheAgent:
                 messages.append(assistant_msg)
 
                 # Signal tool boundary for streaming consumers
-                if use_streaming:
+                if use_streaming and cb.stream_delta is not None:
                     try:
-                        stream_delta_callback(None)
+                        cb.stream_delta(None)
                     except Exception:
                         pass
 
-                # Dispatch tool calls — order-preserving segmentation:
-                # consecutive read-only calls coalesce into a parallel group
-                # (reads never conflict with each other); every non-read-only
-                # call runs alone, in model order, so a read AFTER a write
-                # still observes the write's effect. One write in the batch
-                # therefore no longer serializes the batch's independent reads.
-                import time as _time
-                from core.support.tool_result_storage import maybe_persist_tool_result
-
-                groups: list[list[int]] = []   # index groups into tool_calls
-                groups_read: list[bool] = []
-                for i, tc in enumerate(tool_calls):
-                    _is_ro = registry.is_read_only(tc["name"])
-                    if groups and groups_read[-1] and _is_ro:
-                        groups[-1].append(i)
-                    else:
-                        groups.append([i])
-                        groups_read.append(_is_ro)
-
-                for g, idxs in enumerate(groups):
-                    if groups_read[g] and len(idxs) > 1:
-                        from concurrent.futures import ThreadPoolExecutor, as_completed
-                        results_map: dict[int, str] = {}
-
-                        def _run_tool(idx_tc):
-                            idx, tc = idx_tc
-                            t0 = _time.monotonic()
-                            logger.info("Tool call [parallel]: %s(%s)", tc["name"],
-                                        tc["arguments"][:200])
-                            # Bind this agent so the tool's is_interrupted() polls
-                            # THIS agent's flag — per-session, not a global event.
-                            from core.support.interrupt import bind_current_agent, reset_current_agent
-                            _ctx_token = bind_current_agent(self)
-                            try:
-                                result = registry.dispatch(tc["name"], tc["arguments"],
-                                                           context=_tool_context, parent_agent=self)
-                            finally:
-                                reset_current_agent(_ctx_token)
-                            elapsed = round(_time.monotonic() - t0, 3)
-                            raw_result = result if isinstance(result, str) else str(result)
-                            # Layer 2: persist oversized single results
-                            result = maybe_persist_tool_result(
-                                content=result,
-                                tool_name=tc["name"],
-                                tool_use_id=tc["id"],
-                            )
-                            if tool_call_callback:
-                                try:
-                                    tool_call_callback(tc["name"], tc["arguments"], elapsed)
-                                except Exception:
-                                    pass
-                            if tool_result_callback:
-                                try:
-                                    tool_result_callback(tc["name"], raw_result, elapsed)
-                                except Exception:
-                                    pass
-                            logger.info("Tool %s returned (%.3fs): %s", tc["name"], elapsed,
-                                        result[:500] if isinstance(result, str) else str(result)[:500])
-                            return idx, result
-
-                        # Print tool starts up-front (main thread) so the CLI isn't
-                        # silent during the parallel run; completions print as they finish.
-                        if tool_call_start_callback:
-                            for i in idxs:
-                                _tc = tool_calls[i]
-                                try:
-                                    tool_call_start_callback(_tc["name"], _tc["arguments"])
-                                except Exception:
-                                    pass
-
-                        with ThreadPoolExecutor(max_workers=min(len(idxs), 4)) as pool:
-                            futures = {pool.submit(_run_tool, (i, tool_calls[i])): i
-                                       for i in idxs}
-                            # Wait for ALL tools — no aggregate cutoff. Each tool
-                            # governs its own timeout; interrupt (user /stop) makes
-                            # responsive tools return early. A cutoff wouldn't save
-                            # wall-clock anyway (the pool's shutdown(wait=True) blocks
-                            # for stragglers) and would discard real results (e.g. a
-                            # slow search_files) with false "timed out" errors.
-                            for future in as_completed(futures):
-                                try:
-                                    idx, result = future.result()
-                                    results_map[idx] = result
-                                except Exception as exc:
-                                    idx = futures[future]
-                                    logger.error("Parallel tool %d failed: %s", idx, exc)
-                                    tc = tool_calls[idx]
-                                    results_map[idx] = tool_error(f"Tool execution failed: {exc}")
-
-                        for i in idxs:
-                            messages.append({"role": "tool", "content": results_map[i],
-                                             "tool_call_id": tool_calls[i]["id"]})
-                    else:
-                        for i in idxs:
-                            tc = tool_calls[i]
-                            if tool_call_start_callback:
-                                try:
-                                    tool_call_start_callback(tc["name"], tc["arguments"])
-                                except Exception:
-                                    pass
-                            t0 = _time.monotonic()
-                            logger.info("Tool call: %s(%s)", tc["name"],
-                                        tc["arguments"][:200])
-                            # Bind this agent so the tool's is_interrupted() polls
-                            # THIS agent's flag — per-session, not a global event.
-                            from core.support.interrupt import bind_current_agent, reset_current_agent
-                            _ctx_token = bind_current_agent(self)
-                            try:
-                                result = registry.dispatch(tc["name"], tc["arguments"],
-                                                           context=_tool_context, parent_agent=self)
-                            finally:
-                                reset_current_agent(_ctx_token)
-                            elapsed = round(_time.monotonic() - t0, 3)
-                            raw_result = result if isinstance(result, str) else str(result)
-                            # Layer 2: persist oversized single results
-                            result = maybe_persist_tool_result(
-                                content=result,
-                                tool_name=tc["name"],
-                                tool_use_id=tc["id"],
-                            )
-                            logger.info("Tool %s returned (%.3fs): %s", tc["name"], elapsed,
-                                        result[:500] if isinstance(result, str) else str(result)[:500])
-                            if tool_call_callback:
-                                try:
-                                    tool_call_callback(tc["name"], tc["arguments"], elapsed)
-                                except Exception:
-                                    pass
-                            if tool_result_callback:
-                                try:
-                                    tool_result_callback(tc["name"], raw_result, elapsed)
-                                except Exception:
-                                    pass
-                            messages.append({"role": "tool", "content": result,
-                                             "tool_call_id": tc["id"]})
-
-                # Reset read-loop counter when non-read tools are called
+                self._dispatch_tools(
+                    tool_calls, messages, _tool_context,
+                    cb.tool_call, cb.tool_call_start,
+                    cb.tool_result)
                 _read_tools = {"read_file", "search_files"}
                 non_read_called = any(tc["name"] not in _read_tools for tc in tool_calls)
                 if non_read_called:
@@ -1095,7 +1048,7 @@ class XiheAgent:
                 self._persist_messages(session_id, messages)
 
                 if self._should_compress(messages):
-                    self._notify_compressing(stream_delta_callback)
+                    self._notify_compressing(cb.stream_delta)
                     messages = self.compressor.compress(messages, session_key=session_key)
                     turn_base = 0
                     # Strip stale budget warnings from compressed history
@@ -1133,7 +1086,7 @@ class XiheAgent:
                         "tokens=%d)", iteration, iter_limit,
                         self._last_prompt_tokens)
                     messages.append(assistant_msg)
-                    self._notify_compressing(stream_delta_callback)
+                    self._notify_compressing(cb.stream_delta)
                     messages = self.compressor.compress(messages, session_key=session_key)
                     turn_base = 0
                     _strip_budget_warnings(messages)
@@ -1157,8 +1110,160 @@ class XiheAgent:
         return (f"已达到单轮处理上限（本轮共 {iter_limit} 次迭代，任务可能未完成）。"
                 f"中间过程已保存，可让我继续，或换个思路重试。")
 
+    def _dispatch_tools(self, tool_calls: list[dict], messages: list[dict],
+                        tool_context: dict,
+                        tool_call_callback: Callable | None,
+                        tool_call_start_callback: Callable | None,
+                        tool_result_callback: Callable | None) -> None:
+        """Dispatch one batch of tool calls — order-preserving segmentation:
+        consecutive read-only calls coalesce into a parallel group
+        (reads never conflict with each other); every non-read-only call runs
+        alone, in model order, so a read AFTER a write still observes the
+        write's effect. Appends one tool row per call onto messages."""
+
+        # Dispatch tool calls — order-preserving segmentation:
+        # consecutive read-only calls coalesce into a parallel group
+        # (reads never conflict with each other); every non-read-only
+        # call runs alone, in model order, so a read AFTER a write
+        # still observes the write's effect. One write in the batch
+        # therefore no longer serializes the batch's independent reads.
+        import time as _time
+        from core.support.tool_result_storage import maybe_persist_tool_result
+
+        groups: list[list[int]] = []   # index groups into tool_calls
+        groups_read: list[bool] = []
+        for i, tc in enumerate(tool_calls):
+            _is_ro = registry.is_read_only(tc["name"])
+            if groups and groups_read[-1] and _is_ro:
+                groups[-1].append(i)
+            else:
+                groups.append([i])
+                groups_read.append(_is_ro)
+
+        for g, idxs in enumerate(groups):
+            if groups_read[g] and len(idxs) > 1:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                results_map: dict[int, str] = {}
+
+                def _run_tool(idx_tc):
+                    idx, tc = idx_tc
+                    t0 = _time.monotonic()
+                    logger.info("Tool call [parallel]: %s(%s)", tc["name"],
+                                tc["arguments"][:200])
+                    # Bind this agent so the tool's is_interrupted() polls
+                    # THIS agent's flag — per-session, not a global event.
+                    from core.support.interrupt import bind_current_agent, reset_current_agent
+                    _ctx_token = bind_current_agent(self)
+                    try:
+                        result = registry.dispatch(tc["name"], tc["arguments"],
+                                                   context=tool_context, parent_agent=self)
+                    finally:
+                        reset_current_agent(_ctx_token)
+                    elapsed = round(_time.monotonic() - t0, 3)
+                    raw_result = result if isinstance(result, str) else str(result)
+                    # Layer 2: persist oversized single results
+                    result = maybe_persist_tool_result(
+                        content=result,
+                        tool_name=tc["name"],
+                        tool_use_id=tc["id"],
+                    )
+                    if tool_call_callback:
+                        try:
+                            tool_call_callback(tc["name"], tc["arguments"], elapsed)
+                        except Exception:
+                            pass
+                    if tool_result_callback:
+                        try:
+                            tool_result_callback(tc["name"], raw_result, elapsed,
+                                                 tool_call_id=tc["id"])
+                        except Exception:
+                            pass
+                    logger.info("Tool %s returned (%.3fs): %s", tc["name"], elapsed,
+                                result[:500] if isinstance(result, str) else str(result)[:500])
+                    return idx, result
+
+                # Print tool starts up-front (main thread) so the CLI isn't
+                # silent during the parallel run; completions print as they finish.
+                if tool_call_start_callback:
+                    for i in idxs:
+                        _tc = tool_calls[i]
+                        try:
+                            tool_call_start_callback(_tc["name"], _tc["arguments"],
+                                                     tool_call_id=_tc["id"])
+                        except Exception:
+                            pass
+
+                with ThreadPoolExecutor(max_workers=min(len(idxs), 4)) as pool:
+                    futures = {pool.submit(_run_tool, (i, tool_calls[i])): i
+                               for i in idxs}
+                    # Wait for ALL tools — no aggregate cutoff. Each tool
+                    # governs its own timeout; interrupt (user /stop) makes
+                    # responsive tools return early. A cutoff wouldn't save
+                    # wall-clock anyway (the pool's shutdown(wait=True) blocks
+                    # for stragglers) and would discard real results (e.g. a
+                    # slow search_files) with false "timed out" errors.
+                    for future in as_completed(futures):
+                        try:
+                            idx, result = future.result()
+                            results_map[idx] = result
+                        except Exception as exc:
+                            idx = futures[future]
+                            logger.error("Parallel tool %d failed: %s", idx, exc)
+                            tc = tool_calls[idx]
+                            results_map[idx] = tool_error(f"Tool execution failed: {exc}")
+
+                for i in idxs:
+                    messages.append({"role": "tool", "content": results_map[i],
+                                     "tool_call_id": tool_calls[i]["id"]})
+            else:
+                for i in idxs:
+                    tc = tool_calls[i]
+                    if tool_call_start_callback:
+                        try:
+                            tool_call_start_callback(tc["name"], tc["arguments"],
+                                                     tool_call_id=tc["id"])
+                        except Exception:
+                            pass
+                    t0 = _time.monotonic()
+                    logger.info("Tool call: %s(%s)", tc["name"],
+                                tc["arguments"][:200])
+                    # Bind this agent so the tool's is_interrupted() polls
+                    # THIS agent's flag — per-session, not a global event.
+                    from core.support.interrupt import bind_current_agent, reset_current_agent
+                    _ctx_token = bind_current_agent(self)
+                    try:
+                        result = registry.dispatch(tc["name"], tc["arguments"],
+                                                   context=tool_context, parent_agent=self)
+                    finally:
+                        reset_current_agent(_ctx_token)
+                    elapsed = round(_time.monotonic() - t0, 3)
+                    raw_result = result if isinstance(result, str) else str(result)
+                    # Layer 2: persist oversized single results
+                    result = maybe_persist_tool_result(
+                        content=result,
+                        tool_name=tc["name"],
+                        tool_use_id=tc["id"],
+                    )
+                    logger.info("Tool %s returned (%.3fs): %s", tc["name"], elapsed,
+                                result[:500] if isinstance(result, str) else str(result)[:500])
+                    if tool_call_callback:
+                        try:
+                            tool_call_callback(tc["name"], tc["arguments"], elapsed)
+                        except Exception:
+                            pass
+                    if tool_result_callback:
+                        try:
+                            tool_result_callback(tc["name"], raw_result, elapsed,
+                                                 tool_call_id=tc["id"])
+                        except Exception:
+                            pass
+                    messages.append({"role": "tool", "content": result,
+                                     "tool_call_id": tc["id"]})
+
+        # Reset read-loop counter when non-read tools are called
+
     @staticmethod
-    def _is_retryable_error(e) -> bool:
+    def _is_retryable_error(e: BaseException) -> bool:
         """Check if an API error is worth retrying."""
         status = getattr(e, 'status_code', None)
         if status in (429, 500, 502, 503, 504):
@@ -1200,20 +1305,22 @@ class XiheAgent:
                                attempt + 1, max_retries + 1, e, delay)
                 time.sleep(delay)
 
-    def _non_streaming_call(self, model, messages, tool_schemas,
-                            stream_delta_callback=None) -> tuple[str, list[dict], str]:
+    def _non_streaming_call(self, model: str, messages: list[dict],
+                            tool_schemas: list[dict] | None,
+                            stream_delta_callback: Callable | None = None
+                            ) -> tuple[str, list[dict], str]:
         """Standard non-streaming API call. Returns (content, tool_calls, reasoning)."""
         api_messages = self._prepare_api_messages(messages)
-        def _call():
-            kwargs = dict(model=model,
-                          messages=api_messages,
-                          max_tokens=self.max_completion_tokens)
+        def _call() -> object:
+            kwargs: dict = dict(model=model,
+                                messages=api_messages,
+                                max_tokens=self.max_completion_tokens)
             if tool_schemas:
                 kwargs["tools"] = [{"type": "function", "function": s["function"]}
                                    for s in tool_schemas]
             if self.request_extra:
                 kwargs["extra_body"] = self.request_extra
-            return self.client.chat.completions.create(**kwargs)
+            return self.llm_client.chat.completions.create(**kwargs)
         response = self._call_with_retry(_call)
         choice = response.choices[0]
         content = choice.message.content or ""
@@ -1245,33 +1352,74 @@ class XiheAgent:
         self._record_usage(response)
         return content, tool_calls, reasoning or ""
 
+    @staticmethod
+    def _attachment_hint(atts: list) -> str:
+        """附件提示块 —— 模型面向的注入文本（路径/大小/图片描述）。用哪个读
+        取/图片工具是 agent 自己的路由决策，只陈述事实，不点名工具。"""
+        from pathlib import Path as _P
+        parts = []
+        for a in atts:
+            if not isinstance(a, dict) or not a.get("path"):
+                continue
+            p = str(a.get("path"))
+            name = str(a.get("name") or _P(p).name)
+            size = a.get("size")
+            desc = a.get("desc")
+            if _P(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp") \
+                    and desc:
+                parts.append(f"[用户发送了图片 {name}: {desc}]")
+            else:
+                mb = f"，{size / (1 << 20):.1f}MB" if size else ""
+                parts.append(
+                    f"[用户发送了文件 {name}{mb}，服务器路径: {p}。"
+                    f"需要内容时用你可用的工具读取]")
+        return "\n".join(parts)
+
     def _prepare_api_messages(self, messages: list[dict]) -> list[dict]:
         """Return an API-only copy of ``messages`` with ephemeral injections that
         never reach session history: memory-context appended to the system
-        message, a prefill assistant message, and underscore-prefixed internal
-        keys (e.g. ``_reasoning``) stripped."""
+        message, a prefill assistant message, underscore-prefixed internal
+        keys (e.g. ``_reasoning``) stripped, and the attachment hint block
+        folded into its user message (``_attachments`` rides the history
+        unpersisted; the stored user row stays the literal input)."""
         # Copy-elision: skip the per-message rebuild when no internal keys are
         # present (the common history shape) — the list and its dicts are only
         # read by the SDK from here on.
+        _src = messages
         if any(k.startswith("_") for m in messages for k in m):
+            # The rebuild is index-aligned (neither adds nor drops entries), so
+            # each stripped message reads its metadata from its source twin.
             messages = [{k: v for k, v in m.items() if not k.startswith("_")}
                         for m in messages]
+            for m, src_m in zip(messages, _src):
+                if m.get("role") != "user":
+                    continue
+                atts = src_m.get("_attachments")
+                if atts:
+                    hint = self._attachment_hint(atts)
+                    if hint:
+                        m["content"] = f"{hint}\n{m['content']}" if m.get("content") else hint
 
-        memory_block = getattr(self, "_turn_memory_inject", None)
-        if memory_block and messages and messages[0].get("role") == "system":
+        memory_block = self._turn_memory_inject
+        # The turn-scoped layer rides the SAME boundary injection as memory:
+        # it must never touch messages[0] — that dict gets persisted, and a
+        # turn-scoped hint leaking into history lets later turns read it as
+        # standing instruction.
+        turn_layer = self._turn_layer
+        if (memory_block or turn_layer) and messages and messages[0].get("role") == "system":
             messages = list(messages)
             sys0 = messages[0]
-            messages[0] = {
-                **sys0,
-                "content": (
-                    f"{sys0.get('content', '')}\n\n"
-                    f"<memory-context>\n"
-                    f"[System note: The following is recalled memory context, "
-                    f"NOT new user input. Treat as informational background data.]\n\n"
+            injected = f"{turn_layer}\n\n{sys0.get('content', '')}" if turn_layer \
+                else sys0.get("content", "")
+            if memory_block:
+                injected += (
+                    "\n\n<memory-context>\n"
+                    "[System note: The following is recalled memory context, "
+                    "NOT new user input. Treat as informational background data.]\n\n"
                     f"{memory_block}\n"
-                    f"</memory-context>"
-                ),
-            }
+                    "</memory-context>"
+                )
+            messages[0] = {**sys0, "content": injected}
 
         prefill_cfg = self.config.get("prefill", {})
         if not prefill_cfg:
@@ -1289,30 +1437,32 @@ class XiheAgent:
         result.append({"role": "assistant", "content": text})
         return result
 
-    def _streaming_call(self, model, messages, tool_schemas,
-                        stream_delta_callback) -> tuple[str, list[dict], str]:
+    def _streaming_call(self, model: str, messages: list[dict],
+                        tool_schemas: list[dict] | None,
+                        stream_delta_callback: Callable | None
+                        ) -> tuple[str, list[dict], str]:
         """Streaming API call. Returns (content, tool_calls, reasoning)."""
         api_messages = self._prepare_api_messages(messages)
-        def _call():
-            kwargs = dict(model=model,
-                          messages=api_messages,
-                          max_tokens=self.max_completion_tokens,
-                          stream=True,
-                          stream_options={"include_usage": True})
+        def _call() -> object:
+            kwargs: dict = dict(model=model,
+                                messages=api_messages,
+                                max_tokens=self.max_completion_tokens,
+                                stream=True,
+                                stream_options={"include_usage": True})
             if tool_schemas:
                 kwargs["tools"] = [{"type": "function", "function": s["function"]}
                                    for s in tool_schemas]
             if self.request_extra:
                 kwargs["extra_body"] = self.request_extra
-            return self.client.chat.completions.create(**kwargs)
+            return self.llm_client.chat.completions.create(**kwargs)
 
         stream = self._call_with_retry(_call)
 
-        content_parts = []
-        reasoning_parts = []
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         # arguments accumulate as chunk lists (joined once below) — string +=
         # over hundreds of argument deltas is quadratic
-        tool_calls_acc = {}  # index -> {id, name, arguments: list[str]}
+        tool_calls_acc: dict = {}  # index -> {id, name, arguments: list[str]}
 
         for chunk in stream:
             # Honor a mid-generation interrupt: stop consuming the stream and
@@ -1338,7 +1488,7 @@ class XiheAgent:
             delta = chunk.choices[0].delta
 
             reasoning_delta = getattr(delta, "reasoning_content", None)
-            if reasoning_delta:
+            if reasoning_delta and stream_delta_callback is not None:
                 reasoning_parts.append(reasoning_delta)
                 try:
                     stream_delta_callback(reasoning_delta, kind="reasoning")
@@ -1355,7 +1505,7 @@ class XiheAgent:
                 dc = delta.content
                 if dc.strip().startswith("[System:") and dc.strip().endswith("]"):
                     dc = ""
-                if dc:
+                if dc and stream_delta_callback is not None:
                     content_parts.append(dc)
                     try:
                         stream_delta_callback(dc, kind="content")
@@ -1386,7 +1536,7 @@ class XiheAgent:
         content = "".join(content_parts)
         if content and content.strip().startswith("[System:") and content.strip().endswith("]"):
             content = ""
-        tool_calls = []
+        tool_calls: list[dict] = []
         for idx in sorted(tool_calls_acc.keys()):
             acc = tool_calls_acc[idx]
             tool_calls.append({
@@ -1397,13 +1547,13 @@ class XiheAgent:
 
         return content, tool_calls, "".join(reasoning_parts)
 
-    def _record_usage(self, response):
+    def _record_usage(self, response: object) -> None:
         """Extract and accumulate token usage from an API response."""
         usage = getattr(response, 'usage', None)
         if usage:
             self._record_usage_obj(usage)
 
-    def _record_usage_obj(self, usage):
+    def _record_usage_obj(self, usage: object) -> None:
         """Accumulate a usage object into per-turn totals."""
         try:
             p = getattr(usage, 'prompt_tokens', 0) or 0
@@ -1417,7 +1567,7 @@ class XiheAgent:
             pass
 
     def _log_turn_usage(self, model: str, session_key: str = "",
-                        session_id: str = None):
+                        session_id: str | None = None) -> None:
         """Log per-turn token summary, persist it onto the turn's final
         assistant row, and update daily aggregation."""
         u = self._turn_usage
@@ -1460,5 +1610,5 @@ class XiheAgent:
         except Exception as e:
             logger.warning("Failed to update daily usage: %s", e)
 
-    def _persist_messages(self, session_id: str, messages: list[dict]):
+    def _persist_messages(self, session_id: str, messages: list[dict]) -> None:
         self.db.rewrite_messages(session_id, messages)

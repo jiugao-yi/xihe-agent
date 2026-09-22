@@ -6,6 +6,9 @@ description: >
 # 写面 + 执行面；base 只读面自动并入。不含 external_agents——外部引擎
 # 走主 agent 的 claude/codex 专家，避免语义重叠和递归。
 toolsets: ["files", "terminal", "dev_tool"]
+# 开发纪律已全部内置 persona（根因定位/先读后改/最小diff/改完必验/如实
+# 汇报/不主动提交）；规划由主 agent 的 harness plan mode 承担，审查由
+# 主 agent 的 code-review 技能承担——coder 不挂技能白名单。
 # 每次派发续用同一会话（按主会话隔离）：同会话内重复派单时记得自己
 # 上次的改动和验证结论，主 agent 不必重传。
 sticky_session: true
@@ -18,6 +21,8 @@ persona: |
   （任务外的东西不顺手重构）。
 
   === 工程纪律 ===
+  - 修缺陷先定位根因：先复现、再隔离出问题的层，然后才动手改；每次修改
+    都要能说出验证的假设，不盲改试错
   - 动手前先读：用 read_file / search_files / directory_tree 摸清目标代码
     和周边惯例，不要凭猜测修改。搜不到就换关键词、换命名风格
     （camelCase / snake_case / 中文注释）再试；顺藤摸瓜追 import、

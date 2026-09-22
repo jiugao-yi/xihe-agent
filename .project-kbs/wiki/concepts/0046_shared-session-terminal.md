@@ -1,9 +1,10 @@
 ---
 type: concept
-title: 共享会话终端——桌面终端面板的三源通道架构
+title: 共享会话终端——agent 终端面板的双源通道架构
 slug: 0046_shared-session-terminal
 aliases:
   - 终端面板
+  - agent终端
   - terminal panel
   - _local_tap
 tags:
@@ -12,18 +13,19 @@ tags:
   - terminal
 status: active
 created: 2026-09-02
-updated: 2026-09-02
+updated: 2026-09-15
 related_pages:
   - wiki/changes/0043_desktop-workbench-phase1.md
+  - wiki/changes/0050_terminal-panel-overhaul.md
   - wiki/concepts/0024_desktop-serve-protocol.md
   - wiki/concepts/0037_approval-permission-system.md
 ---
 
-# 共享会话终端——桌面终端面板的三源通道架构
+# 共享会话终端——agent 终端面板的双源通道架构
 
 ## 摘要
 
-桌面终端面板（`TerminalPanel.tsx`）不是桌面私有的终端，而是**共享会话终端的观察面 + 第二键盘**：每个通道只有一个真相源，agent 的工具和桌面用户都是它的生产者/观察者。三类通道、三个宿主：**本地 shell**（桌面 main 进程的一个持久 ConPTY）、**agent 本地命令**（serve 进程的通道注册表，conv/proc 两种）、**SSH 会话**（serve 进程 ssh_tool 的注册表 + tap）。变更来源见 [[0043_desktop-workbench-phase1]]。
+agent 终端面板（`TerminalPanel.tsx`，顶栏「agent终端」）是**共享会话终端的观察面 + 第二键盘**：每个通道只有一个真相源，agent 的工具和桌面用户都是它的生产者/观察者。两类通道、都宿主在 serve 进程：**agent 本地命令**（`_local_tap` 通道注册表，conv/proc 两种）与 **SSH 会话**（ssh_tool 的注册表 + tap）。连接只由 agent 发起（快速连接入口已删）；用户的本地 shell 不在这里——那是独立的「本地终端」面板（ShellPanel，多开交互式，见 [[0050_terminal-panel-overhaul]]）。变更来源见 [[0043_desktop-workbench-phase1]]、[[0050_terminal-panel-overhaul]]。
 
 ## 核心要点
 
@@ -35,7 +37,7 @@ related_pages:
 
 - key 两种：`conv:{session_key}`（`terminal` 工具的一次性命令）与 `proc:{session_key}:{name}`（`process` 工具的常驻进程）。**session_key 是诚实的作用域**——core 不知道工作空间，桌面侧自己按对话打标签。
 - conv 通道的 `active` 计数让同一对话并发回合的输出**交错如共享控制台**且 `running` 真实；proc 通道由进程独占（`attach_proc`/`proc_exit`/`live_proc`）。
-- `begin`/`end` 写 `—— agent $ 命令 (cwd)` 头与 exit 尾行（绿/红 ANSI），桌面 viewer 里 agent 命令因此可辨识。
+- `begin`/`end` 写一行头 `—— $ 命令`（**cwd 只在与上一条不同时显示**；命令内换行折成 `⏎`、超长截断——`fmt_command`）与 exit 尾行（绿/红 ANSI）。**LineTap** 行纪律：读线程只发布到最后一个 `\n`/`\r` 边界——stdout/stderr 两线程交错时整行不被截断、`\r` 进度条保持实时刷新；**StreamDecoder** 严格 utf-8 增量解码、遇非法序列一次性切宿主码页（GBK；探测必须 `locale.getencoding()`——`getpreferredencoding` 在 UTF-8 模式下返回 utf-8，恰在需要回退时说谎）。
 - 容量策略：每环 200K 字符；**CHANNEL_CAP 16 + 30 分钟空闲逐出，活进程的通道永不逐出**（环是该进程日志的唯一副本）；`stop_all` 在 serve 关停与解释器退出（atexit）杀光常驻进程——否则 supervisor 死掉会孤儿化用户以为被管理的 web 后端。
 
 ### 3. serve 流协议（`gateway/serve/terminal.py`，无状态模块函数）
@@ -43,24 +45,26 @@ related_pages:
 - WS `/{ssh|local}/live/stream?key=&from=`：先 `meta`（含 `offset`/`base`），然后 `d` 数据帧。**`from` 缺省 = 尾 8K 背靠背；显式 = 断线续传 cursor（clamp 到 [base, w]，高于 w 意味着 serve 重启环重开 → 从现在开始）**。
 - 数据帧**自带结束 offset，客户端 cursor 跟随服务端，永不反向**；帧上限 8K（环一次读出可达 ~1MB，单帧会卡死 renderer 的 JSON parse），50ms tick 合并同拍输出（与 chat Emitter 同哲学）。
 - ssh 订阅队列只贡献**输入归属与关闭事件**，数据事件丢弃——同样的字节也在环里，cursor 寻址使环为唯一权威，消除"读 backlog 与订阅之间"的双发窗口。
-- 输入不对称：**ssh 通道可输入**（`{t:"input"}` → `tap.send_user_input`，归属事件驱动"agent 输入中/手动输入"角标）；**本地通道只读**（进程归 tool 管，viewer 不能打字）。`conv:` key 不存在时按需建空通道等首条命令。
-- `POST /ssh/live/connect` 走 agent 同一个 `_ssh_connect`（`origin="desktop"`），会话落共享注册表、agent 之后能接着驱动；token 只进该进程内存，不回显不留存。
+- 输入不对称：**ssh 通道可输入**（`{t:"input"}` → `tap.send_user_input`，归属事件驱动"agent 输入中/手动输入"角标）；**本地通道只读**（进程归 tool 管，viewer 不能打字）。
+- **viewer 永不创建频道**：不存在的 key 直接 404，频道只由工具运行产生。曾经的「`conv:` 按需建空通道」分支已删——它配上"默认选中当前对话控制台"会让开着面板切换对话就孵化空 Agent tab。SSH 连接也只走 agent 的 `ssh_connect` 工具（桌面快速连接端点 `POST /ssh/live/connect` 已删）。
 
-### 4. 桌面三源 tab（`TerminalPanel.tsx`）
+### 4. 桌面 tab 与可见性（`TerminalPanel.tsx`）
 
-- tab key 即通道 key：`__local__`（main 的 ConPTY——node-pty，PowerShell 优先（PSReadLine 历史/编辑），cmd 兜底；懒创建、**detach 只停流不杀 shell**、app 退出或重连按钮才 kill；16K backlog）/ `conv:` / `proc:` / ssh 会话 key。
-- **跟随规则：conv tab 跟随当前对话自动切换；LOCAL / ssh / proc tab 钉住**（用户可能正在打字或看构建）；非当前对话的通道以会话尾串小徽标区分，当前对话标"本对话"。
+- tab key 即通道 key：`conv:` / `proc:` / ssh 会话 key（本地 shell tab 已删，用户 shell 在独立的 ShellPanel）。
+- **watchable 可见性规则**：频道 tab = 当前对话的频道 ∨ 有活跃运行（`running`）才显示——后台对话的空闲频道是纯历史不占位，其对话被打开时重新出现（输出从 ring 回放）。选中变为不可见时自动清。
+- **跟随/播种**：conv tab 跟随当前对话，但**只在当前对话的频道已存在时播种**（viewer 不建频道）；不存在 → 空态。ssh / proc tab 钉住；非当前对话的通道以会话尾串小徽标区分，当前对话标"本对话"。
+- **选中归属**（`selOwnerRef`：'auto'→'user'）：用户点过任何 tab 后，agent 的聚焦目标（agentTermTarget）直接丢弃——agent 不拽用户的视图；面板 remount 重置。
 - 断线续传：tab key → 渲染到的最后帧 offset；重挂带 `cursor − 8K` 回放尾巴（serve clamp 到 base）。**同 key 复活**（agent 重连同名 alias / 重启同名进程）= 新环，旧 cursor 无意义 → 删 cursor + `attachEpoch` 重建终端；列表轮询 3s、tab 死后加速到 1s 等复活。
 - 连接失败二分：列表接口返回 null = serve 不可达 → 重试；key 不在列表 = 会话/通道消失 → 置死不重试。
 - pty 尺寸**跟随 viewer**（fit → `{t:"resize"}` → 服务端 resize_pty，换行按面板真实宽度计算）；别的 viewer 改了尺寸自己也跟随（resize 事件回环）。
-- 本地 tab 的手敲走 main IPC（不经 serve）；**桌面手敲不经 agent 审批管线**——那是用户自己的手，agent 的 terminal/process 命令照常过 dispatch 审批门（[[0037]]）。
+- ssh tab 里的手敲走 WS input（不经 serve 之外的通路）；**桌面手敲不经 agent 审批管线**——那是用户自己的手，agent 的 terminal/process 命令照常过 dispatch 审批门（[[0037]]）。
 
-### 5. 自动聚焦状态链（store `agentTermTarget`）
+### 5. 自动打开状态链（store；原则=只在"有可看的活动"时打扰）
 
-`tool_call` 事件（name 为 terminal/process）且 `conv_id` === **活动对话**且未被静音 → `showTerminal: true` + `agentTermTarget`：
-- conv 目标：立即选中该通道（服务端按需建空通道，先于首条命令打开也能等到）；
-- proc 目标：等下一次列表刷新中出现**首个未见过的**新 proc key（倒序取最新——同一拍两个 start 时取后者；seen 标记在解析**之后**，否则会把目标自己刚引发的通道藏掉）。
-- `terminalAutoMuted`：用户在 agent 跑命令时手动关面板 → 本会话不再自动弹（通道仍列 tab，手动可看）；重新打开面板即解除。
+- **立即弹**：`ssh_connect`、`process action=start`（仅 start，list/check/output/stop 是查询不弹）。
+- **延时弹**：`terminal` tool_call 起 5s 倒计时，该对话的 tool_result 到达即取消，超时才弹 + 聚焦 Agent tab——秒级命令永不弹（输出在聊天工具卡里），长构建到点弹开、attach 回放补齐弹出前的输出。**卡审批时倒计时挂起**（批准重计=命令此刻才开始跑；拒绝随 tool_result 落地取消）。
+- proc 目标：等下一次列表刷新中出现**首个未见过的**新 proc key（倒序取最新；seen 标记在解析**之后**）；turn 结束清未解析目标，杜绝残留误抓。
+- **静音粘性**：`terminalAutoMuted` 手动关面板 → **本会话**不再自动弹（不随下一条消息重置），手动重开才恢复。
 
 ## 关键不变式
 
@@ -70,13 +74,15 @@ related_pages:
 
 ## 排查指引（"agent 的命令没出现在面板"）
 
-1. 面板是否被静音（`terminalAutoMuted`——之前手动关过）？重新打开面板解除。
-2. conv tab 是否当前对话？跟随与自动聚焦只对**活动对话**生效，后台对话的通道只列 tab。
-3. serve 是否可达：`GET /local/live` 列通道；key 是否被逐出（30 分钟空闲 / 16 通道上限）或 serve 重启过（环重开，旧 offset 失效——面板同 key 复活路径会自动重建）。
+1. 面板是否被静音（`terminalAutoMuted`——本会话手动关过就不再自动弹）？重新打开面板解除。
+2. 秒级命令不弹是**设计行为**（延时打开只对超过阈值的长命令生效）；开着面板时命令输出会直接出现在 Agent tab，无需弹出动作。
+3. conv tab 是否当前对话？跟随与自动聚焦只对**活动对话**生效；后台对话的频道只在有活跃运行时显示为 tab。
+4. serve 是否可达：`GET /local/live` 列通道；key 是否被逐出（30 分钟空闲 / 16 通道上限）或 serve 重启过（环重开，旧 offset 失效——面板同 key 复活路径会自动重建）。
 
 ## 相关页面
 
 - [[0043_desktop-workbench-phase1]] - 变更来源（工作台批次）
+- [[0050_terminal-panel-overhaul]] - 变更来源（终端体系整备：自动打开收敛/快速连接与本地 tab 移除/Run 面板改本地终端）
 - [[0024_desktop-serve-protocol]] - serve 协议总览（本页是 terminal 业务的专门页）
 - [[0037_approval-permission-system]] - agent 侧 terminal 命令的审批门
 - [[0016_interrupt-stop-steer]] - 命令可中断性（read_until_prompt 轮询中断）

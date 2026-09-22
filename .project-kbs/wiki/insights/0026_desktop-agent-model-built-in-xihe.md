@@ -14,7 +14,7 @@ tags:
   - decision
 status: active
 created: 2026-08-11
-updated: 2026-08-11
+updated: 2026-09-14
 confidence: high
 derived_from:
   - wiki/concepts/0025_desktop-control-plane.md
@@ -28,6 +28,8 @@ related_pages:
 ---
 
 # 桌面端 Agent 模型定调——内置 xihe + 可添加 claude（非多实例 / 非 persona）
+
+> **演进记录（2026-09-14）**：本文核心结论（xihe 内置、main 托管 serve、非多实例 / 非 persona）不变并已彻底落地；「claude = 可添加 connector」一支已进一步收敛——claude/codex **不再作为桌面并列引擎**（其间曾以 ClaudeRunner 双引擎实现过，见已过时的 [[0028]]/[[0029]]，后删除），改经 **xihe 内核的 `external_agent` 工具**（[[0040_external-agent-adapter-protocol]]）访问。桌面 store 多 agent 骨架（`agents[]`/`selectedAgentId`）已清除，见 [[0047_desktop-single-agent-collapse]]。
 
 ## 摘要
 
@@ -57,10 +59,10 @@ related_pages:
 
 桌面 **main 进程完全拥有 `xihe serve` 的生命周期**，而不是把 serve 当成一个用户需要自己启动的外部后端：
 
-- spawn `xihe serve` 子进程；健康检查（`/health`）；崩溃重启；应用退出时清理子进程。
+- spawn `xihe serve` 子进程；健康检查（`/health`）；崩溃重启（**always-fresh 策略**：探到端口被占先杀再拉新，保证代码改动必然生效——订正 2026-09-14，非普通 spawn/restart）；应用退出时清理子进程。
 - **renderer↔serve 通道不变**：渲染层仍直连 `127.0.0.1:7788`（[[0024_desktop-serve-protocol]] 的 REST/WS 契约不动）。
 - main→renderer 通过 IPC（如 `xihe:status`）汇报 serve 健康，渲染层据此切 demo↔live。
-- **凭据归属不变**：xihe 读自己的 `~/.xihe-agent/.env`；桌面 main 永不触碰、永不代理 `api_key`/`base_url`（与 [[0025]] 「对话真理归属分形态」一致）。
+- ~~**凭据归属不变**~~（订正 2026-09-14：本文写作时 xihe 还读 `~/.xihe-agent/.env`——单源化后改为唯一 `config.yaml`；且桌面 main 现在**直接行级补丁读写该 config.yaml**（设置页，api_key 只写不读）。「永不触碰凭据」的旧前提已不成立，但「凭据真理在 xihe 侧单文件」仍然成立）。
 
 ### Workspace：项目文件夹 / 用户资产（与 agent 正交）
 

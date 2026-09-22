@@ -19,6 +19,7 @@ Usage in tools:
 
 import contextvars
 import logging
+from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 _current_agent = contextvars.ContextVar("xihe_current_agent", default=None)
 
 
-def bind_current_agent(agent):
+def bind_current_agent(agent: Any) -> contextvars.Token:
     """Bind `agent` as the current agent on this thread/context.
 
     Returns a token to pass to reset_current_agent(). The agent loop calls
@@ -38,7 +39,7 @@ def bind_current_agent(agent):
     return _current_agent.set(agent)
 
 
-def reset_current_agent(token):
+def reset_current_agent(token: contextvars.Token) -> None:
     """Restore the previous binding (pass the token from bind_current_agent)."""
     _current_agent.reset(token)
 
@@ -57,7 +58,7 @@ def is_interrupted() -> bool:
         return False
 
 
-def interruptible_iter(iterable, every=32):
+def interruptible_iter(iterable: Iterable, every: int = 32) -> Iterable:
     """Iterate `iterable`, checking for an interrupt every `every` items.
 
     Stops yielding as soon as an interrupt is detected, so the caller's `for`
@@ -83,7 +84,7 @@ def interruptible_iter(iterable, every=32):
         yield item
 
 
-def register_subprocess(proc) -> None:
+def register_subprocess(proc: Any) -> None:
     """Register a subprocess with the currently-running agent so its
     interrupt() can kill it (prompt /stop for subprocess tools). No-op when no
     agent is bound. The tool MUST call unregister_subprocess(proc) when done.
@@ -108,7 +109,7 @@ def register_subprocess(proc) -> None:
                        getattr(proc, "pid", proc), exc_info=True)
 
 
-def unregister_subprocess(proc) -> None:
+def unregister_subprocess(proc: Any) -> None:
     agent = _current_agent.get()
     if agent is not None:
         try:
@@ -118,8 +119,10 @@ def unregister_subprocess(proc) -> None:
                            getattr(proc, "pid", proc), exc_info=True)
 
 
-def run_interruptible(*popenargs, timeout=None, capture_output=False,
-                      text=None, **kwargs):
+def run_interruptible(*popenargs: Any, timeout: Optional[float] = None,
+                      capture_output: bool = False,
+                      text: Optional[bool] = None,
+                      **kwargs: Any) -> "object":
     """subprocess.run drop-in that registers the child with the current agent
     so /stop can kill it mid-run.
 

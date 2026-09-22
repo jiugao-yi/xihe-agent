@@ -16,7 +16,7 @@ tags:
   - websocket
 status: active
 created: 2026-08-10
-updated: 2026-09-01
+updated: 2026-09-20
 related_pages:
   - wiki/concepts/0011_gateway-architecture.md
   - wiki/concepts/0006_session-design.md
@@ -40,10 +40,10 @@ related_pages:
 | 模式 | agent 生命周期 | 入口 | 前端 | 事件循环阻塞？ |
 |------|----------------|------|------|----------------|
 | `chat` | 一个长生命周期 `XiheAgent` | `cli/chat.py` | 终端 REPL | — |
-| `gateway` | 每条消息新建薄 agent | `gateway/bot.py` | 平台 adapter（WeCom/Feishu） | **是**（`thread.join`，见 [[0011_gateway-architecture]]） |
-| **`serve`** | **每轮对话新建薄 agent** | `gateway/serve.py` | 任意 HTTP/WS 客户端（桌面/脚本/web） | **否**（`run_in_executor`） |
+| `gateway` | 每条消息新建薄 agent | `gateway/bot.py` | 平台 adapter（WeCom/Feishu） | **否**（`asyncio.to_thread` join，2026-08 起，见 [[0011_gateway-architecture]]） |
+| **`serve`** | **每轮对话新建薄 agent** | `gateway/serve/`（server.py 组装） | 任意 HTTP/WS 客户端（桌面/脚本/web） | **否**（`run_in_executor`） |
 
-serve 本质上是「把 gateway 模式跑在一个中立协议上」，把平台 adapter 换成了 aiohttp。`SharedContext`（`app/main.py`）跨轮复用重对象；`SharedContext.create_agent()` 每轮调一次——**薄壳**，持有 config + 三个共享引用，构造廉价（同 [[0011_gateway-architecture]] 的前提）。toolset 解析也照搬 gateway：`DEFAULT_TOOLSETS` + `mcp`（有 `mcp_*` 工具时）+ `kbs`（`kbs.enabled` 时）。
+serve 本质上是「把 gateway 模式跑在一个中立协议上」，把平台 adapter 换成了 aiohttp。`SharedContext`（`core/context.py`，`bootstrap_process` 做进程编排）跨轮复用重对象；`SharedContext.create_agent(main_toolsets, main_skills, cwd)` 每轮调一次——**薄壳**，构造廉价（同 [[0011_gateway-architecture]] 的前提）；名单来自 config 顶层键（见 [[0034_three-layer-agent-roster]]），无 DEFAULT_TOOLSETS。
 
 入口注册：`app/main.py:cmd_serve` → `load_config(args.config)` → `setup_logging(INFO, also_file=True)`（serve 起初漏了 logging，回调日志被吞，已修）→ `run_serve(config, host=args.host, port=args.port, version=VERSION)`。CLI 子命令：`xihe serve [--host 127.0.0.1] [--port 7788] [--config X]`。端口/主机**不在 config.yaml 里**，是 CLI flag（默认 7788 / 127.0.0.1）；桌面端硬编码 7788（`setServeBase` 可覆盖）。
 
@@ -52,36 +52,47 @@ serve 本质上是「把 gateway 模式跑在一个中立协议上」，把平�
 | 方法·路径 | 响应 |
 |-----------|------|
 | `GET /health` | `{ok, version, mode:"serve", model, capabilities:[...]}` |
-| `GET /agents` | `{agents:[{id:"self", name, engine:"xihe", shape:"process", model, status:"online", capabilities, dataRoot:AGENT_HOME, description}]}` —— P0 自描述单 agent，persona 多 agent 留待 [[0025_desktop-control-plane]] 的 P1 |
+| `GET /readiness` / `POST /test-connection` | 结构化缺项报告（onboarding UI）/ 服务端模型连通探测（key 不出端） |
 | `GET /sessions` | `{sessions:[{conv_id, session_key, title, updated_at, msg_count}]}` —— serve 平台会话，按更新时间倒序 |
-| `GET /convs/{conv_id}/messages` | `{conv_id, messages:[{role, content}]}` —— 历史转录 |
-| `POST /convs/{conv_id}/reset` | `{conv_id, session_key, reset:bool}` —— 该会话重开一轮 |
+| `GET /convs/{conv_id}/messages` | `{conv_id, messages:[{role, content, id?, tools?, has_reasoning?, incomplete?, usage?, ts?, attachments?}]}` —— 历史转录（assistant 帧带 trace 锚点/工具数折叠元数据；user 帧带附件元数据 chips，2026-09-20 起；`id` 为 uuid 字符串） |
+| `GET /convs/{conv_id}/trace/{msg_id}` | 单轮工具轨迹（懒加载；工具事件可带 `approval` 审批徽章数据） |
+| `POST /convs/{conv_id}/reset` / `truncate` / `title`；`DELETE /convs/{conv_id}` | 重开一轮 / 回滚到某用户行（重发；`from_msg_id` 为 uuid）/ 改名 / 删会话 |
+| `GET /toolresult` / `GET /toolargs` | 溢出落盘的完整工具结果 / 完整入参 |
+| 管理/资源面 | `/mcp /skills /cron /specialists[/{slug}]`（CRUD）/ `/store*` / `/memory /kbs /kbs/page`；浏览器面板 `/browser/*`；终端 `/ssh/live* /local/live*`（见 [[0046_shared-session-terminal]]） |
 
-`get_messages` 有两处过滤，**不能去掉**：丢掉 `role=="system"`（xihe 内部 system prompt，不是聊天气泡）和「无 content 的 assistant 帧」（纯工具调用框架、[[0011_gateway-architecture]] 提到的 dangling 修复/恢复提示等内部脚手架）。桌面只渲染 `role+content`。
+`get_messages` 的折叠有两处**不能去掉**的容错：「无 content 的 assistant 帧」（纯工具调用框架、[[0011_gateway-architecture]] 提到的 dangling 修复/恢复提示等内部脚手架）；`role=="system"` 过滤分支已删（2026-09-20 起 system 行不再持久化——prompt 每轮重建，见 [[0054_messages-uuid-meta-refactor]]）。
 
 ## WebSocket `/stream` 事件契约
 
 **客户端 → 服务端：**
 | type | 字段 | 语义 |
 |------|------|------|
-| `send` | `conv_id`, `text` | 发起一轮对话 |
+| `send` | `conv_id`, `text`, `cwd?` | 发起一轮对话（`cwd`=工作空间绑定，透传给 agent） |
+| `attach` | `conv_id` | 重连后认领会话（serve 返回 `attached{running}` ack） |
+| `steer` | `conv_id`, `text` | 中途改向（不打断） |
 | `interrupt` | `conv_id` | 中断该会话当前回合 |
+| `approve` | `conv_id`, `id`, `approved`, `always?` | 审批卡批复（见 [[0037_approval-permission-system]]） |
+| `clarify` | `conv_id`, `id`, `answer` | 澄清卡作答（选项点击=选项文本；自由输入原样） |
 
 **服务端 → 客户端：**
 | type | 字段 | 何时发 |
 |------|------|--------|
 | `hello` | `version`, `mode`, `model`, `capabilities` | 连接建立即发（无 `turn_id`/`conv_id`） |
+| `attached` | `conv_id`, `running` | `attach` 的 ack（`running:false` + 本地 pending 气泡 → 强制重拉转录） |
 | `turn_start` | `turn_id`, `conv_id`, `session_key` | 每轮回合开始 |
-| `text_delta` | `turn_id`, `conv_id`, `text` | 正文增量 |
-| `thought_delta` | `turn_id`, `conv_id`, `text` | 推理增量（`kind=="reasoning"`） |
-| `tool_call` | `turn_id`, `conv_id`, `name`, `args` | 工具开始 |
-| `tool_result` | `turn_id`, `conv_id`, `name`, `args`, `elapsed` | 工具结束（`elapsed` 秒，3 位小数） |
-| `complete` | `turn_id`, `conv_id`, `text` | 回合正常结束，`text`=最终回复 |
-| `error` | `turn_id?`, `conv_id?`, `message` | 回合失败或入参非法；`hello` 后的通用错误可无 `turn_id`/`conv_id` |
+| `text_delta` | `turn_id`, `conv_id`, `text`, `by?` | 正文增量 |
+| `thought_delta` | `turn_id`, `conv_id`, `text`, `by?` | 推理增量（`kind=="reasoning"`；`by` 归因外部引擎子活动） |
+| `tool_call` | `turn_id`, `conv_id`, `name`, `args`, `by?`, `id?` | 工具开始 |
+| `tool_result` | `turn_id`, `conv_id`, `name`, `result`, `elapsed`, `truncated?`, `by?` | 工具结束（**带 result 不带 args**；`elapsed` 秒） |
+| `approval_request` / `approval_resolved` | `conv_id`, `id`, `name`, `summary`, `args?` / `id`, `approved`, `reason` | 审批卡弹出 / 各方落定 |
+| `clarify_request` / `clarify_resolved` | `conv_id`, `id`, `question`, `options[]` / `id`, `status`, `answer?` | 澄清卡弹出（agent 中途提问并阻塞等待）/ 落定（answered 带答案文本） |
+| `complete` | `turn_id`, `conv_id`, `text`, `reason?`, `usage?` | 回合结束（`reason`: interrupted/api_error/…；`usage` token 用量） |
+| `cron_result` | `conv_id`, `text` | DesktopChannel 推送的定时任务结果 |
+| `error` | `turn_id?`, `conv_id?`, `message`, `code?` | 回合失败或入参非法；`hello` 后的通用错误可无 `turn_id`/`conv_id` |
 
-心跳：`WebSocketResponse(heartbeat=30)` —— aiohttp 自动 ping/pong 保活。
+心跳：`WebSocketResponse(heartbeat=60)` —— aiohttp 自动 ping/pong 保活。
 
-> **`args` 是摘要不是全文**：`tool_call` / `tool_result` 的 `args` 是 agent 把原始 `arguments` 截到 **120 字符**后传出的（`core/agent/agent.py` 调 `tc["arguments"][:120]`），用于 UI 展示，**不是**完整工具入参。需要完整入参得在桌面端侧自己留（P0 不需要）。
+> **`args` 是摘要不是全文**：`tool_call` 的 `args` 被截到 **500 字符**（`_WS_ARGS_LIMIT`），用于 UI 展示；审批卡的 `args` 上限 64K；完整入参/结果可经 `GET /toolargs` / `GET /toolresult` 回捞（溢出侧存储，见 [[0002_tool-registry-and-dispatch]]）。
 
 ## 会话映射
 
@@ -89,7 +100,7 @@ serve 本质上是「把 gateway 模式跑在一个中立协议上」，把平�
 
 - 历史落 `sessions.db`，**跨 serve 重启存活**。
 - 与 CLI / gateway 会话**完全隔离**（platform 段不同：`serve` vs `cli`/`wecom`/`feishu`），除非你手动复用 key。
-- `_PLATFORM = "serve"`、`_DEFAULT_USER = "desktop"` 是 serve.py 顶部两个常量——刻意匹配 `xihe serve` 命令名以便按进程 grep；若偏好 "server" 改这一处即可（cosmetic）。
+- `_PLATFORM = "serve"`、`_DEFAULT_USER = "desktop"` 是 `gateway/serve/_common.py` 顶部两个常量——刻意匹配 `xihe serve` 命令名以便按进程 grep；若偏好 "server" 改这一处即可（cosmetic）。
 
 会话 key 推导见 [[0006_session-design]]。
 
@@ -98,22 +109,22 @@ serve 本质上是「把 gateway 模式跑在一个中立协议上」，把平�
 `_capabilities()` 向桌面声明能力 flag：
 
 ```
-["text","streaming","tools","interrupt","sessions","thoughts"]   # 基线常驻
+["text","streaming","tools","interrupt","sessions","thoughts","approvals"]   # 基线常驻
 + "browser"            # 有任一 browser_* 工具
 + "vision"             # 有 vision_analyze 或 image_ocr
 + "image_generation"   # 有 image_generation 工具
 + "mcp"                # 有任一 mcp_* 工具
 ```
 
-后半段从 `registry._tools` 实时推导——也就是说能力 flag 反映**当前进程真正过 `check_fn` 门控的工具**（如 Playwright 没装则 `browser` 自动消失，见 [[0002_tool-registry-and-dispatch]] 的 check_fn 门控）。`/health`、`/agents`、WS `hello` 三处都带这份描述符。
+后半段从 `registry._tools` 实时推导——也就是说能力 flag 反映**当前进程真正过 `check_fn` 门控的工具**（如 Playwright 没装则 `browser` 自动消失，见 [[0002_tool-registry-and-dispatch]] 的 check_fn 门控）。`/health` 与 WS `hello` 两处带这份描述符（`/agents` 端点已随多 agent 骨架清除删除，见 [[0047_desktop-single-agent-collapse]]）。
 
-**桌面 UI 按这些 flag 分支，永不 sniff 引擎名。** 这是「中立协议」的核心承诺，也是桌面能同时容纳 xihe / Claude / CodeBuddy 等异质 provider 的前提。能力描述符的**设计哲学**（三层模型、capability-driven UI）见 [[0025_desktop-control-plane]]，本文只记 wire 层。
+~~桌面 UI 按这些 flag 分支，永不 sniff 引擎名~~（2026-09-14 订正：桌面当前展示模型名，不按 capability 分支；「一套 UI 容纳异质 provider」的多引擎前提已随单 agent 收敛消失，描述符保留为通用自描述面）。
 
 ## Emitter：跨线程回调 → WS 的桥
 
 这是 serve 最关键的技术点。`agent.chat()` 的回调（`stream_delta_callback` / `tool_call_start_callback` / `tool_call_callback`）是**从工作线程同步触发**的（agent 跑在 `run_in_executor` 的线程里），不能直接调 `ws.send_json`（asyncio 对象非线程安全，且该线程没有 running loop）。
 
-`Emitter`（`gateway/serve.py`）解法：
+`Emitter`（`gateway/serve/emitter.py`）解法：
 - 回调把 JSON 事件 `put` 进一个 **stdlib `queue.Queue`**（线程安全，无需 loop）。
 - WS handler 协程**自己**排空这个队列：`get_nowait()` 取不到就 `await asyncio.sleep(0.02)` 再试，循环往复直到工作线程结束。
 - `_DONE` 哨兵：工作线程 `finally` 里 `emitter.finish()` 推一个 `_DONE`，排空循环见到它即收尾。
@@ -126,7 +137,7 @@ serve 本质上是「把 gateway 模式跑在一个中立协议上」，把平�
 
 ## 并发与中断
 
-serve 用 `loop.run_in_executor(None, _worker)` 跑 agent 回合，事件循环在 `await asyncio.sleep(0.02)` 的间隙**完全空闲**——可以收新 WS 帧、发心跳、处理别的会话。**这正是它对 gateway 的核心改进**：[[0011_gateway-architecture]] 里 `thread.join()` 把单线程循环卡死，导致同会话被动串行、跨会话互相拖累、中断触发不了、期间发不了进度。serve 把 join 换成「executor + 排空循环」，循环不再阻塞。
+serve 用 `loop.run_in_executor(None, _worker)` 跑 agent 回合，事件循环在排空间隙**完全空闲**——可以收新 WS 帧、发心跳、处理别的会话。（gateway 的 `thread.join` 阻塞问题也已用 `asyncio.to_thread` 修复，见 [[0011_gateway-architecture]]；两模式的差异现在主要是协议面而非循环健康度。）Emitter 内置 **delta 合并**（0.2s / 160 字符窗口 + flusher 线程），长流不逐 chunk 发帧。
 
 两条锁：
 
@@ -135,27 +146,27 @@ serve 用 `loop.run_in_executor(None, _worker)` 跑 agent 回合，事件循环�
 
 中断路径（两条）：
 1. **客户端主动**：WS 收 `{type:"interrupt","conv_id":...}` → `_interrupt()` 从 `_active` 取 agent → `agent.interrupt()`。
-2. **客户端掉线**：`stream()` 的 `finally` 遍历该 socket 启动过的所有 `conv_id` 逐个 `_interrupt`——**关键**：否则 agent 会对着死连接把一整轮跑完、回调对着无人排空的队列空推。
+2. **客户端掉线**：`stream()` 的 `finally` 不再立刻中断——起 **60s 宽限窗**（`_GRACE_SECONDS`），回合**脱离连接继续跑**并持续落库；重连的客户端发 `attach` 认领同一回合继续收流（`attached{running}` ack；宽限窗烧完仍无人认领才真正 `_interrupt`）。
 
-`_safe_send(ws, obj) -> bool`：发帧前先判 `ws.closed`，发送异常一律返回 `False`。排空循环一旦拿到 `False` 立刻 `_interrupt` + 跳出——保证「客户端没了，回合不再烧」。
+`_safe_send(ws, obj) -> bool`：发帧前先判 `ws.closed`，发送异常一律返回 `False`。
 
 ## CORS 与桌面端接法
 
 Electron renderer（`file://`/`app://` origin）跨域 fetch `http://127.0.0.1:<port>` 的 REST。WS 不受同源约束，故 CORS 只需给 REST 加：
 
-- `on_response_prepare` 钩子给所有响应加 `Access-Control-Allow-Origin: *`、`Allow-Headers: Content-Type`、`Allow-Methods: GET, POST, OPTIONS`；`WebSocketResponse` 跳过。
+- `on_response_prepare` 钩子给所有响应加 `Access-Control-Allow-Origin: *`、`Allow-Headers: Content-Type`、`Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`；`WebSocketResponse` 跳过。
 - `OPTIONS /{tail:.*}` 返回 204，满足预检。
 
 桌面端（renderer 原生 `WebSocket` + `fetch`，无 axios）：
 - `baseUrl = http://127.0.0.1:7788`、`wsUrl = ws://127.0.0.1:7788/stream` 硬编码；`setServeBase(url)` 可改（给设置项留口）。
 - `connectStream` 在 `onopen` resolve、`onclose`/`onerror` reject / 触发 `onStatus(false)`；store 据此做 3s 指数重连兜底。
-- React StrictMode 在 dev 下会 double-invoke `useEffect` → 两次 `/health` + `/agents` + `/stream`，无害（生产无）。
+- React StrictMode 在 dev 下会 double-invoke `useEffect` → 两次 `/health` + `/stream`，无害（生产无）。
 
 ## 落地文件
 
-- **serve 内核**：`gateway/serve.py`（`run_serve` / `ServeApp` / `Emitter` / `_capabilities` / `_resolve_toolsets` / CORS）
+- **serve 内核**：`gateway/serve/` 按业务分模块——`server.py`（ServeApp 组装 / `_capabilities` / CORS / banner）、`chat.py`（/stream 回合引擎 + 会话/历史/审批路由）、`system.py`（health/readiness/test-connection）、`admin.py`（specialists/store/mcp/skills/cron）、`browser.py`/`terminal.py`/`knowledge.py`、`emitter.py`（跨线程桥）、`_common.py`（常量/限长）
 - **CLI 接线**：`app/main.py`（`cmd_serve` + `serve` 子解析器：`--host` / `--port` / `--config`）
-- **桌面端客户端**：`xihe-desktop/src/renderer/src/lib/serveClient.ts`（事件联合类型 + REST/WS 客户端）
+- **桌面端客户端**：`desktop/src/renderer/src/lib/serveClient.ts`（事件联合类型 + REST/WS 客户端）
 
 ## 设计权衡与坑
 
@@ -164,7 +175,7 @@ Electron renderer（`file://`/`app://` origin）跨域 fetch `http://127.0.0.1:<
 - **端口在 CLI 不在 config**：`--port`/`--host` 是 flag，不进 `config.yaml`。要开多实例用 `xihe --config X serve --port N`（实例隔离见 [[0023_multi-instance-config]]：`agent_home` 决定数据根，各实例 sessions/log/browser/cron 独立）。
 - **历史过滤不可去**：system prompt + 空 assistant 帧是 xihe 内部脚手架，泄漏到桌面会暴露 recovery hint / dangling 修复（见 [[0011_gateway-architecture]] 的 `_repair_dangling_tool_calls` / `_inject_recovery_hint`）。
 - **排空用 stdlib queue 而非 asyncio.Queue**：见 Emitter 节，工作线程无 loop。
-- **客户端掉线必中断**：否则烧一整轮 agent。
+- **客户端掉线不再立即中断**（订正 2026-09-14）：60s 宽限窗内回合继续跑，重连 `attach` 认领；窗内无人认领才中断——兼顾「不烧死轮」与「短暂闪断不丢工作」。
 
 ## 相关页面
 

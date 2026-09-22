@@ -7,8 +7,13 @@ Lives in core (not app/) because the modes construct it themselves inside
 run_chat / run_gateway / run_serve — it must sit BELOW the mode layer, never
 inside the launcher."""
 
-from pathlib import Path
+from typing import TYPE_CHECKING, Optional
 
+if TYPE_CHECKING:
+    from core.agent import XiheAgent
+    from core.agent.auxiliary_client import AuxiliaryClient
+    from core.agent.compressor import ContextCompressor
+    from core.session import SessionDB
 
 class SharedContext:
     """Heavy state shared across per-message XiheAgent instances in gateway mode.
@@ -16,6 +21,13 @@ class SharedContext:
     Creating a new XiheAgent per message is cheap — the expensive objects
     (SQLite connection, auxiliary LLM client, context compressor) are reused.
     """
+
+    db: "SessionDB"
+    aux: "AuxiliaryClient"
+    compressor: "ContextCompressor"
+    llm_client: Optional[object]
+    main_toolsets: list | set | None
+    main_skills: list | set | None  # None = "*" unrestricted; XiheAgent widens to set
 
     def __init__(self, config: dict):
         from core.agent import XiheAgent
@@ -43,11 +55,11 @@ class SharedContext:
         # creation (serve translates that to its onboarding error), not crash
         # SharedContext startup. httpx.Client is thread-safe, so one instance
         # serves all concurrent turns.
-        self.client = None
+        self.llm_client = None
         if config.get("api_key"):
             import httpx
             from openai import OpenAI
-            self.client = OpenAI(
+            self.llm_client = OpenAI(
                 api_key=config["api_key"],
                 base_url=config["base_url"],
                 timeout=httpx.Timeout(120.0, connect=10.0),
@@ -70,8 +82,9 @@ class SharedContext:
         self.main_toolsets, self.main_skills = merge_mounts(
             "main", *resolve_roster(config, where="config.yaml"))
 
-    def create_agent(self, enabled_toolsets=None, cwd=None,
-                     skills_allowed=None) -> "XiheAgent":
+    def create_agent(self, enabled_toolsets: Optional[list[str]] = None,
+                     cwd: Optional[str] = None,
+                     skills_allowed: Optional[set] = None) -> "XiheAgent":
         """Create a fresh XiheAgent sharing this context.
 
         No args → unrestricted agent (cron jobs, slash-command context); the
@@ -83,14 +96,14 @@ class SharedContext:
             shared_db=self.db,
             shared_aux=self.aux,
             shared_compressor=self.compressor,
-            client=self.client,
+            llm_client=self.llm_client,
             enabled_toolsets=enabled_toolsets,
             skills_allowed=skills_allowed,
             cwd=cwd,
         )
 
 
-def bootstrap_process(ctx: "SharedContext", adapter=None) -> None:
+def bootstrap_process(ctx: "SharedContext", adapter: Optional[object] = None) -> None:
     """Process-level composition root — every mode entrypoint calls this
     once, explicitly (SharedContext construction is side-effect-free, so
     tests can build one without spawning threads).
@@ -116,18 +129,3 @@ def bootstrap_process(ctx: "SharedContext", adapter=None) -> None:
         from tools import send_message_tool
         send_message_tool.set_adapter(adapter)
         set_platform_adapter(adapter)
-
-
-def init_agent(config: dict, platform_adapter=None, cwd=None):
-    """Create XiheAgent and wire all tool dependencies.
-
-    For CLI mode: returns a single long-lived agent (main-agent roster from
-    config). ``cwd`` defaults to the launch directory.
-    For gateway/serve mode: use SharedContext.create_agent() instead (no cwd).
-    """
-    ctx = SharedContext(config)
-    bootstrap_process(ctx, adapter=platform_adapter)
-    agent = ctx.create_agent(enabled_toolsets=ctx.main_toolsets,
-                             skills_allowed=ctx.main_skills,
-                             cwd=cwd or Path.cwd())
-    return agent

@@ -71,6 +71,8 @@ related_insights:
 
 ### 运行面板 + 共享终端
 
+> **已过时注记（2026-09-15）**：本节的运行面板（每 workdir 一槽 + 历史）与终端面板的本地 tab、快速连接已被 [[0050_terminal-panel-overhaul]] 取代——Run 面板重做为通用多开本地终端（ShellPanel），agent 终端面板删本地 tab 与快速连接、连接统一交给 agent。
+
 - `main/run.ts`：一次性命令执行，**每 workdir 一槽**（新命令 supersede 旧的、树杀）、历史按 workdir 持久（`~/.xihe-desktop/`）；`run:event` 推 start/out/exit。`RunPanel`：↑ 召回历史 + 下拉重填、文件树/编辑器 Play 入口经 `runCmdDraft` 预填、`guessRunCommand` 按扩展名猜启动命令（python/node/npx tsx）。
 - `main/localPty.ts`：本地 pty attach/write/resize/kill + 事件推送；**终端面板三源合一**（本地 shell / agent 的本地命令 / SSH 会话），agent 与桌面手敲共写同一通道（pump + 环形缓冲；`prompt` 字段修状态链盲点）。serve 侧 `_local_tap.py`（与 `_ssh_tap` 同构的本地命令 tap）+ terminal.py/emitter.py 通道。
 

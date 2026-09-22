@@ -10,7 +10,7 @@ tags:
   - quality
 status: active
 created: 2026-08-07
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0002_tool-registry-and-dispatch.md
   - wiki/concepts/0016_interrupt-stop-steer.md
@@ -24,7 +24,7 @@ sources:
 
 ## 摘要
 
-xihe-agent 是"非确定性 LLM + 长链路工具调用 + 强外部依赖(模型 API/浏览器/shell/平台 webhook)"的系统,传统 `assertEqual` 几乎无处下手。本页定义 xihe 的测试策略:**按保真度分层,每层用不同判据**。核心技巧是用一个**注入的假模型 client** 把 agent 循环变成确定性的,从而用普通断言测循环不变量(撞墙、派工、崩溃恢复)。截至 2026-08-07,L0/L1/L2 的最小骨架已落地于 `tests/`(12 个测试全绿);L3/L4 为后续方向。
+xihe-agent 是"非确定性 LLM + 长链路工具调用 + 强外部依赖(模型 API/浏览器/shell/平台 webhook)"的系统,传统 `assertEqual` 几乎无处下手。本页定义 xihe 的测试策略:**按保真度分层,每层用不同判据**。核心技巧是用一个**注入的假模型 client** 把 agent 循环变成确定性的,从而用普通断言测循环不变量(撞墙、派工、崩溃恢复)。L0/L1/L2 已落地于 `tests/` 并持续增长——**截至 2026-09-14: 44 个测试文件、542 passed / 20 skipped**;L3/L4 为后续方向。
 
 ## 为什么 agent 难测 / 为什么分层
 
@@ -70,7 +70,7 @@ assert "单轮处理上限" in result
 
 - **会话 DB 隔离**:`SessionDB` 的路径取自模块级常量 `core.session._DB_PATH`(导入时由 `AGENT_HOME` 算出,项目 `agent_home: .xihe-agent` → `<repo>/.xihe-agent`)。`tests/conftest.py` 的 `isolate_db`(autouse)把该常量 monkeypatch 到 `tmp_path`,测试不碰真实 session store。
 - **跳过副作用**:`make_agent` 默认 `is_subagent=True`(跳过 auto-title,否则会调 aux LLM)+ `system_prompt_override`(短路 `_build_system_prompt`,不加载 skills/kbs/项目上下文)→ L2 测试 hermetic 且快。
-- **工具隔离**:`load_all_tools()` 在 `core.agent` 导入时跑(注册全部真工具),但 `FakeChatClient` 只请求测试注册的 `test_echo`,真工具在 schema 里是惰性的,不影响断言。
+- **工具隔离**:`load_all_tools()` 延迟到首次 `XiheAgent` 构造时跑(注册全部真工具),但 `FakeChatClient` 只请求测试注册的 `test_echo`,真工具在 schema 里是惰性的,不影响断言。conftest 另有 autouse 审批记忆隔离(approvals 落盘目录指到 tmp)。
 
 ## 行业对照(为什么这套是主流)
 
@@ -81,7 +81,7 @@ assert "单轮处理上限" in result
 
 ## 务实路径
 
-1. ✅ **L0/L1/L2 地基**(本次落地):pytest + 可注入 client + `FakeChatClient` + 12 个代表性测试。每层 1–2 个,给模式,增量覆盖留给后续。
+1. ✅ **L0/L1/L2 地基**(已落地并持续增长):pytest + 可注入 client + `FakeChatClient`;并行/串行派工(`test_agent_loop.py`)、流式往返(`test_stream_consumer.py` / `test_stream_attribution.py`)等原「扩展点」已覆盖。
 2. ⏳ **L3 nightly**:真模型 + `auxiliary_client` 当 judge + 结构断言("至少调了某工具""输出合法 JSON""< N 迭代")。不进阻塞 CI。
 3. ⏳ **L4 平台集成**:等 WeCom/Feishu 协议稳定后,用假平台 server 测 `handle_message` 全链路。
 
@@ -91,15 +91,15 @@ assert "单轮处理上限" in result
 - 共享 fixture 与假对象放 `tests/conftest.py` 与 `tests/fakes.py`。
 - 新增工具时,至少补一条 L1(mock IO,断言输出 shaping);改循环/退出语义时,补 L2(`FakeChatClient` 剧本)。
 
-## 已知扩展点(骨架有意未做)
+## 已知扩展点(原骨架未做,订正 2026-09-14)
 
-- **并行 vs 串行派工**(`read_only=True` → `ThreadPoolExecutor`):基于时序的断言易 flaky,骨架里 L2 只验证"一轮多个 tool_call 都被派发并组装结果"这条功能不变量;真正的并发性留作带线程观测的专项测试。
+- ~~并行 vs 串行派工专项~~ — **已覆盖**:`test_agent_loop.py` 的 `test_mixed_batch_parallel_reads_around_sequential_write`。
 - **崩溃恢复**(`_repair_dangling_tool_calls`):可加一个"假 client 发了 tool_call 后抛异常"的剧本,断言悬空 tool_call 被补成 error——后续补。
-- **流式路径**:`FakeChatClient` 已支持 `stream=True`,但骨架的 L2 测试走非流式(更快);流式往返可按需补。
+- ~~流式往返~~ — **已覆盖**:`test_stream_consumer.py` / `test_stream_attribution.py`。
 
 ## 验证
 
-- `pip install -e .`(已加 `pytest>=7.0`)后 `pytest -q` → 12 绿。
+- `pip install -e .` 后 `pytest -q` → 542 passed / 20 skipped(2026-09-14)。
 - 有效性自证:`test_max_iterations_sets_exit_reason` 断言 `agent._last_exit_reason == "max_iterations"`;该属性在 `__init__` 默认 `None`、仅撞墙返回路径设置——测试通过即证明该路径生效,移除设置则转红(非空转)。
 
 ## 相关页面

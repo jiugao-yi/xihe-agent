@@ -9,7 +9,6 @@ kills the whole tree (kill_tree), not just the shell wrapper — a web backend
 spawned through ``shell=True`` always has grandchildren.
 """
 
-import codecs
 import logging
 import os
 import subprocess
@@ -141,7 +140,7 @@ def _start_process(args: dict, **kw) -> str:
     except Exception as e:
         return tool_error(f"Failed to start process: {e}")
 
-    ch.publish(f"\r\n\x1b[90m—— agent $ {display_command}"
+    ch.publish(f"\r\n\x1b[90m—— $ {_local_tap.fmt_command(display_command)}"
                + (f"  [{name}]" if explicit else "")
                + "\x1b[0m\r\n")
     if effective_cwd:
@@ -150,19 +149,18 @@ def _start_process(args: dict, **kw) -> str:
 
     parts: list[str] = []
 
-    def _drain(pipe, decoder) -> None:
+    def _drain(pipe, sink: list, decoder) -> None:
+        tap = _local_tap.LineTap(ch, sink)
         try:
             while True:
                 data = pipe.read1(65536)
                 if not data:
                     break
-                s = decoder.decode(data)
-                if s:
-                    parts.append(s)
-                    ch.publish(s)
+                tap.feed(decoder.decode(data))
         except Exception:
             pass
         finally:
+            tap.flush()
             try:
                 pipe.close()
             except Exception:
@@ -170,9 +168,9 @@ def _start_process(args: dict, **kw) -> str:
 
     readers = [
         threading.Thread(target=_drain, daemon=True, name=f"proc-{name}-out",
-                         args=(proc.stdout, codecs.getincrementaldecoder("utf-8")("replace"))),
+                         args=(proc.stdout, parts, _local_tap.StreamDecoder())),
         threading.Thread(target=_drain, daemon=True, name=f"proc-{name}-err",
-                         args=(proc.stderr, codecs.getincrementaldecoder("utf-8")("replace"))),
+                         args=(proc.stderr, parts, _local_tap.StreamDecoder())),
     ]
     for t in readers:
         t.start()

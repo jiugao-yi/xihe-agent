@@ -10,7 +10,7 @@ tags:
   - skills
 status: active
 created: 2026-07-01
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/entities/0001_xihe-agent.md
 sources:
@@ -37,7 +37,7 @@ Skills 是 xihe-agent 的**过程记忆**——把反复验证的任务方法论
   - 必填: `name`（小写+连字符，正则 `^[a-z0-9][a-z0-9._-]*$`，≤64 字符）、`description`（≤1024 字符）。
   - 可选: `version` / `prerequisites.commands`（依赖命令）/ `platforms`（linux/macos/windows）/ `metadata.tags`。
   - body 建议: Prerequisites / Instructions / Pitfalls / Verification / References。
-- **索引注入** (`build_skills_prompt`): 扫描所有 SKILL.md 生成紧凑索引注入 system prompt，附带「匹配则 `skill_view` 加载、有问题 `skill_manage patch`、复杂任务后 offer 保存为 skill」的引导。**仅当** skills 工具可用时注入；子 agent（`delegate_depth>0`）跳过。
+- **索引注入** (`build_skills_prompt`): 扫描所有 SKILL.md 生成紧凑索引注入 system prompt，附带「匹配则 `skill_view` 加载、有问题 `skill_manage patch`、复杂任务后 offer 保存为 skill」的引导。**仅当** skill_manage/skill_view/skills_list 任一可用时注入（订正 2026-09-14：~~子 agent 跳过~~——`skills_list`/`skill_view` 在 `base` 读面地板里，delegate 子代理也看得到索引）；索引支持白名单过滤（`allowed=`，接专家 skills 名单与主 agent 的 config 顶层 `skills` 键——不写=不注入、`["*"]`=全部）。
 - **缓存**: 进程内缓存，key 为 `(bundled_dir_mtime, user_dir_mtime)`；mtime 变自动失效；`skill_manage` 成功后 `clear_skills_cache()` 立即清。
 - **原子写入** `_atomic_write_text`: 写临时文件 `.filename.tmp.xxxx` → `os.replace()` 原子替换，崩溃也不会部分写入。
 - **内容限制**: SKILL.md ≤100k 字符（~36k tokens）；supporting file ≤1 MiB。

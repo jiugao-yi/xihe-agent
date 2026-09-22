@@ -13,7 +13,7 @@ tags:
   - config
 status: active
 created: 2026-07-13
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0002_tool-registry-and-dispatch.md
   - wiki/concepts/0013_toolset-scope-and-dynamic-expansion.md
@@ -28,7 +28,7 @@ xihe 在构建 system prompt 时会加载项目目录下的上下文文件（`.x
 
 ## 加载机制
 
-`core/agent/prompt_context.py` 的 `load_project_context()` 在 `build_system_prompt()` 第 7 层调用（`core/agent/prompts.py`）。
+`core/agent/prompt_context.py` 的 `load_project_context()` 是声明式 `LAYERS` 表的**最后一层**（18 层，`core/agent/prompts.py`）。
 
 ### 加载规则（ALL 匹配，不是 first-match-wins）
 
@@ -58,7 +58,8 @@ session:
 
 - `.xihe.md` 和 `AGENTS.md` **始终加载**，不受配置控制（xihe 的核心上下文）
 - 默认值 `true`（向后兼容）
-- 子 agent（delegate_depth > 0）跳过所有上下文文件（`skip_context_files=True`）
+- 子代理不看项目上下文的方式：delegate 走 wholesale `system_prompt_override`（纯任务卡）；专家默认 `project_context=False`（订正 2026-09-14：无 `skip_context_files` 参数）
+- `.cursorrules` 加载同时读 `.cursor/rules/*.mdc`；所有上下文文件 20K 字符上限 + prompt-injection 扫描 + frontmatter 剥离
 
 ## 各文件职责
 

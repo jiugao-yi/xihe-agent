@@ -23,6 +23,8 @@ Config (config.yaml):
 import logging
 import os
 import re
+import base64
+from pathlib import Path
 from typing import Any, Optional
 
 from openai import OpenAI
@@ -48,7 +50,7 @@ _DEFAULT_TIMEOUTS = {
 }
 
 
-def extract_content_or_reasoning(response) -> str:
+def extract_content_or_reasoning(response: Any) -> str:
     """Extract content from an LLM response, falling back to reasoning fields.
 
     Reasoning models (DeepSeek-R1, Qwen-QwQ, etc.) may return content=None
@@ -96,6 +98,98 @@ def extract_content_or_reasoning(response) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# describe_image — 工具内部基础设施（非工具面）
+# ---------------------------------------------------------------------------
+
+# 入站附件自动描述的降级文案：只陈述事实，不点名任何工具——用哪个图片
+# 工具（image_ocr 等）是 agent 按自己 roster 的路由决策，实现层不替它做。
+_DESCRIBE_UNAVAILABLE = (
+    "（图片未自动识别，路径: {path}。请按需用你可用的图片工具处理）")
+
+
+def describe_image(aux: "AuxiliaryClient", image: str,
+                   prompt: Optional[str] = None) -> str:
+    """调辅助 LLM 看图，返回描述文本；失败/未配置时返回中性降级文案。
+
+    给工具内部与入口层的附件自动描述用（gateway 企微/飞书入站图、serve
+    桌面上传、computer_screenshot 的 describe 参数）。住在 core 层而非
+    vision_tools：这是 AuxiliaryClient 之上的基础设施，任何工具 import
+    它都不构成 tool↔tool 耦合（规则见 CLAUDE.md）。
+
+    接受本地路径或 http(s) URL。Never raises。
+    """
+    if aux is None or not aux.is_available("vision"):
+        return _DESCRIBE_UNAVAILABLE.format(path=image)
+    try:
+        data_url = _image_to_data_url(image)
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text",
+                 "text": prompt or "简短描述这张图片的内容，包括文字、物体、场景等关键信息。"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }]
+        # 视觉模型优先，空内容回落主模型（与 vision_tools 的 fallback 同构）
+        response = aux.call_vision(messages=messages, max_tokens=2000)
+        content = extract_content_or_reasoning(response) if response else ""
+        if not content:
+            response = aux.call_llm(task="", messages=messages, max_tokens=2000)
+            content = extract_content_or_reasoning(response) if response else ""
+        if not content:
+            return "(vision analysis returned no response)"
+        from core.support.redact import redact_sensitive_text
+        return redact_sensitive_text(content)
+    except Exception as e:
+        return f"(vision error: {e})"
+
+
+_MIME_BY_EXT = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+}
+
+
+def _image_to_data_url(image: str) -> str:
+    """Local file path or http(s) URL → base64 data URL (≤10MB)."""
+    p = Path(image).expanduser()
+    if p.is_file():
+        mime = _MIME_BY_EXT.get(p.suffix.lower())
+        if not mime:
+            raise ValueError(f"Unsupported image format: {p.suffix}")
+        data = p.read_bytes()
+        if len(data) > 10 * 1024 * 1024:
+            raise ValueError(f"Image too large: {len(data)} bytes (max 10MB)")
+        return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    if image.startswith(("http://", "https://")):
+        resp = httpx.get(image, timeout=30, follow_redirects=True, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; XiheAgent/1.0)",
+            "Accept": "image/*,*/*;q=0.8",
+        })
+        resp.raise_for_status()
+        data = resp.content
+        if len(data) > 10 * 1024 * 1024:
+            raise ValueError(f"Image too large: {len(data)} bytes (max 10MB)")
+        mime = _sniff_image_mime(data) or \
+            resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+        return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    raise ValueError(
+        f"Invalid image source: {image}. Use a file path or HTTP URL.")
+
+
+def _sniff_image_mime(data: bytes) -> Optional[str]:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 class AuxiliaryClient:
     """Stateless LLM client for auxiliary (non-agent-loop) completions.
 
@@ -104,7 +198,7 @@ class AuxiliaryClient:
     """
 
     def __init__(self, base_url: str = "", api_key: str = "", model: str = "",
-                 config: dict = None):
+                 config: Optional[dict] = None):
         self._base_url = base_url
         self._api_key = api_key
         self._default_model = model
@@ -118,7 +212,8 @@ class AuxiliaryClient:
         "vision": "vision_model",
     }
 
-    def _resolve(self, task: str, model: str = None, timeout: float = None) -> tuple[str, float]:
+    def _resolve(self, task: str, model: Optional[str] = None,
+                 timeout: Optional[float] = None) -> tuple[str, float]:
         """Resolve effective model and timeout for a task.
 
         Priority: explicit arg > top-level config key > auxiliary section > default.
@@ -156,7 +251,7 @@ class AuxiliaryClient:
         model: str,
         messages: list[dict],
         max_tokens: int = 4000,
-        temperature: float = None,
+        temperature: Optional[float] = None,
         timeout: float = 30.0,
     ) -> dict:
         """Build kwargs for chat.completions.create()."""
@@ -174,10 +269,10 @@ class AuxiliaryClient:
         self,
         task: str,
         messages: list[dict],
-        model: str = None,
+        model: Optional[str] = None,
         max_tokens: int = 4000,
-        temperature: float = None,
-        timeout: float = None,
+        temperature: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> Optional[Any]:
         """Single-shot LLM completion. Returns the raw response object.
 
@@ -229,9 +324,9 @@ class AuxiliaryClient:
     def call_vision(
         self,
         messages: list[dict],
-        model: str = None,
+        model: Optional[str] = None,
         max_tokens: int = 2000,
-        timeout: float = None,
+        timeout: Optional[float] = None,
     ) -> Optional[Any]:
         """Vision LLM completion. Same as call_llm but with vision defaults."""
         return self.call_llm(
@@ -245,11 +340,11 @@ class AuxiliaryClient:
     def generate_image(
         self,
         prompt: str,
-        model: str = None,
+        model: Optional[str] = None,
         size: str = "1024x1024",
         n: int = 1,
         style: str = "vivid",
-        timeout: float = None,
+        timeout: Optional[float] = None,
     ) -> Optional[Any]:
         """Generate images via DALL-E style API."""
         if not self._client:
@@ -258,7 +353,7 @@ class AuxiliaryClient:
         effective_model, effective_timeout = self._resolve("image_gen", model, timeout)
 
         try:
-            return self._client.images.generate(
+            return self._client.images.generate(  # type: ignore[call-overload]  # 非 OpenAI 网关接受任意 style/size 组合
                 model=effective_model or "dall-e-3",
                 prompt=prompt,
                 size=size,
@@ -274,8 +369,8 @@ class AuxiliaryClient:
         self,
         text: str,
         voice: str = "alloy",
-        model: str = None,
-        timeout: float = None,
+        model: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> Optional[Any]:
         """Generate speech via TTS API."""
         if not self._client:
@@ -294,7 +389,7 @@ class AuxiliaryClient:
             logger.warning("Auxiliary text_to_speech failed: %s", e)
             return None
 
-    def is_available(self, task: str = None) -> bool:
+    def is_available(self, task: Optional[str] = None) -> bool:
         """Check if the client is configured and (optionally) a task is ready."""
         if not self._client:
             return False

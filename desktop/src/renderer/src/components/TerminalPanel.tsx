@@ -2,28 +2,21 @@ import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
-import { Plus, RefreshCw, Square } from 'lucide-react'
+import { RefreshCw, Square } from 'lucide-react'
 import {
   connectLocalStream,
   connectSshStream,
   getLocalChannels,
   getSshLive,
-  sshConnect,
   stopLocalChannel,
   type LocalChannel,
   type LocalStream,
   type SshLiveSession,
   type SshStream,
 } from '../lib/serveClient'
-import { desktop } from '../lib/desktop'
 import { useStore } from '../appStore'
 import { cn } from '../lib/cn'
 import { Resizer, usePanelSize } from './Resizer'
-
-/** Sentinel tab key for the LOCAL shell (owned by main's ConPTY, not serve's
- *  registries). Every other tab is a serve key: a channel key (`conv:` /
- *  `proc:`) or an ssh session key (`session_key|alias`). */
-const LOCAL = '__local__'
 
 const POLL_MS = 3_000
 const POLL_DEAD_MS = 1_000
@@ -67,17 +60,6 @@ export function TerminalPanel({ className }: { className?: string }) {
   const [streamOk, setStreamOk] = useState(false)
   const [badge, setBadge] = useState<{ who: string; at: number } | null>(null)
   const [height, setHeight] = usePanelSize(HEIGHT_KEY, DEFAULT_HEIGHT, MIN_HEIGHT)
-  const [connectOpen, setConnectOpen] = useState(false)
-  const [connecting, setConnecting] = useState(false)
-  const [connectErr, setConnectErr] = useState<string | null>(null)
-  const [form, setForm] = useState({
-    name: '',
-    host: '',
-    port: '22',
-    user: '',
-    token: '',
-    mode: 'shell',
-  })
 
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
@@ -89,18 +71,18 @@ export function TerminalPanel({ className }: { className?: string }) {
   const seenProcsRef = useRef<Set<string>>(new Set())
   const selectedRef = useRef(selected)
   selectedRef.current = selected
+  // 'auto' until the user clicks a tab: agent focus targets are dropped
+  // once the user pinned their own view (a remount — close/reopen of the
+  // panel — resets it).
+  const selOwnerRef = useRef<'auto' | 'user'>('auto')
+  const pick = (key: string): void => {
+    selOwnerRef.current = 'user'
+    setSelected(key)
+  }
 
   const convSessionKeys = useStore((s) => s.convSessionKeys)
-  const activeConvId = useStore(
-    (s) => s.agents.find((a) => a.id === s.selectedAgentId)?.activeConvId
-  )
+  const activeConvId = useStore((s) => s.activeConvId)
   const activeSessionKey = activeConvId ? convSessionKeys[activeConvId] : undefined
-  // Local shell's seed cwd = the active conversation's workspace (only used
-  // when main spawns it; afterwards the shell owns its own cwd).
-  const convWorkspace = useStore((s) => s.convWorkspace)
-  const workspaces = useStore((s) => s.workspaces)
-  const wsId = activeConvId ? convWorkspace[activeConvId] : undefined
-  const localCwd = wsId ? workspaces.find((w) => w.id === wsId)?.workdir : undefined
 
   // Session/channel list poll. Keeps a vanished selected tab selected — the
   // stream's dead state is the truth, not the list.
@@ -112,9 +94,6 @@ export function TerminalPanel({ className }: { className?: string }) {
       if (!alive) return
       if (rows) setSessions(rows)
       if (chans) setChannels(chans)
-      // Local tab is the fallback default — the terminal always has something
-      // to show even with no channels/sessions.
-      setSelected((cur) => cur ?? LOCAL)
       // Revive: a dead selected tab whose key reappears means a fresh ring
       // under the same key (agent reconnected the alias / restarted the
       // process) — the old cursor is meaningless. Drop it and rebuild
@@ -144,47 +123,67 @@ export function TerminalPanel({ className }: { className?: string }) {
     }
   }, [refreshKey])
 
-  // The Agent console tab follows the active conversation: switching
-  // conversations moves a conv-channel selection onto the new conversation's
-  // console. LOCAL / ssh / proc tabs stay pinned — the user may be typing
-  // there or watching a build; their badges mark what belongs to this conv.
+  // A channel tab earns its strip slot by belonging to the ACTIVE
+  // conversation or having a live run — idle consoles of past conversations
+  // are history, not something to watch; they reappear when their
+  // conversation is opened (their output replays from the server ring).
+  const watchable = (c: LocalChannel): boolean =>
+    (activeSessionKey != null && c.session_key === activeSessionKey) || c.running
+
+  // The Agent console tab follows the active conversation: a null or
+  // unwatchable agent-tab selection is re-seeded onto the active
+  // conversation's console — but only when that channel EXISTS. Channels are
+  // created by tool runs, never by viewers; seeding unconditionally would
+  // spawn an empty Agent tab for every conversation browsed with the panel
+  // open. ssh tabs are pinned (the user may be typing there); a live
+  // agent tab the user is watching stays put.
   useEffect(() => {
-    if (!activeSessionKey) return
-    setSelected((cur) => (cur?.startsWith('conv:') ? `conv:${activeSessionKey}` : cur))
-  }, [activeSessionKey])
+    const key = activeSessionKey ? `conv:${activeSessionKey}` : null
+    setSelected((cur) => {
+      if (cur != null && !isLocalKey(cur)) return cur
+      if (cur != null && channels.some((c) => c.key === cur && watchable(c)))
+        return cur
+      return key != null && channels.some((c) => c.key === key) ? key : null
+    })
+  }, [activeSessionKey, channels])
 
   // An agent tool run in the active conversation wants this panel focused:
   // a conv target selects its channel immediately (created on demand
   // server-side); a proc target waits for the FIRST NEW proc channel under
-  // that session to appear in a list refresh. Keys are marked seen AFTER
+  // that session to appear in a list refresh. Dropped without effect once
+  // the user pinned a tab (selOwnerRef). Keys are marked seen AFTER
   // resolving — effects run in order, so marking first would hide the new
   // channel from the very target that caused it.
   const agentTermTarget = useStore((s) => s.agentTermTarget)
   const clearAgentTermTarget = useStore((s) => s.clearAgentTermTarget)
   useEffect(() => {
-    if (agentTermTarget?.kind === 'conv') {
-      setSelected(agentTermTarget.key)
-      clearAgentTermTarget()
-    } else if (agentTermTarget?.kind === 'proc') {
-      // Newest unseen wins (reverse of insertion order): when two starts
-      // land in the same poll burst, the pending target came from the LATER
-      // tool call.
-      let fresh: LocalChannel | undefined
-      for (let i = channels.length - 1; i >= 0; i--) {
-        const c = channels[i]
-        if (
-          c.kind === 'proc' &&
-          c.session_key === agentTermTarget.sessionKey &&
-          !seenProcsRef.current.has(c.key)
-        ) {
-          fresh = c
-          break
+    if (agentTermTarget && selOwnerRef.current === 'auto') {
+      if (agentTermTarget.kind === 'conv') {
+        setSelected(agentTermTarget.key)
+        clearAgentTermTarget()
+      } else {
+        // Newest unseen wins (reverse of insertion order): when two starts
+        // land in the same poll burst, the pending target came from the LATER
+        // tool call.
+        let fresh: LocalChannel | undefined
+        for (let i = channels.length - 1; i >= 0; i--) {
+          const c = channels[i]
+          if (
+            c.kind === 'proc' &&
+            c.session_key === agentTermTarget.sessionKey &&
+            !seenProcsRef.current.has(c.key)
+          ) {
+            fresh = c
+            break
+          }
+        }
+        if (fresh) {
+          setSelected(fresh.key)
+          clearAgentTermTarget()
         }
       }
-      if (fresh) {
-        setSelected(fresh.key)
-        clearAgentTermTarget()
-      }
+    } else if (agentTermTarget) {
+      clearAgentTermTarget()
     }
     for (const c of channels) {
       if (c.kind === 'proc') seenProcsRef.current.add(c.key)
@@ -236,11 +235,8 @@ export function TerminalPanel({ className }: { className?: string }) {
         if (dims.cols === term.cols && dims.rows === term.rows) return
         term.resize(dims.cols, dims.rows)
         if (closed) return
-        if (selected === LOCAL) void desktop.localPtyResize(dims.cols, dims.rows)
-        else {
-          const s = streamRef.current
-          if (s && 'resize' in s) s.resize(dims.cols, dims.rows)
-        }
+        const s = streamRef.current
+        if (s && 'resize' in s) s.resize(dims.cols, dims.rows)
       } catch {
         /* disposed mid-fit */
       }
@@ -252,42 +248,9 @@ export function TerminalPanel({ className }: { className?: string }) {
     })
     ro.observe(host)
 
-    // Local pty tab: the shell lives in main (survives tab switches / panel
-    // close); this panel just attaches, replays the tail backlog, streams.
-    let localOff: (() => void) | null = null
     let dataSub: { dispose(): void } | null = null
 
-    if (selected === LOCAL) {
-      void desktop
-        .localPtyAttach(localCwd, term.cols, term.rows)
-        .then((r) => {
-          if (!alive) return
-          if (!r.ok) {
-            closed = true
-            setDeadReason(r.reason)
-            deadRef.current = r.reason
-            return
-          }
-          term.write(r.backlog)
-          applyFit()
-          term.focus()
-        })
-      localOff = desktop.onLocalPtyEvent((ev) => {
-        if (!alive || closed) return
-        if (ev.t === 'out') {
-          term.write(ev.chunk)
-          setStreamOk(true)
-        } else {
-          closed = true
-          setDeadReason(ev.reason)
-          deadRef.current = ev.reason
-          term.write(`\r\n\x1b[90m—— 本地终端已退出（${ev.reason}）——\x1b[0m\r\n`)
-        }
-      })
-      dataSub = term.onData((d) => {
-        if (!closed) void desktop.localPtyInput(d)
-      })
-    } else if (isLocalKey(selected)) {
+    if (isLocalKey(selected)) {
       // Agent channels (conv console / resident process): read-only
       // cursor-addressed stream off serve's channel ring (same resume
       // contract as ssh). No onData — the viewer cannot type into the
@@ -453,10 +416,6 @@ export function TerminalPanel({ className }: { className?: string }) {
       if (retry) clearTimeout(retry)
       if (fitTimer) clearTimeout(fitTimer)
       dataSub?.dispose()
-      localOff?.()
-      // Detach (not kill): the local shell keeps running in main so its state
-      // survives switching to another tab and back.
-      if (selected === LOCAL) void desktop.localPtyDetach()
       ro.disconnect()
       streamRef.current?.close()
       streamRef.current = null
@@ -472,44 +431,8 @@ export function TerminalPanel({ className }: { className?: string }) {
     return () => clearTimeout(t)
   }, [badge])
 
-  // Dead local shell → fresh one: kill (main nulls the session) and re-run the
-  // attach effect via its epoch.
-  const restartLocal = (): void => {
-    void desktop.localPtyKill()
-    deadRef.current = null
-    setDeadReason(null)
-    setAttachEpoch((e) => e + 1)
-  }
-
-  const onConnect = async (): Promise<void> => {
-    if (!form.name.trim() || !form.token.trim()) {
-      setConnectErr('name 和 Token/密码 必填')
-      return
-    }
-    setConnecting(true)
-    setConnectErr(null)
-    const r = await sshConnect({
-      name: form.name.trim(),
-      host: form.host.trim() || undefined,
-      port: Number(form.port) || 22,
-      user: form.user.trim() || undefined,
-      token: form.token,
-      mode: form.mode,
-      sessionKey: activeSessionKey,
-    })
-    setConnecting(false)
-    if (r?.ok) {
-      setConnectOpen(false)
-      setForm((f) => ({ ...f, token: '' }))
-      setSelected(form.name.trim())
-      setRefreshKey((k) => k + 1)
-    } else {
-      setConnectErr(r?.error || r?.message || '连接失败')
-    }
-  }
-
-  const convChannels = channels.filter((c) => c.kind === 'conv')
-  const procChannels = channels.filter((c) => c.kind === 'proc')
+  const convChannels = channels.filter((c) => c.kind === 'conv' && watchable(c))
+  const procChannels = channels.filter((c) => c.kind === 'proc' && watchable(c))
   const selChannel = channels.find((c) => c.key === selected) ?? null
   const selProcRunning = selChannel?.kind === 'proc' && selChannel.running
 
@@ -532,31 +455,10 @@ export function TerminalPanel({ className }: { className?: string }) {
 
       <header className="flex items-center gap-1 border-b border-line px-3 py-1.5">
         <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
-          <button
-            onClick={() => {
-              if (selected === LOCAL && deadReason) restartLocal()
-              else setSelected(LOCAL)
-            }}
-            title="本地终端（本机 shell，与 SSH 无关）"
-            className={cn(
-              'flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-xs transition',
-              selected === LOCAL
-                ? 'bg-contrast text-ink'
-                : 'text-ink-3 hover:bg-elevated hover:text-ink'
-            )}
-          >
-            <span
-              className={cn(
-                'h-1.5 w-1.5 rounded-full',
-                selected === LOCAL && deadReason ? 'bg-danger' : 'bg-accent'
-              )}
-            />
-            <span>本地</span>
-          </button>
           {convChannels.map((c) => (
             <button
               key={c.key}
-              onClick={() => setSelected(c.key)}
+              onClick={() => pick(c.key)}
               title={
                 c.command
                   ? `${c.session_key} · 最近命令：${c.command}`
@@ -585,7 +487,7 @@ export function TerminalPanel({ className }: { className?: string }) {
           {procChannels.map((c) => (
             <button
               key={c.key}
-              onClick={() => setSelected(c.key)}
+              onClick={() => pick(c.key)}
               title={`${c.command ?? c.name} · ${c.cwd ?? ''} · ${
                 c.session_key === activeSessionKey ? '本对话' : c.session_key
               }`}
@@ -619,16 +521,14 @@ export function TerminalPanel({ className }: { className?: string }) {
           {sessions.map((s) => (
             <button
               key={s.key}
-              onClick={() => setSelected(s.key)}
+              onClick={() => pick(s.key)}
               className={cn(
                 'flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-xs transition',
                 selected === s.key
                   ? 'bg-contrast text-ink'
                   : 'text-ink-3 hover:bg-elevated hover:text-ink'
               )}
-              title={`${s.user}@${s.host} · ${s.mode} · ${
-                s.origin === 'desktop' ? '桌面发起' : 'agent 发起'
-              }`}
+              title={`${s.user}@${s.host} · ${s.mode} · agent 发起`}
             >
               <span
                 className={cn(
@@ -664,16 +564,6 @@ export function TerminalPanel({ className }: { className?: string }) {
             </button>
           )}
           <button
-            onClick={() => setConnectOpen((v) => !v)}
-            title="快速连接"
-            className={cn(
-              'rounded p-1.5 transition',
-              connectOpen ? 'bg-contrast text-sky-300' : 'text-ink-3 hover:bg-elevated hover:text-ink'
-            )}
-          >
-            <Plus className="h-4 w-4" />
-          </button>
-          <button
             onClick={() => setRefreshKey((k) => k + 1)}
             title="刷新会话/频道列表"
             className="rounded p-1.5 text-ink-3 transition hover:bg-elevated hover:text-ink"
@@ -682,57 +572,6 @@ export function TerminalPanel({ className }: { className?: string }) {
           </button>
         </div>
       </header>
-
-      {connectOpen && (
-        <div className="flex flex-wrap items-center gap-2 border-b border-line bg-panel px-3 py-2 text-xs">
-          {(
-            [
-              ['name', '别名*'],
-              ['host', '主机'],
-              ['port', '端口'],
-              ['user', '用户'],
-              ['token', 'Token/密码*', 'password'],
-            ] as const
-          ).map(([k, label, type]) => (
-            <label key={k} className="flex items-center gap-1">
-              <span className="text-ink-4">{label}</span>
-              <input
-                type={type === 'password' ? 'password' : 'text'}
-                value={form[k]}
-                onChange={(e) => setForm((f) => ({ ...f, [k]: e.target.value }))}
-                className="w-28 rounded border border-line-strong bg-app px-1.5 py-1 text-ink outline-none focus:border-accent"
-              />
-            </label>
-          ))}
-          <label className="flex items-center gap-1">
-            <span className="text-ink-4">模式</span>
-            <select
-              value={form.mode}
-              onChange={(e) => setForm((f) => ({ ...f, mode: e.target.value }))}
-              className="rounded border border-line-strong bg-app px-1.5 py-1 text-ink outline-none"
-            >
-              <option value="shell">shell（堡垒机）</option>
-              <option value="exec">exec（普通服务器）</option>
-            </select>
-          </label>
-          <button
-            onClick={() => void onConnect()}
-            disabled={connecting}
-            className={cn(
-              'rounded-md px-3 py-1.5 text-xs font-medium transition',
-              connecting
-                ? 'cursor-wait bg-elevated text-ink-3'
-                : 'bg-sky-600 text-white hover:bg-sky-500'
-            )}
-          >
-            {connecting ? '连接中…' : '连接'}
-          </button>
-          {connectErr && <span className="text-danger">{connectErr}</span>}
-          <span className="text-[10px] text-ink-4">
-            与 agent 共用会话；连接后可直接在此终端操作，agent 也能使用
-          </span>
-        </div>
-      )}
 
       <div className="relative min-h-0 flex-1">
         {selected ? (
@@ -744,14 +583,7 @@ export function TerminalPanel({ className }: { className?: string }) {
             />
             {deadReason && (
               <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-2">
-                {selected === LOCAL ? (
-                  <button
-                    onClick={restartLocal}
-                    className="pointer-events-auto rounded bg-elevated px-2 py-1 text-[10px] text-danger"
-                  >
-                    本地终端已退出（{deadReason}）— 点击重启
-                  </button>
-                ) : isLocalKey(selected) ? (
+                {isLocalKey(selected) ? (
                   <span className="rounded bg-elevated px-2 py-1 text-[10px] text-danger">
                     频道已消失（{deadReason}）— 自动重连中
                   </span>
@@ -772,9 +604,9 @@ export function TerminalPanel({ className }: { className?: string }) {
           </>
         ) : (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-ink-4">
-            <p className="text-xs">无 SSH 会话</p>
+            <p className="text-xs">暂无终端</p>
             <p className="max-w-[24rem] text-center text-[10px] leading-relaxed">
-              agent 通过 ssh 工具连接后这里会实时显示；也可以点右上角 + 用 Token 直连堡垒机
+              当前对话还没有 agent 输出。agent 执行命令后会自动显示；SSH 连接后会新增标签页，点击查看。
             </p>
           </div>
         )}

@@ -2,7 +2,6 @@ import { create } from 'zustand'
 import {
   connectStream,
   deleteSession,
-  getAgents,
   getHealth,
   getHistory,
   truncateConversation,
@@ -16,7 +15,6 @@ import {
   type CronJobInfo,
   type McpServer,
   type SchedulerHealth,
-  type ServeAgent,
   type ServeEvent,
   type ServeStream,
   type SkillInfo,
@@ -33,11 +31,7 @@ import {
   type WindowState,
 } from './lib/desktop'
 
-export type EngineKind = 'xihe' | 'codebuddy'
-export type AgentShape = 'process' | 'connector'
-export type AgentStatus = 'online' | 'offline'
-
-/** One conversation within an agent. `id` is the serve conv_id. */
+/** One conversation. `id` is the serve conv_id. */
 export interface ConvMeta {
   id: string
   title: string
@@ -46,6 +40,10 @@ export interface ConvMeta {
    *  server round-trip — DELETE on a conv serve never created returns
    *  deleted:false, which must not block local removal. */
   synced?: boolean
+  /** A turn is streaming in this conversation right now (serve truth on
+   *  sync; WS turn_start/complete keep it live between syncs). Sidebar
+   *  badges the title with a spinner. */
+  running?: boolean
 }
 
 /** A reusable working directory the user can bind a conversation to. Desktop-only;
@@ -56,30 +54,9 @@ export interface Workspace {
   workdir: string
 }
 
-export interface Agent {
-  id: string
-  name: string
-  engine: EngineKind
-  shape: AgentShape
-  status: AgentStatus
-  model: string
-  /** capability descriptor — UI branches on these flags, never on engine name */
-  capabilities: string[]
-  description: string
-  /** where this agent's truth lives — shows the data-ownership split */
-  dataRoot?: string
-  /** true → sendMessage routes through `xihe serve` (WS). */
-  serveBacked?: boolean
-  /** conversations owned by this agent; a new one = a new conv_id */
-  conversations: ConvMeta[]
-  /** conversation currently shown in the chat panel; null = no conversation
-   *  selected (empty list / boot) → chat shows a "start new chat" CTA. */
-  activeConvId: string | null
-}
-
 export type TraceEvent =
   | { kind: 'thought'; text: string; ts?: number; by?: string }
-  | { kind: 'tool'; name: string; args: string; status: 'running' | 'done' | 'interrupted'; elapsed?: number; result?: string; truncated?: boolean; ts?: number; by?: string; id?: number }
+  | { kind: 'tool'; name: string; args: string; status: 'running' | 'done' | 'interrupted'; elapsed?: number; result?: string; truncated?: boolean; ts?: number; by?: string; id?: number; approval?: { decision: string; summary: string; reason?: string; always?: boolean } }
   | { kind: 'steer'; text: string }
 
 /** Approval card state on an assistant bubble — set by approval_request,
@@ -94,6 +71,17 @@ export interface PendingApproval {
   /** Raw tool-args JSON (serve-side cap 64K) — the 查看变更 preview reads it.
    *  Absent on older cores / non-args events. */
   args?: string
+}
+
+/** Clarify card state on an assistant bubble — set by clarify_request,
+ *  settled by the user's answer (optimistic) or clarify_resolved. */
+export interface PendingClarify {
+  id: string
+  question: string
+  options: string[]
+  status: 'pending' | 'answered' | 'expired'
+  /** The delivered answer once known (own click or the resolved event). */
+  answer?: string
 }
 
 /** One-shot comparison payload for a diff tab (Monaco DiffEditor). */
@@ -122,17 +110,23 @@ export interface Message {
   id: string
   role: 'user' | 'assistant'
   content: string
+  /** 附件（仅用户消息）：live 发送时本地记录；历史同步时来自 serve 的
+   *  attachments 列（图片带 desc 描述，气泡可作 title 展示）。图片路径
+   *  渲染经 xfile:// 特权协议。 */
+  attachments?: { name: string; path: string; size?: number; desc?: string }[]
   /** ISO timestamp — set locally on live sends, from serve DB rows on
    *  history sync. Rendered as HH:mm on the message bubble. */
   ts?: string
-  /** serve row id of the user row (history-synced messages only) — addresses
+  /** serve row uuid of the user row (history-synced messages only) — addresses
    * the message server-side for resend truncation. */
-  serveId?: number
+  serveId?: string
   pending?: boolean
   error?: boolean
   /** live approval card for this turn (at most one: approval tools are all
    *  write → sequential dispatch on the server) */
   pendingApproval?: PendingApproval
+  /** live clarify card for this turn (at most one) */
+  pendingClarify?: PendingClarify
   /** Stop clicked — optimistic, shown until the turn finalises */
   stopping?: boolean
   /** Turn ended because the user stopped it (authoritative, from complete.reason) */
@@ -142,9 +136,9 @@ export interface Message {
   incomplete?: boolean
   /** ordered tool/thought events for an assistant turn (rendered as a trace) */
   trace?: TraceEvent[]
-  /** Historical turns: serve row id to lazy-fetch `trace` on expand (absent
+  /** Historical turns: serve row uuid to lazy-fetch `trace` on expand (absent
    *  on live turns, which accumulate trace from the stream). */
-  traceAnchor?: number
+  traceAnchor?: string
   /** Historical turns: tool-call count shown in the trace header before the
    *  trace is lazy-loaded (>0 → render the collapsed header). */
   toolsCount?: number
@@ -154,12 +148,28 @@ export interface Message {
   /** Token usage of this turn (live: from the complete event; history: from
    *  the persisted final assistant row) — rendered as a cost badge. */
   usage?: TurnUsage
+  /** History-synced only: first message of a post-reset round — a reset
+   *  divider renders before it. */
+  roundStart?: boolean
+  /** Reset reason label source ('manual' | 'idle' | 'daily'); absent when
+   *  the boundary predates reason persistence. */
+  resetReason?: string
+  /** Synthetic trailing marker: render ONLY the reset divider, no bubble —
+   *  a reset whose round has no messages yet. */
+  dividerOnly?: boolean
 }
 
 interface DesktopState {
-  agents: Agent[]
-  selectedAgentId: string | null
-  /** keyed by conv_id (not agent id) — one message list per conversation */
+  // [[0026]]: xihe is the single BUILT-IN agent; claude/codex are reached via
+  // its external_agent tool, never as peer desktop agents.
+  /** all conversations of the built-in agent; a new one = a new conv_id */
+  conversations: ConvMeta[]
+  /** conversation currently shown in the chat panel; null = no conversation
+   *  selected (empty list / boot) → chat shows a "start new chat" CTA. */
+  activeConvId: string | null
+  /** model name of the connected serve (from /health); null until connected */
+  serveModel: string | null
+  /** keyed by conv_id — one message list per conversation */
   sessions: Record<string, Message[]>
   serveConnected: boolean
   serveVersion: string | null
@@ -168,7 +178,7 @@ interface DesktopState {
    *  decides WHEN to attempt a connection; `serveConnected` (WS truth) decides
    *  whether streaming actually SUCCEEDED. See applyXiheStatus for coordination. */
   xiheStatus: XiheStatus | null
-  /** Desktop-wide (process-level, not per-agent) listings for the "管理" panel.
+  /** Desktop-wide process-level listings for the "管理" panel.
    *  Loaded lazily by loadManageData() when the panel mounts / serve connects —
    *  not fetched on every connectServe (avoid hitting 3 endpoints nobody opens). */
   mcpServers: McpServer[]
@@ -190,30 +200,29 @@ interface DesktopState {
    *  (switching conversations), where a later browser tool call in the new
    *  conversation should still auto-open the panel. */
   dismissBrowserPanel: () => void
-  /** Terminal-panel visibility (bottom drawer over the chat). Same auto-open
-   *  contract as the browser panel: agent ssh tool calls pop it unless the
-   *  user closed it this turn. Sessions are cross-conversation (they live in
-   *  serve's registry), so there is no dismiss-on-conv-switch. */
+  /** Terminal-panel visibility (bottom drawer over the chat). Fully manual —
+   *  nothing auto-opens it; the user toggles the toolbar button. */
   showTerminal: boolean
-  terminalAutoMuted: boolean
   setShowTerminal: (v: boolean) => void
-  /** Pending terminal-panel focus set by an agent tool run in the ACTIVE
-   *  conversation: its console channel (terminal tool) or the next new
-   *  resident-process channel under that session (process tool). Consumed by
-   *  the panel; runs in background conversations never set it. */
+  /** Pending terminal-panel focus: the next new resident-process channel
+   *  under the active conversation's session. Consumed by the panel, or
+   *  dropped when the user has pinned a tab. (Auto-OPEN was removed — this
+   *  only steers the tab when the panel is ALREADY open.) */
   agentTermTarget:
     | { kind: 'conv'; key: string }
     | { kind: 'proc'; sessionKey: string }
     | null
   clearAgentTermTarget: () => void
-  /** Run-panel visibility (bottom drawer, workbench-adjacent). */
-  showRun: boolean
-  setShowRun: (v: boolean) => void
-  /** One-shot prefill delivered when a Play entry (editor tab / tree row)
-   *  opens the panel — consumed by RunPanel, then cleared. */
-  runCmdDraft: string | null
-  openRunPanel: (cmd?: string) => void
-  clearRunCmdDraft: () => void
+  /** Shell-panel visibility (the user's local terminals — a window-level
+   *  bottom drawer, full-width in every layout). Pure user toggle, scoped to
+   *  neither conversation nor workspace. */
+  showShell: boolean
+  setShowShell: (v: boolean) => void
+  /** One-shot command delivered when a Play entry (editor tab / tree row)
+   *  opens the panel — runs in a NEW shell tab, then cleared. */
+  shellCmdDraft: string | null
+  openShellPanel: (cmd?: string) => void
+  clearShellCmdDraft: () => void
   /** conv_id → serve session_key (recorded from turn_start). The terminal
    *  panel uses the ACTIVE conversation's key when quick-connecting so the
    *  session is grouped with it; agent-triggered sessions carry it already. */
@@ -225,45 +234,51 @@ interface DesktopState {
    *  syncConversations rebuilds). Absent key = 通用/unbound. */
   convWorkspace: Record<string, string>
   /** Non-null while "inside" a workspace: the sidebar then shows that
-   *  workspace's bound conversations instead of the agent list, and the file
-   *  tree is shown on the right. null = the ordinary agent-centric view. */
+   *  workspace's bound conversations instead of the full list, and the file
+   *  tree is shown on the right. null = the ordinary conversation list. */
   activeWorkspaceId: string | null
   /** Effective xihe config from ~/.xihe-agent/config.yaml (single source).
    *  Empty until hydrateXiheConfig() runs on mount; api_key is present only as
    *  api_key_set (never the plaintext). */
   xiheConfig: XiheConfig
-  select: (id: string) => void
-  sendMessage: (agentId: string, text: string) => void
+  sendMessage: (
+    text: string,
+    plan?: boolean,
+    regenerate?: boolean,
+    attachments?: { name: string; path: string; size?: number; desc?: string }[]
+  ) => void
   /** Resend a user message: truncate the conversation to before it (serve
    * rows + local state) and send its text again as a fresh turn. No-ops while
    * a turn is streaming or serve is unreachable. */
-  resendMessage: (agentId: string, index: number) => Promise<void>
+  resendMessage: (index: number) => Promise<void>
   /** Edit a user message and resend it: same rollback as resendMessage, but
    * the edited text replaces the original as the fresh turn. */
-  editAndResendMessage: (agentId: string, index: number, newText: string) => Promise<void>
+  editAndResendMessage: (index: number, newText: string) => Promise<void>
   /** Regenerate an assistant reply: keep the user message before it, truncate
    * from the turn's first row, and re-send that user message. */
-  regenerateMessage: (agentId: string, index: number) => Promise<void>
-  interrupt: (agentId: string) => void
-  steer: (agentId: string, text: string) => void
+  regenerateMessage: (index: number) => Promise<void>
+  interrupt: () => void
+  steer: (text: string) => void
   /** Answer the active turn's pending approval card (approve/deny buttons).
    *  always pairs with approval ("本会话不再询问" — session memory server-side). */
-  approve: (agentId: string, id: string, approved: boolean, always?: boolean) => void
-  newConversation: (agentId: string) => void
-  selectConversation: (agentId: string, convId: string) => void
-  resetConversation: (agentId: string, convId: string) => Promise<void>
-  deleteConversation: (agentId: string, convId: string) => Promise<void>
-  /** Rename a conversation. serve-backed + already on the server → POST /title
+  approve: (id: string, approved: boolean, always?: boolean) => void
+  /** Answer the active turn's pending clarify card (option click / free text). */
+  answerClarify: (id: string, answer: string) => void
+  newConversation: () => void
+  selectConversation: (convId: string) => void
+  resetConversation: (convId: string) => Promise<void>
+  deleteConversation: (convId: string) => Promise<void>
+  /** Rename a conversation. Connected + already on the server → POST /title
    *  (persists; xihe's auto-title skips sessions that already have a title, so a
    *  manual rename sticks). An unsent "新对话" (synced !== true) has no serve
    *  session yet → skip the round-trip and rename locally only (its first send
    *  will create the session and run auto-title, which may overwrite — an
    *  accepted edge case). */
-  renameConversation: (agentId: string, convId: string, title: string) => Promise<void>
+  renameConversation: (convId: string, title: string) => Promise<void>
   /** Reload a conversation's transcript from serve + refresh the list (picks up
    *  serve-generated titles). `convId` targets a specific conversation (the
    *  per-conv refresh button — opens it + reloads); omit for the active one. */
-  refreshConversation: (agentId: string, convId?: string) => Promise<void>
+  refreshConversation: (convId?: string) => Promise<void>
   setTab: (tab: 'chat' | 'manage' | 'store' | 'knowledge') => void
   addWorkspace: (workdir: string, name?: string) => void
   removeWorkspace: (id: string) => void
@@ -272,7 +287,7 @@ interface DesktopState {
    *  recent bound one (or seed a fresh bound conv if it has none), land on the
    *  chat tab. The middle/right panes follow because the active conv is bound. */
   openWorkspace: (workspaceId: string) => void
-  /** Leave workspace view; the sidebar returns to the agent-centric list. */
+  /** Leave workspace view; the sidebar returns to the full conversation list. */
   exitWorkspace: () => void
   hydrateWorkspaceStore: () => Promise<void>
   /** Read effective xihe config from ~/.xihe-agent/config.yaml into state. */
@@ -327,12 +342,8 @@ interface DesktopState {
   /** Lazy-load a historical turn's tool-call trace from serve by its anchor
    *  row id, writing it onto the message so the trace panel can render it.
    *  No-op if the message isn't found or already has a trace. */
-  loadTrace: (convId: string, msgId: number) => Promise<void>
+  loadTrace: (convId: string, msgId: string) => Promise<void>
 }
-
-// [[0026]]: Agent = TYPE. xihe is the single BUILT-IN agent; claude is reached
-// via xihe's external_agent tool, not as a peer agent.
-const LIVE_SLOT_ID = 'xihe'
 
 // View-state restore bookkeeping. `wsHydrated` gates the window-state writer —
 // before the store file has been read, boot-time nulls must not clobber it.
@@ -353,15 +364,14 @@ let tabBuckets: Record<string, { tabs: EditorTab[]; active: string | null }> = {
 
 /** Bucket key for the current view: the workspace the ACTIVE conversation is
  *  bound to (what the tree/editor act on), '' when unbound. */
-function tabKeyOf(s: { agents: Agent[]; convWorkspace: Record<string, string> }): string {
-  const convId = s.agents.find((a) => a.id === LIVE_SLOT_ID)?.activeConvId
-  return (convId && s.convWorkspace[convId]) || ''
+function tabKeyOf(s: { activeConvId: string | null; convWorkspace: Record<string, string> }): string {
+  return (s.activeConvId && s.convWorkspace[s.activeConvId]) || ''
 }
 
 /** This window's persisted record — a pure function of live state + the tab
  *  buckets, so every writer computes it fresh with no copy to keep in sync. */
 function windowRecordOf(s: {
-  agents: Agent[]
+  activeConvId: string | null
   activeWorkspaceId: string | null
   workspaces: Workspace[]
 }): WindowState {
@@ -381,7 +391,7 @@ function windowRecordOf(s: {
   return {
     id: WINDOW_ID,
     workspaceId: s.activeWorkspaceId,
-    convId: s.agents.find((x) => x.id === LIVE_SLOT_ID)?.activeConvId ?? null,
+    convId: s.activeConvId,
     tabsByWorkspace,
   }
 }
@@ -389,22 +399,6 @@ function windowRecordOf(s: {
 /** Resident transcript cache ceiling — beyond this, oldest non-active convs are
  *  evicted from `sessions` (their transcript refetches lazily on reopen). */
 const MAX_SESSIONS = 16
-
-const SEED_AGENTS: Agent[] = [
-  {
-    id: 'xihe',
-    name: 'xihe',
-    engine: 'xihe',
-    shape: 'process',
-    status: 'offline',
-    model: 'glm-5.2-zp',
-    capabilities: ['shell', 'browser', 'mcp', 'interrupt', 'escalation'],
-    description: '内置xihe agent。',
-    dataRoot: '.xihe-agent/',
-    conversations: [],
-    activeConvId: null,
-  },
-]
 
 export const useStore = create<DesktopState>()((set, get) => {
   let stream: ServeStream | null = null
@@ -459,13 +453,13 @@ export const useStore = create<DesktopState>()((set, get) => {
 
   /** Keep the resident transcript cache bounded: evict the oldest
    * non-protected conv entries (whole key — reopening lazily refetches from
-   * serve, `convId in sessions` is the cache sentinel). Protected: every
-   * agent's active conv and any conv with a live turn. */
+   * serve, `convId in sessions` is the cache sentinel). Protected: the
+   * active conv and any conv with a live turn. */
   function trimSessions() {
     const s = get()
     const keys = Object.keys(s.sessions)
     if (keys.length <= MAX_SESSIONS) return
-    const protect = new Set(s.agents.map((a) => a.activeConvId ?? ''))
+    const protect = new Set([s.activeConvId ?? ''])
     for (const k of keys) {
       if ((s.sessions[k] ?? []).some((m) => m.role === 'assistant' && m.pending))
         protect.add(k)
@@ -514,9 +508,8 @@ export const useStore = create<DesktopState>()((set, get) => {
    *  missing-正在思考… bug); a turn that COMPLETED while we were away is
    *  settled by the attached{running:false} ack's force-refetch instead. */
   async function resyncAfterReconnect() {
-    const a = get().agents.find((x) => x.id === LIVE_SLOT_ID)
-    const convId = a?.activeConvId
-    if (!a?.serveBacked || !convId || !get().serveConnected) return
+    const convId = get().activeConvId
+    if (!convId || !get().serveConnected) return
     stream?.attach(convId)
     await refetchConv(convId)
   }
@@ -545,34 +538,6 @@ export const useStore = create<DesktopState>()((set, get) => {
       if (e.name.startsWith('browser_') && !get().browserAutoMuted) {
         set({ showBrowser: true })
       }
-      // Same contract for the terminal drawer: an ssh tool in flight means
-      // there is (or is about to be) a live session worth watching.
-      if (e.name.startsWith('ssh_') && !get().terminalAutoMuted) {
-        set({ showTerminal: true })
-      }
-      // The agent's local runs stream into per-conversation console channels
-      // (terminal tool) and per-process channels (process tool) — open the
-      // drawer and focus that channel so the run is watchable live. Only the
-      // ACTIVE conversation may yank the panel; a background conversation's
-      // channels are still listed (tabs), just not auto-followed.
-      if (
-        (e.name === 'terminal' || e.name === 'process') &&
-        !get().terminalAutoMuted
-      ) {
-        const st = get()
-        const activeConv = st.agents.find((a) => a.id === st.selectedAgentId)
-          ?.activeConvId
-        if (e.conv_id === activeConv) {
-          const sk = st.convSessionKeys[e.conv_id] ?? ''
-          set({
-            showTerminal: true,
-            agentTermTarget:
-              e.name === 'terminal'
-                ? { kind: 'conv', key: `conv:${sk}` }
-                : { kind: 'proc', sessionKey: sk },
-          })
-        }
-      }
       patchPending(e.conv_id, (m) => {
         const trace = m.trace ? m.trace.slice() : []
         trace.push({ kind: 'tool', name: e.name, args: e.args, status: 'running', ts: Date.now(), by: e.by, id: e.id })
@@ -585,28 +550,47 @@ export const useStore = create<DesktopState>()((set, get) => {
       if (e.name === 'write_file' || e.name === 'patch') {
         set((s) => ({ fsVersion: s.fsVersion + 1 }))
       }
-      // No call id in the protocol → match the earliest running tool with the
-      // same name (FIFO), preferring the same source (`by`) so main-agent and
-      // child tools sharing a name don't cross-pair. Best-effort for parallel
-      // same-name tools (display only).
+      // Pair the result with its running tool_call by echoed ring id —
+      // exact even for parallel same-name tools. A result whose id matches
+      // nothing (duplicate resolve / stale) is dropped.
       patchPending(e.conv_id, (m) => {
         if (!m.trace) return m
         const trace = m.trace.slice()
-        const isRunningNamed = (by?: string) => (t: TraceEvent) =>
-          t.kind === 'tool' && t.name === e.name && t.status === 'running' && t.by === by
-        let idx = trace.findIndex(isRunningNamed(e.by))
-        if (idx < 0) idx = trace.findIndex(isRunningNamed(undefined))
-        const cur = idx >= 0 ? trace[idx] : undefined
-        if (cur && cur.kind === 'tool')
+        const idx = trace.findIndex(
+          (t) => t.kind === 'tool' && t.status === 'running' && t.id === e.id)
+        if (idx < 0) return { ...m, trace }
+        const cur = trace[idx]
+        if (cur.kind === 'tool')
           trace[idx] = { ...cur, status: 'done', elapsed: e.elapsed, result: e.result, truncated: e.truncated }
         return { ...m, trace }
       })
     }
     else if (e.type === 'turn_start') {
+      // Sidebar spinner: this conv has a live turn now (cleared on
+      // complete/error — syncConversations re-syncs serve truth later).
+      setConvRunning(e.conv_id, true)
       // Record the conv's serve session_key — the terminal panel joins
       // desktop quick-connects to the conversation they were opened from.
       if (e.session_key && !get().convSessionKeys[e.conv_id])
         set((s) => ({ convSessionKeys: { ...s.convSessionKeys, [e.conv_id]: e.session_key } }))
+      // This send crossed a reset boundary server-side (auto reset fires
+      // inside get_or_create_session, after our optimistic append): flag the
+      // just-appended user bubble so the round divider shows live, not only
+      // after the next transcript refetch.
+      if (e.auto_reset) {
+        set((s) => {
+          const list = s.sessions[e.conv_id]
+          if (!list) return {}
+          for (let i = list.length - 1; i >= 0; i--) {
+            if (list[i].role === 'user') {
+              const next = list.slice()
+              next[i] = { ...next[i], roundStart: true, resetReason: e.auto_reset ?? undefined }
+              return { sessions: { ...s.sessions, [e.conv_id]: next } }
+            }
+          }
+          return {}
+        })
+      }
       // The pending assistant bubble is created optimistically in
       // sendMessage. Interrupt targets conv_id, not turn_id.
     } else if (e.type === 'cron_result') {
@@ -624,11 +608,10 @@ export const useStore = create<DesktopState>()((set, get) => {
           },
         }))
       }
-      const owner = owningAgent(convId)
-      if (owner) void syncConversations(owner.id)
+      void syncConversations()
       // 任务跑完，调度列表里的 next/last/state 已变——顺带刷新管理面板数据
       void get().loadManageData()
-      const isActive = get().agents.some((a) => a.activeConvId === convId)
+      const isActive = get().activeConvId === convId
       if (!isActive) {
         // 主进程通知（web Notification 在 Windows 开发构建下静默失败）
         void desktop.notify('xihe 定时任务', (e.text ?? '').slice(0, 120))
@@ -656,6 +639,31 @@ export const useStore = create<DesktopState>()((set, get) => {
           args: e.args,
         },
       }))
+    } else if (e.type === 'clarify_request') {
+      patchPending(e.conv_id, (m) => ({
+        ...m,
+        pendingClarify: {
+          id: e.id,
+          question: e.question,
+          options: e.options ?? [],
+          status: 'pending',
+        },
+      }))
+    } else if (e.type === 'clarify_resolved') {
+      // Authoritative for every path but our own click (which settles
+      // optimistically below): the other client's answer, timeout, interrupt.
+      patchPending(e.conv_id, (m) => {
+        const cl = m.pendingClarify
+        if (!cl || cl.id !== e.id || cl.status !== 'pending') return m
+        return {
+          ...m,
+          pendingClarify: {
+            ...cl,
+            status: e.status === 'answered' ? 'answered' : 'expired',
+            answer: e.answer ?? undefined,
+          },
+        }
+      })
     } else if (e.type === 'approval_resolved') {
       // Every resolution path lands here — the other client's reply, timeout,
       // interrupt. Our own button click already settled the card optimistically;
@@ -672,6 +680,14 @@ export const useStore = create<DesktopState>()((set, get) => {
         }
       })
     } else if (e.type === 'complete') {
+      setConvRunning(e.conv_id, false)
+      // Turn settled: drop a proc target the turn may still hold (a start
+      // whose channel never appeared).
+      {
+        const t = get().agentTermTarget
+        if (t?.kind === 'proc' && get().convSessionKeys[e.conv_id] === t.sessionKey)
+          set({ agentTermTarget: null })
+      }
       const interrupted = e.reason === 'interrupted'
       // chat() returns "API error: …" as text instead of raising — flag it so
       // the bubble renders as an error, not a normal reply.
@@ -687,21 +703,21 @@ export const useStore = create<DesktopState>()((set, get) => {
         error: failed || undefined,
         usage: e.usage,
         pendingApproval: expireApproval(m.pendingApproval),
+        pendingClarify: expireClarify(m.pendingClarify),
         trace: sweepRunningTools(m.trace, interrupted ? 'interrupted' : 'done'),
       }))
-      const owner = owningAgent(e.conv_id)
-      if (owner?.serveBacked && get().serveConnected) {
+      if (get().serveConnected) {
         // Refresh the conversation list so a serve-generated title (first turn)
         // appears and the list re-sorts by recency. syncConversations never
         // touches messages, so the just-finalised content is safe.
-        void syncConversations(owner.id)
+        void syncConversations()
         // serve generates the session title on a fire-and-forget aux-LLM thread
         // started inside agent.chat, which lands AFTER `complete` — so the
         // sync above usually reads the row before its title is written. Re-sync
         // a moment later to pick up the generated title (manual refresh covers
         // the slow-aux tail).
         setTimeout(() => {
-          if (get().serveConnected) void syncConversations(owner.id)
+          if (get().serveConnected) void syncConversations()
         }, 2500)
       }
       trimSessions()
@@ -713,8 +729,10 @@ export const useStore = create<DesktopState>()((set, get) => {
         stopping: undefined,
         error: true,
         pendingApproval: expireApproval(m.pendingApproval),
+        pendingClarify: expireClarify(m.pendingClarify),
         trace: sweepRunningTools(m.trace),
       }))
+      if (e.conv_id) setConvRunning(e.conv_id, false)
     }
     // hello: connection metadata, already applied via connectServe
   }
@@ -774,22 +792,28 @@ export const useStore = create<DesktopState>()((set, get) => {
     set((s) => ({ sessions: { ...s.sessions, [convId]: next } }))
   }
 
-  /** Which agent owns a conv_id (its conversation list contains it). conv_id may
-   *  be undefined for some event variants (e.g. `error`) → returns undefined. */
-  function owningAgent(convId: string | undefined): Agent | undefined {
-    if (!convId) return undefined
-    return get().agents.find((a) => a.conversations.some((c) => c.id === convId))
+  /** Flip a conversation's sidebar running flag in place (WS turn lifecycle:
+   *  turn_start / complete / error). No-op for unknown conv ids — a conv the
+   *  list doesn't know (e.g. deleted mid-turn) needs no badge. */
+  function setConvRunning(convId: string, running: boolean) {
+    set((s) => {
+      const idx = s.conversations.findIndex((c) => c.id === convId)
+      if (idx < 0 || !!s.conversations[idx].running === running) return {}
+      const next = s.conversations.slice()
+      next[idx] = { ...next[idx], running: running || undefined }
+      return { conversations: next }
+    })
   }
 
-  /** Rebuild an agent's conversation list from serve `/sessions`: server rows
+  /** Rebuild the conversation list from serve `/sessions`: server rows
    *  update title/order; local unsent new conversations (not yet on the server)
    *  are preserved at the top. Never touches messages. */
-  async function syncConversations(agentId: string) {
-    const a = get().agents.find((x) => x.id === agentId)
-    if (!a?.serveBacked || !get().serveConnected) return
+  async function syncConversations() {
+    if (!get().serveConnected) return
+    const { activeConvId: prevActive, conversations: prevConvs } = get()
     const rows = await listSessions()
     const serverIds = new Set(rows.map((r) => r.conv_id))
-    const localOnly = a.conversations.filter((c) => !serverIds.has(c.id))
+    const localOnly = prevConvs.filter((c) => !serverIds.has(c.id))
     // localOnly was snapshotted before the await; a sync/new-conv during it can
     // resurface a stale local copy beside its server copy, so dedupe.
     const merged: ConvMeta[] = []
@@ -797,7 +821,8 @@ export const useStore = create<DesktopState>()((set, get) => {
     for (const r of rows) {
       if (seen.has(r.conv_id)) continue
       seen.add(r.conv_id)
-      merged.push({ id: r.conv_id, title: r.title || '新对话', synced: true })
+      merged.push({ id: r.conv_id, title: r.title || '新对话', synced: true,
+                    running: r.running || undefined })
     }
     for (const c of localOnly) {
       if (seen.has(c.id)) continue
@@ -812,7 +837,7 @@ export const useStore = create<DesktopState>()((set, get) => {
     const prefer = restoredConvId
     restoredConvId = null
     const pickActive =
-      a.activeConvId ??
+      prevActive ??
       (prefer && merged.some((m) => m.id === prefer)
         ? prefer
         : merged.length > 0
@@ -827,9 +852,8 @@ export const useStore = create<DesktopState>()((set, get) => {
       if (r.session_key) keyAdds[r.conv_id] = r.session_key
     }
     set((s) => ({
-      agents: s.agents.map((x) =>
-        x.id === agentId ? { ...x, conversations: merged, activeConvId: pickActive } : x
-      ),
+      conversations: merged,
+      activeConvId: pickActive,
       convSessionKeys: Object.keys(keyAdds).length
         ? { ...s.convSessionKeys, ...keyAdds }
         : s.convSessionKeys,
@@ -839,23 +863,39 @@ export const useStore = create<DesktopState>()((set, get) => {
   /** Fetch + map a conversation's transcript from serve into Message[]. Shared
    *  by lazy first-load (loadActiveHistory) and forced reload (refreshConversation). */
   async function fetchHistory(convId: string): Promise<Message[]> {
-    const msgs = await getHistory(convId)
-    return msgs
+    const resp = await getHistory(convId)
+    const msgs = resp?.messages ?? []
+    const mapped: Message[] = msgs
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({
         id: uid(),
         role: m.role as 'user' | 'assistant',
         content: m.content,
         ts: m.ts,
-        serveId: m.role === 'user' && typeof m.id === 'number' ? m.id : undefined,
+        serveId: m.role === 'user' && typeof m.id === 'string' ? m.id : undefined,
         // Assistant turns fold their tool calls into a count + a stable anchor
-        // (serve row id); the trace itself is lazy-fetched on expand.
-        traceAnchor: typeof m.id === 'number' ? m.id : undefined,
+        // (serve row uuid); the trace itself is lazy-fetched on expand.
+        traceAnchor: typeof m.id === 'string' ? m.id : undefined,
         toolsCount: typeof m.tools === 'number' ? m.tools : undefined,
         hasReasoning: m.has_reasoning === true,
         incomplete: m.incomplete === true,
         usage: m.usage,
+        roundStart: m.round_start || undefined,
+        resetReason: m.reset_reason,
+        attachments: m.attachments?.length ? m.attachments : undefined,
       }))
+    // A reset with no messages in its round yet: append a trailing divider
+    // so the reset is visible immediately, not only on the next message.
+    if (resp?.pending_reset != null) {
+      mapped.push({
+        id: `reset-pending-${convId}`,
+        role: 'assistant',
+        content: '',
+        dividerOnly: true,
+        resetReason: resp.pending_reset || undefined,
+      })
+    }
+    return mapped
   }
 
   /** Replace a conv's transcript with freshly fetched history. Skips while a
@@ -877,12 +917,11 @@ export const useStore = create<DesktopState>()((set, get) => {
     return mapped
   }
 
-  /** Lazy-load persisted history from serve for the agent's active conversation
+  /** Lazy-load persisted history from serve for the active conversation
    *  (first open only — skips if already loaded). */
-  async function loadActiveHistory(agentId: string) {
-    const a = get().agents.find((x) => x.id === agentId)
-    if (!a?.serveBacked || !get().serveConnected) return
-    const convId = a.activeConvId
+  async function loadActiveHistory() {
+    if (!get().serveConnected) return
+    const convId = get().activeConvId
     if (!convId || convId in get().sessions) return
     const mapped = await fetchHistory(convId)
     set((s) => ({ sessions: { ...s.sessions, [convId]: mapped } }))
@@ -900,30 +939,46 @@ export const useStore = create<DesktopState>()((set, get) => {
     })
   }
 
-  /** Shared rollback for 重新发送/编辑重发: pull a fresh transcript, truncate
-   *  the conversation at the user bubble addressed by `index`, adopt the
-   *  post-truncate truth, then send `text` (null = re-send the row's own
+  /** Shared rollback for 重新发送/编辑重发/重新生成: pull a fresh transcript,
+   *  truncate the conversation at the user bubble addressed by `index`, adopt
+   *  the post-truncate truth, then send `text` (null = re-send the row's own
    *  content). No-op while a turn is streaming or serve is unreachable. */
-  async function rollbackAndSend(agentId: string, index: number, text: string | null) {
-    const a = get().agents.find((x) => x.id === agentId)
-    const convId = a?.activeConvId
-    if (!a || !convId || !a.serveBacked || !get().serveConnected) return
-    if ((get().sessions[convId] ?? []).some((m) => m.role === 'assistant' && m.pending))
+  async function rollbackAndSend(index: number, text: string | null,
+                                 opts: { regenerate?: boolean } = {}) {
+    const convId = get().activeConvId
+    if (!convId || !get().serveConnected) {
+      console.warn('[rollback] skipped: no active conv or serve disconnected')
       return
+    }
+    if ((get().sessions[convId] ?? []).some((m) => m.role === 'assistant' && m.pending)) {
+      console.warn('[rollback] skipped: a turn is still streaming')
+      return
+    }
     const mapped = await fetchHistory(convId)
     const target = mapped[index]
-    if (!target || target.role !== 'user' || target.serveId == null) return
+    if (!target || target.role !== 'user' || target.serveId == null) {
+      console.warn('[rollback] skipped: no user row with a serve id at index', index)
+      return
+    }
     const ok = await truncateConversation(convId, target.serveId)
-    if (!ok) return
+    if (!ok) {
+      console.warn('[rollback] truncate refused by serve (turn in progress?)')
+      return
+    }
     // Adopt the post-truncate truth (everything before the target), then
-    // let the normal send path append + stream the fresh turn.
+    // let the normal send path append + stream the fresh turn. `regenerate`
+    // tells serve to inject a no-persist "answer independently" hint — the
+    // industry regenerate semantics: the model must not anchor on its own
+    // earlier answer to the same prompt.
     set((s) => ({ sessions: { ...s.sessions, [convId]: mapped.slice(0, index) } }))
-    get().sendMessage(agentId, text ?? target.content)
+    // 重发保留原消息的附件（serve 重新注入路径提示，模型上下文不丢）。
+    get().sendMessage(text ?? target.content, undefined, opts.regenerate, target.attachments)
   }
 
   return {
-    agents: SEED_AGENTS,
-    selectedAgentId: SEED_AGENTS[0].id,
+    conversations: [],
+    activeConvId: null,
+    serveModel: null,
     sessions: {},
     serveConnected: false,
     serveVersion: null,
@@ -939,10 +994,9 @@ export const useStore = create<DesktopState>()((set, get) => {
     showBrowser: false,
     browserAutoMuted: false,
     showTerminal: false,
-    terminalAutoMuted: false,
     agentTermTarget: null,
-    showRun: false,
-    runCmdDraft: null,
+    showShell: false,
+    shellCmdDraft: null,
     convSessionKeys: {},
     // Empty until hydrateWorkspaceStore() loads ~/.xihe-desktop/workspaces.json
     // on app mount (file IO is async, so the store can't seed synchronously).
@@ -1045,40 +1099,25 @@ export const useStore = create<DesktopState>()((set, get) => {
 
     bumpFsVersion: () => set((s) => ({ fsVersion: s.fsVersion + 1 })),
 
-    select: (id) => {
-      // No activeWorkspaceId wipe here: the only caller is connectServe's boot
-      // path, which must not clobber the view hydrateWorkspaceStore restored
-      // (leaving a workspace view is exitWorkspace's job, bound to the rail
-      // button directly).
-      set({ selectedAgentId: id })
-      const a = get().agents.find((x) => x.id === id)
-      // serve-backed + connected → keep the conversation list fresh and load
-      // the active conversation's history on first open.
-      if (a?.serveBacked && get().serveConnected) {
-        // sync first (it may auto-select a conv when none is active), THEN load
-        // that conv's history — firing both concurrently makes load bail on the
-        // pre-sync null activeConvId and leaves the just-selected conv empty.
-        void syncConversations(id).then(() => loadActiveHistory(id))
-      }
-    },
-
-    sendMessage: (agentId, text) => {
-      const agent = get().agents.find((a) => a.id === agentId)
-      const convId = agent?.activeConvId
-      if (!convId || !agent) return
+    sendMessage: (text: string, plan?: boolean, regenerate?: boolean, attachments?: { name: string; path: string; size?: number; desc?: string }[]) => {
+      const convId = get().activeConvId
+      if (!convId) return
 
       const prev = get().sessions[convId] ?? []
-      const userMsg: Message = { id: uid(), role: 'user', content: text, ts: new Date().toISOString() }
+      const userMsg: Message = {
+        id: uid(), role: 'user', content: text, ts: new Date().toISOString(),
+        ...(attachments?.length ? { attachments } : {}),
+      }
       const pending: Message = { id: uid(), role: 'assistant', content: '', pending: true, ts: new Date().toISOString() }
-      // A fresh turn re-arms browser/terminal auto-open (the previous turn's
-      // explicit close only mutes within that turn).
+      // A fresh turn re-arms the browser panel's auto-open (an explicit close
+      // only mutes within that turn). The terminal drawer stays muted — its
+      // close means "stop popping this session" until a manual reopen.
       set((s) => ({
         sessions: { ...s.sessions, [convId]: [...prev, userMsg, pending] },
         browserAutoMuted: false,
-        terminalAutoMuted: false,
       }))
 
-      if (agent?.serveBacked && get().serveConnected && stream) {
+      if (get().serveConnected && stream) {
         // Resolve the conversation's bound workspace workdir so serve threads it
         // into the agent as cwd (relative paths + terminal then land in the
         // workspace). Unbound conv → undefined → frame carries no cwd → serve
@@ -1087,19 +1126,12 @@ export const useStore = create<DesktopState>()((set, get) => {
         const workdir = wsId
           ? get().workspaces.find((w) => w.id === wsId)?.workdir
           : undefined
-        stream.sendTurn(convId, text, workdir)
+        stream.sendTurn(convId, text, workdir, plan || undefined, regenerate || undefined, attachments?.length ? attachments : undefined)
         // First send creates the session server-side → mark synced so a later
         // delete knows to delete it there (not just locally).
         set((s) => ({
-          agents: s.agents.map((a) =>
-            a.id === agentId
-              ? {
-                  ...a,
-                  conversations: a.conversations.map((c) =>
-                    c.id === convId ? { ...c, synced: true } : c
-                  ),
-                }
-              : a
+          conversations: s.conversations.map((c) =>
+            c.id === convId ? { ...c, synced: true } : c
           ),
         }))
         return
@@ -1126,26 +1158,25 @@ export const useStore = create<DesktopState>()((set, get) => {
     // Live-sent messages carry no serve row id, so both rollback paths re-pull
     // the transcript before addressing the target server-side (indexes match
     // 1:1: the local list is either built from this same reshape or mirrors it).
-    resendMessage: (agentId, index) => rollbackAndSend(agentId, index, null),
+    resendMessage: (index) => rollbackAndSend(index, null),
 
-    editAndResendMessage: async (agentId, index, newText) => {
+    editAndResendMessage: async (index, newText) => {
       const t = newText.trim()
       if (!t) return
-      await rollbackAndSend(agentId, index, t)
+      await rollbackAndSend(index, t)
     },
 
-    regenerateMessage: async (agentId, index) => {
+    regenerateMessage: async (index) => {
       // Same rollback as 重新发送, addressed at the prompt row: truncate AT
       // the user message (deleting it together with the reply), then re-send
-      // its content. The old shape truncated at the assistant anchor — the
-      // user row survived server-side while sendMessage re-sent the same
-      // text, leaving the message duplicated locally AND in sessions.db.
-      await rollbackAndSend(agentId, index - 1, null)
+      // its content — flagged so serve injects the "answer independently"
+      // hint (industry regenerate semantics: the model must not see its own
+      // earlier answer to this prompt as something to defer to).
+      await rollbackAndSend(index - 1, null, { regenerate: true })
     },
 
-    interrupt: (agentId) => {
-      const a = get().agents.find((x) => x.id === agentId)
-      const convId = a?.activeConvId
+    interrupt: () => {
+      const convId = get().activeConvId
       if (!convId) return
       if (!stream) return
       stream.interrupt(convId)
@@ -1155,9 +1186,8 @@ export const useStore = create<DesktopState>()((set, get) => {
       patchPending(convId, (m) => ({ ...m, stopping: true }))
     },
 
-    steer: (agentId, text) => {
-      const a = get().agents.find((x) => x.id === agentId)
-      const convId = a?.activeConvId
+    steer: (text) => {
+      const convId = get().activeConvId
       if (!convId) return
       if (!stream) return
       stream.steer(convId, text)
@@ -1171,9 +1201,8 @@ export const useStore = create<DesktopState>()((set, get) => {
       })
     },
 
-    approve: (agentId, id, approved, always) => {
-      const a = get().agents.find((x) => x.id === agentId)
-      const convId = a?.activeConvId
+    approve: (id, approved, always) => {
+      const convId = get().activeConvId
       if (!convId) return
       if (!stream) return
       stream.approve(convId, id, approved, always)
@@ -1186,142 +1215,118 @@ export const useStore = create<DesktopState>()((set, get) => {
       })
     },
 
-    newConversation: (agentId) => {
-      const a = get().agents.find((x) => x.id === agentId)
+    answerClarify: (id, answer) => {
+      const convId = get().activeConvId
+      const text = answer.trim()
+      if (!convId || !text) return
+      if (!stream) return
+      stream.answerClarify(convId, id, text)
+      patchPending(convId, (m) => {
+        const cl = m.pendingClarify
+        if (!cl || cl.id !== id || cl.status !== 'pending') return m
+        return { ...m, pendingClarify: { ...cl, status: 'answered', answer: text } }
+      })
+    },
+
+    newConversation: () => {
       // Reuse the active conversation if it's still a blank, unsent "新对话" —
       // avoids a stack of identical empty entries from repeated clicks.
-      const cur = a?.conversations.find((c) => c.id === a.activeConvId)
+      const cur = get().conversations.find((c) => c.id === get().activeConvId)
       if (cur && !cur.synced && (get().sessions[cur.id] ?? []).length === 0) return
       const convId = 'desktop-' + uid()
       set((s) => ({
-        agents: s.agents.map((a) =>
-          a.id === agentId
-            ? {
-                ...a,
-                conversations: [{ id: convId, title: '新对话' }, ...a.conversations],
-                activeConvId: convId,
-              }
-            : a
-        ),
+        conversations: [{ id: convId, title: '新对话' }, ...s.conversations],
+        activeConvId: convId,
         sessions: { ...s.sessions, [convId]: [] },
       }))
       trimSessions()
     },
 
-    selectConversation: (agentId, convId) => {
-      set((s) => ({
-        selectedAgentId: agentId,
-        agents: s.agents.map((a) => (a.id === agentId ? { ...a, activeConvId: convId } : a)),
-      }))
+    selectConversation: (convId) => {
+      set({ activeConvId: convId })
       // First open → full load. Already cached → render the cache immediately,
       // then silently refetch in the background (cron pushes / cross-window
       // changes land in DB while the user is elsewhere). refetchConv's streaming
       // guard skips the replace for conversations mid-turn.
-      const agent = get().agents.find((a) => a.id === agentId)
-      if (agent?.activeConvId && agent.activeConvId in get().sessions) {
-        void refetchConv(agent.activeConvId)
+      if (convId in get().sessions) {
+        void refetchConv(convId)
       } else {
-        void loadActiveHistory(agentId)
+        void loadActiveHistory()
       }
     },
 
-    resetConversation: async (agentId, convId) => {
-      const a = get().agents.find((x) => x.id === agentId)
-      // serve-backed: reset server-side (starts a fresh session, same conv_id).
-      // Offline: just clear the local messages.
-      if (a?.serveBacked && get().serveConnected) {
-        const ok = await resetSession(convId)
-        if (!ok) return
+    resetConversation: async (convId) => {
+      // Connected: reset server-side — a fresh context round under the same
+      // conv. The transcript spans rounds server-side, so reload it (the
+      // pre-reset history stays visible); the title is conversation-scoped
+      // and survives the round switch. Offline: nothing server-backed to keep.
+      if (!get().serveConnected) {
+        set((s) => ({ sessions: { ...s.sessions, [convId]: [] } }))
+        return
       }
-      set((s) => ({
-        sessions: { ...s.sessions, [convId]: [] },
-        agents: s.agents.map((x) =>
-          x.id === agentId
-            ? {
-                ...x,
-                conversations: x.conversations.map((c) =>
-                  c.id === convId ? { ...c, title: '新对话' } : c
-                ),
-              }
-            : x
-        ),
-      }))
+      const ok = await resetSession(convId)
+      if (!ok) return
+      await refetchConv(convId)
     },
 
-    deleteConversation: async (agentId, convId) => {
-      const a = get().agents.find((x) => x.id === agentId)
+    deleteConversation: async (convId) => {
+      const wasActive = get().activeConvId === convId
       // If the live conv has a running turn, stop it first — otherwise the
       // turn keeps persisting and get_or_create_session would resurrect the
       // session we just deleted on its next write.
-      if (convId === a?.activeConvId) {
+      if (wasActive) {
         const list = get().sessions[convId] ?? []
         if (list.some((m) => m.role === 'assistant' && m.pending) && stream) {
           stream.interrupt(convId)
         }
       }
-      const conv = a?.conversations.find((c) => c.id === convId)
-      // Server-backed AND already on the server (sent once / seen in /sessions)
+      const conv = get().conversations.find((c) => c.id === convId)
+      // Connected AND already on the server (sent once / seen in /sessions)
       // → delete server-side, bail on real failure. An unsent "新对话" never
       // reached serve, so remove it locally without a round-trip — otherwise
       // DELETE returns deleted:false and the entry gets stuck undeletable.
-      if (a?.serveBacked && get().serveConnected && conv?.synced) {
+      if (get().serveConnected && conv?.synced) {
         const ok = await deleteSession(convId)
         if (!ok) return
       }
       set((s) => {
-        const agent = s.agents.find((x) => x.id === agentId)
-        if (!agent) return {}
-        const remaining = agent.conversations.filter((c) => c.id !== convId)
+        const remaining = s.conversations.filter((c) => c.id !== convId)
         const sessions = { ...s.sessions }
         delete sessions[convId]
         // Deleted the active one → fall back to the next conversation, or null
         // when that was the last one (the chat panel then shows its "start new
         // chat" empty state instead of forcing a phantom 新对话 back into
         // existence — the undeletable-conversation bug).
-        const conversations = remaining
         const activeConvId =
-          convId === agent.activeConvId
+          convId === s.activeConvId
             ? remaining.length > 0
               ? remaining[0].id
               : null
-            : agent.activeConvId
-        return {
-          sessions,
-          agents: s.agents.map((x) =>
-            x.id === agentId ? { ...x, conversations, activeConvId } : x
-          ),
-        }
+            : s.activeConvId
+        return { sessions, conversations: remaining, activeConvId }
       })
       // Deleted the active conversation → the fallback selection was never
       // opened this session; lazy-load its history like selectConversation
       // does, else it renders blank until manually re-selected.
-      if (convId === a?.activeConvId) void loadActiveHistory(agentId)
+      if (wasActive) void loadActiveHistory()
     },
 
-    renameConversation: async (agentId, convId, title) => {
+    renameConversation: async (convId, title) => {
       const t = title.trim()
       if (!t) return
-      const a = get().agents.find((x) => x.id === agentId)
-      const conv = a?.conversations.find((c) => c.id === convId)
-      // serve-backed AND already on the server → persist the rename there.
+      const conv = get().conversations.find((c) => c.id === convId)
+      // Connected AND already on the server → persist the rename there.
       // xihe's auto-title skips sessions that already have a title, so once this
       // lands the manual rename won't be overwritten. An unsent "新对话" has no
       // session yet → skip the POST (it 404s) and keep the name locally; its
       // first send creates the session and may auto-title over it (edge case).
-      if (a?.serveBacked && get().serveConnected && conv?.synced) {
+      if (get().serveConnected && conv?.synced) {
         const ok = await setConversationTitle(convId, t)
         if (!ok) return
       }
       set((s) => ({
-        agents: s.agents.map((x) =>
-          x.id === agentId
-            ? {
-                ...x,
-                conversations: x.conversations.map((c) =>
-                  c.id === convId ? { ...c, title: t } : c
-                ),
-              }
-            : x
+        conversations: s.conversations.map((c) =>
+          c.id === convId ? { ...c, title: t } : c
         ),
       }))
     },
@@ -1331,22 +1336,21 @@ export const useStore = create<DesktopState>()((set, get) => {
   // conversation list (which is how serve-generated titles sync back). Skips
   // the message reload while a turn is streaming — it would drop the in-flight
   // assistant bubble whose deltas are still arriving.
-  refreshConversation: async (agentId, convId) => {
-    const a = get().agents.find((x) => x.id === agentId)
-    if (!a?.serveBacked || !get().serveConnected) return
+  refreshConversation: async (convId) => {
+    if (!get().serveConnected) return
     // Target the given conversation (per-conv refresh button) or fall back to
     // the active one (top refresh button).
-    const target = convId ?? a.activeConvId
+    const target = convId ?? get().activeConvId
     if (!target) return
     // Open the target if it isn't already active. selectConversation leaves the
     // workspace view intact (it doesn't touch activeWorkspaceId), so refreshing
     // a conv from inside a workspace doesn't kick you out of it.
-    if (target !== a.activeConvId) get().selectConversation(agentId, target)
+    if (target !== get().activeConvId) get().selectConversation(target)
     // Force-reload its transcript from serve (overrides the lazy-load cache);
     // refetchConv skips while a turn is streaming.
     await refetchConv(target)
     // Refresh the list too — this is how serve-generated titles sync back.
-    await syncConversations(agentId)
+    await syncConversations()
   },
 
     setTab: (tab) => {
@@ -1367,22 +1371,16 @@ export const useStore = create<DesktopState>()((set, get) => {
 
     dismissBrowserPanel: () => set({ showBrowser: false }),
 
-    // Terminal drawer: same open/close semantics as the browser panel (open
-    // re-arms auto-open; explicit close mutes it for the rest of the turn).
-    setShowTerminal: (v) =>
-      set(
-        v
-          ? { showTerminal: true, terminalAutoMuted: false }
-          : { showTerminal: false, terminalAutoMuted: true }
-      ),
+    // Terminal drawer: pure user toggle — nothing auto-opens it.
+    setShowTerminal: (v) => set({ showTerminal: v }),
     clearAgentTermTarget: () => set({ agentTermTarget: null }),
 
-    // Run drawer: pure user toggle (no agent-driven auto-open). openRunPanel
-    // with a cmd carries a one-shot prefill from a Play entry point.
-    setShowRun: (v) => set({ showRun: v }),
-    openRunPanel: (cmd) =>
-      set({ showRun: true, runCmdDraft: cmd != null ? cmd : null }),
-    clearRunCmdDraft: () => set({ runCmdDraft: null }),
+    // Shell drawer: pure user toggle (no agent-driven auto-open).
+    // openShellPanel with a cmd runs it in a new shell tab (Play entry point).
+    setShowShell: (v) => set({ showShell: v }),
+    openShellPanel: (cmd) =>
+      set({ showShell: true, shellCmdDraft: cmd != null ? cmd : null }),
+    clearShellCmdDraft: () => set({ shellCmdDraft: null }),
 
     addWorkspace: (workdir, name) => {
       // Default name = last path segment (pure JS; the renderer can't use
@@ -1412,17 +1410,16 @@ export const useStore = create<DesktopState>()((set, get) => {
       persistWs()
     },
 
-    // Advanced path: always open a FRESH conversation (under the serve-backed
-    // xihe slot) bound to this workspace, and land on the chat tab. Unlike
-    // newConversation it always binds — this is the workspace fast path for
-    // advanced users (also the "新对话" button inside workspace view).
+    // Advanced path: always open a FRESH conversation bound to this workspace,
+    // and land on the chat tab. Unlike newConversation it always binds — this
+    // is the workspace fast path (also the "新对话" button inside workspace view).
     openConversationInWorkspace: (workspaceId) => {
       if (!get().workspaces.some((w) => w.id === workspaceId)) return
       // Reuse the active conv if it's still a blank, unsent "新对话" already
       // bound to this workspace — avoids a stack of empty entries from repeated
       // clicks in workspace view.
-      const a0 = get().agents.find((x) => x.id === LIVE_SLOT_ID)
-      const cur = a0?.conversations.find((c) => c.id === a0.activeConvId)
+      const activeConvId = get().activeConvId
+      const cur = get().conversations.find((c) => c.id === activeConvId)
       if (
         cur &&
         !cur.synced &&
@@ -1433,19 +1430,11 @@ export const useStore = create<DesktopState>()((set, get) => {
       }
       const convId = 'desktop-' + uid()
       set((s) => ({
-        selectedAgentId: LIVE_SLOT_ID,
         activeTab: 'chat',
         convWorkspace: { ...s.convWorkspace, [convId]: workspaceId },
         sessions: { ...s.sessions, [convId]: [] },
-        agents: s.agents.map((a) =>
-          a.id === LIVE_SLOT_ID
-            ? {
-                ...a,
-                conversations: [{ id: convId, title: '新对话' }, ...a.conversations],
-                activeConvId: convId,
-              }
-            : a
-        ),
+        conversations: [{ id: convId, title: '新对话' }, ...s.conversations],
+        activeConvId: convId,
       }))
       persistWs()
     },
@@ -1457,26 +1446,21 @@ export const useStore = create<DesktopState>()((set, get) => {
     // pane isn't empty.
     openWorkspace: (workspaceId) => {
       if (!get().workspaces.some((w) => w.id === workspaceId)) return
-      const a = get().agents.find((x) => x.id === LIVE_SLOT_ID)
-      const bound = a
-        ? a.conversations.filter((c) => get().convWorkspace[c.id] === workspaceId)
-        : []
+      const bound = get().conversations.filter(
+        (c) => get().convWorkspace[c.id] === workspaceId
+      )
       if (bound.length > 0) {
-        const convId = bound[0].id
-        set((s) => ({
-          selectedAgentId: LIVE_SLOT_ID,
+        set({
           activeWorkspaceId: workspaceId,
           activeTab: 'chat',
-          agents: s.agents.map((x) =>
-            x.id === LIVE_SLOT_ID ? { ...x, activeConvId: convId } : x
-          ),
-        }))
+          activeConvId: bound[0].id,
+        })
       } else {
         // No history yet — seed a blank bound conversation.
         get().openConversationInWorkspace(workspaceId)
         set({ activeWorkspaceId: workspaceId })
       }
-      void loadActiveHistory(LIVE_SLOT_ID)
+      void loadActiveHistory()
     },
 
     exitWorkspace: () => set({ activeWorkspaceId: null }),
@@ -1522,19 +1506,15 @@ export const useStore = create<DesktopState>()((set, get) => {
       // Race: connectServe's sync may have ALREADY picked a conversation (the
       // auto-pick couldn't see restoredConvId yet) — re-apply the restored one
       // on top. Conversations still empty → leave the preference for pickActive.
-      const a = get().agents.find((x) => x.id === LIVE_SLOT_ID)
-      if (restoredConvId && a?.conversations.some((c) => c.id === restoredConvId)) {
-        if (a.activeConvId !== restoredConvId) {
+      const convs = get().conversations
+      if (restoredConvId && convs.some((c) => c.id === restoredConvId)) {
+        if (get().activeConvId !== restoredConvId) {
           const convId = restoredConvId
-          set((s) => ({
-            agents: s.agents.map((x) =>
-              x.id === LIVE_SLOT_ID ? { ...x, activeConvId: convId } : x
-            ),
-          }))
-          void loadActiveHistory(LIVE_SLOT_ID)
+          set({ activeConvId: convId })
+          void loadActiveHistory()
         }
         restoredConvId = null
-      } else if ((a?.conversations.length ?? 0) > 0) {
+      } else if (convs.length > 0) {
         // Synced, but the restored conv is gone (deleted elsewhere / was an
         // unsent local 新对话) — the auto-pick stands.
         restoredConvId = null
@@ -1619,36 +1599,18 @@ export const useStore = create<DesktopState>()((set, get) => {
           set({ serveConnected: false })
           return false
         }
-        const remote = await getAgents()
         deliberateClose = false
-        set((s) => ({
+        set({
           serveConnected: true,
           serveVersion: health.version,
-          agents: s.agents.map((a) => {
-            if (a.id !== LIVE_SLOT_ID) return a
-            const r: ServeAgent | undefined = remote[0]
-            // Keep the seeded conversations/activeConvId (empty/null until
-            // syncConversations fills the list); just adopt the serve-discovered
-            // name/model/caps and flip serveBacked.
-            if (!r)
-              return { ...a, status: 'online', serveBacked: true }
-            return {
-              ...a,
-              status: 'online',
-              serveBacked: true,
-              name: r.name || a.name,
-              engine: 'xihe',
-              shape: 'process',
-              model: r.model || a.model,
-              capabilities: r.capabilities?.length ? r.capabilities : a.capabilities,
-              dataRoot: r.dataRoot ?? a.dataRoot,
-              description: 'xihe已连接。对话历史存于本地 sessions.db。',
-            }
-          }),
-        }))
+          serveModel: health.model,
+        })
         void openStream()
-        // select() syncs the conversation list + loads history for the now-live slot.
-        get().select(LIVE_SLOT_ID)
+        // Sync the conversation list first (it may auto-select a conv when
+        // none is active), THEN load that conv's history — firing both
+        // concurrently makes load bail on the pre-sync null activeConvId and
+        // leaves the just-selected conv empty.
+        void syncConversations().then(() => loadActiveHistory())
         return true
       } finally {
         connectInFlight = false
@@ -1690,8 +1652,8 @@ useStore.subscribe((s, prev) => {
 let viewPersistTimer: ReturnType<typeof setTimeout> | null = null
 useStore.subscribe((s, prev) => {
   if (!wsHydrated) return
-  const conv = s.agents.find((a) => a.id === LIVE_SLOT_ID)?.activeConvId ?? null
-  const prevConv = prev.agents.find((a) => a.id === LIVE_SLOT_ID)?.activeConvId ?? null
+  const conv = s.activeConvId
+  const prevConv = prev.activeConvId
   if (
     conv === prevConv &&
     s.activeWorkspaceId === prev.activeWorkspaceId &&
@@ -1733,6 +1695,12 @@ function sweepRunningTools(trace?: TraceEvent[], to: 'done' | 'interrupted' = 'd
 function expireApproval(ap?: PendingApproval): PendingApproval | undefined {
   if (!ap || ap.status !== 'pending') return ap
   return { ...ap, status: 'expired' }
+}
+
+/** Same contract for a pending clarify. */
+function expireClarify(cl?: PendingClarify): PendingClarify | undefined {
+  if (!cl || cl.status !== 'pending') return cl
+  return { ...cl, status: 'expired' }
 }
 
 function uid(): string {

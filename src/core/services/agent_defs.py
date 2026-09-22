@@ -14,6 +14,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from core.toolsets import resolve_roster
 
@@ -46,8 +47,8 @@ class AgentDef:
     bundled: bool = False
     # Same semantics as the main agent's config: absent → [] (nothing loaded),
     # ["*"] → None (everything). skills None only ever comes from an explicit "*".
-    toolsets: list = field(default_factory=list)
-    skills: "list | None" = field(default_factory=list)
+    toolsets: "list[str] | None" = field(default_factory=list)
+    skills: "list[str] | None" = field(default_factory=list)
     # Connection overrides — empty/None means "inherit the main config".
     model: str = ""
     base_url: str = ""
@@ -68,7 +69,7 @@ class AgentDef:
 
     def config_overrides(self) -> dict:
         """Non-empty connection keys, ready to overlay onto the main config."""
-        out = {}
+        out: dict = {}
         if self.model:
             out["model"] = self.model
         if self.base_url:
@@ -80,7 +81,7 @@ class AgentDef:
         return out
 
 
-def _load_raw(slug: str, directory: Path = None) -> dict:
+def _load_raw(slug: str, directory: Optional[Path] = None) -> dict:
     import yaml
     path = (directory or specialists_dir()) / f"{slug}.yaml"
     spec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -150,14 +151,15 @@ _BUNDLED_OVERRIDE_KEYS = frozenset(
     ("enabled", "model", "base_url", "api_key", "max_iterations"))
 
 
-def _merged_specs(warnings: list = None) -> list:
+def _merged_specs(warnings: Optional[list] = None) -> list:
     """``[(slug, spec, bundled), …]`` after priority resolution — bundled
     agents WIN their slugs. A same-slug user file is a DELTA: only the
     override keys above are merged onto the bundled base (drift-proof by
     construction — the product updates its content freely); any other key in
     it is ignored with a warning. Bundled before user, active before disabled
     (within each group), then slug."""
-    bundled_specs, user_specs = {}, {}
+    bundled_specs: dict = {}
+    user_specs: dict = {}
     for f, d, is_bundled in _iter_agent_files():
         try:
             spec = _load_raw(f.stem, d)
@@ -169,7 +171,7 @@ def _merged_specs(warnings: list = None) -> list:
             continue
         (bundled_specs if is_bundled else user_specs)[f.stem] = spec
 
-    out = {}
+    out: dict = {}
     for slug, spec in bundled_specs.items():
         u = user_specs.pop(slug, None)
         if u is not None:
@@ -205,7 +207,7 @@ def list_raw_specs() -> list:
     return _merged_specs()
 
 
-def _warn(warnings: list, msg: str) -> None:
+def _warn(warnings: Optional[list], msg: str) -> None:
     logger.warning(msg)
     if warnings is not None:
         warnings.append(msg)
@@ -219,7 +221,7 @@ def _mcp_tools_registered(toolset: str) -> bool:
         return False
 
 
-def _parse_def(slug: str, spec: dict, warnings: list,
+def _parse_def(slug: str, spec: dict, warnings: Optional[list],
                bundled: bool = False) -> "AgentDef | None":
     """Validate one spec dict → AgentDef. Warns and returns None on bad input.
 
@@ -275,7 +277,7 @@ def _parse_def(slug: str, spec: dict, warnings: list,
     )
 
 
-def load_agent_defs(warnings: list = None) -> list:
+def load_agent_defs(warnings: Optional[list] = None) -> list:
     """Load + validate the EFFECTIVE agents (see ``_merged_specs``: bundled
     wins its slugs, a pure disable copy opts a bundled agent out) into
     AgentDefs, bundled first, active before disabled within each group."""

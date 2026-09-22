@@ -81,6 +81,9 @@ def _build_agent_instance(agent_def, parent_agent):
     # 子代理命中审批门时，request 经共享引用走父代理（顶层 turn）注入的
     # 回调；外部 resolve 也只找得到顶层 agent。
     child._approval_shared = parent_agent._approval_shared
+    # Pending mid-turn asks（审批等待）住在 hub 里——共享同一实例，外部经顶
+    # 层 agent 的 resolve 才能打到挂在子代理 turn 里的 pending。
+    child._midturn = parent_agent._midturn
 
     if hasattr(parent_agent, '_active_children'):
         lock = getattr(parent_agent, '_active_children_lock', None)

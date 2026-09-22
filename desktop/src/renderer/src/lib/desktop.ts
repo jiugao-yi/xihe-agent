@@ -158,6 +158,10 @@ export interface DesktopAPI {
   notify: (title: string, body: string) => Promise<boolean>
   /** Native folder picker; null if the user cancels. */
   openDirectory: () => Promise<string | null>
+  /** Native multi-file picker for chat attachments; [] on cancel. */
+  openFiles: () => Promise<string[]>
+  /** Read a file (any type, ≤50MB) as ArrayBuffer for chat upload. */
+  readAttachment: (path: string) => Promise<ArrayBuffer | null>
   /** Immediate children of a directory (zero-stat). Empty on any error. */
   listDir: (path: string) => Promise<DirEntry[]>
   /** Read a file with size cap + binary guard. */
@@ -198,28 +202,21 @@ export interface DesktopAPI {
   gitStatus: (workdir: string) => Promise<GitStatus>
   /** HEAD text of one file (editor change-mark base). */
   gitHeadFile: (path: string) => Promise<GitHeadFile>
-  /** Start a one-shot local run (one active run per workdir; supersedes that
-   *  workdir's previous run). Output/exit arrive via onRunEvent. */
-  runStart: (command: string, cwd: string) => Promise<{ ok: boolean; id?: number }>
-  /** Tree-kill the workdir's active run. */
-  runStop: (cwd: string) => Promise<boolean>
-  /** Persisted per-workdir command history (most recent first). */
-  runHistory: () => Promise<Record<string, string[]>>
-  onRunEvent: (cb: (ev: RunEvent) => void) => () => void
-  /** Attach the shared local shell (created on first call; cwd seeds it).
-   *  Returns the tail backlog; further output via onLocalPtyEvent. */
-  localPtyAttach: (
+  /** Create a shell session (cwd only seeds it; interactive ConPTY).
+   *  Output/exit arrive via onTermEvent; attach replays the tail. */
+  termCreate: (
     cwd: string | undefined,
     cols: number,
     rows: number
-  ) => Promise<{ ok: true; backlog: string } | { ok: false; reason: string }>
-  localPtyInput: (data: string) => Promise<boolean>
-  localPtyResize: (cols: number, rows: number) => Promise<boolean>
-  /** Stop streaming (shell keeps running in main). */
-  localPtyDetach: () => Promise<boolean>
-  /** Kill the shell (reconnect path — next attach spawns a fresh one). */
-  localPtyKill: () => Promise<boolean>
-  onLocalPtyEvent: (cb: (ev: LocalPtyEvent) => void) => () => void
+  ) => Promise<{ ok: true; id: number } | { ok: false; reason: string }>
+  termAttach: (
+    id: number
+  ) => Promise<{ ok: true; backlog: string; w: number } | { ok: false; reason: string }>
+  termInput: (id: number, data: string) => Promise<boolean>
+  termResize: (id: number, cols: number, rows: number) => Promise<boolean>
+  termKill: (id: number) => Promise<boolean>
+  termList: () => Promise<{ id: number }[]>
+  onTermEvent: (cb: (ev: TermEvent) => void) => () => void
   /** Report the browser-panel placeholder rect (CSS px) to main, or null to
    *  un-track: mode 'float' (PinOff) releases the Chrome visible beside the
    *  app, mode 'hide' (panel close) puts it away until the panel returns. */
@@ -236,14 +233,12 @@ export interface DesktopAPI {
   getXiheStatus: () => Promise<XiheStatus | null>
 }
 
-/** Run-panel event pushed by main (one active run at a time). */
-export type RunEvent =
-  | { t: 'start'; id: number; command: string; cwd: string }
-  | { t: 'out'; id: number; stream: 'out' | 'err'; chunk: string }
-  | { t: 'exit'; id: number; code: number | null }
-
-/** Local-terminal event: pty output chunks / shell exit. */
-export type LocalPtyEvent = { t: 'out'; chunk: string } | { t: 'exit'; reason: string }
+/** Shell-panel event pushed by main, per session id. `w` is the session's
+ *  total output chars after this chunk — the dedupe cursor against attach's
+ *  replay snapshot. */
+export type TermEvent =
+  | { id: number; t: 'out'; chunk: string; w: number }
+  | { id: number; t: 'exit'; reason: string }
 
 /** Every component imports this, never `window.desktop`. */
 export const desktop: DesktopAPI = window.desktop

@@ -81,7 +81,7 @@ def test_start_alive_hands_off(monkeypatch):
     assert "listening" in data["output"]
     # the channel is the live-view source: header + streamed chunk are in it
     text = _local_tap.get("proc:t-p2:web").tail_text(10_000)
-    assert "agent $ python app.py" in text
+    assert "—— $ python app.py  [web]" in text
     assert "listening on 8000" in text
 
     for p in procs:

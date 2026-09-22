@@ -18,7 +18,7 @@
 model: glm-5.2-zp            # 主模型（默认非多模态）
 base_url: https://api.openai.com/v1   # OpenAI 兼容端点
 api_key: ""                  # 必填：留空则 xihe chat / xihe gateway 拒绝启动
-toolsets: ["files", "terminal", "agent", "external_agents", "communication", "memory", "http", "mcp", "kbs", "scheduler"]
+toolsets: ["files", "terminal", "agent", "external_agents", "communication", "memory", "http", "mcp", "kbs", "scheduler", "ssh", "office"]
                             # 主 agent 的 toolsets（与专家 agents/*.yaml 同一套
                             # 语义：不写或 [] = 不加载，["*"] = 全量，
                             # mcp = 全部 MCP 服务器，mcp-<server> = 单服务器；
@@ -30,7 +30,8 @@ toolsets: ["files", "terminal", "agent", "external_agents", "communication", "me
                             # skill_view、memory 读、kbs_search、todo、model_info）经
                             # base 组自动并入每个非空名单，不用配。推荐主 agent 只当
                             # 协调者，专业工具交给专家 agent / delegate_task
-skills: []                # 技能索引：不写 = 不注入；["*"] = 全部；或列技能名
+skills: ["*"]                # 技能索引：不写 = 不注入；["*"] = 全部（prompt 只带索引，
+                             # 正文经 skill_view 按需载入，全量也不臃肿）；或列技能名
 vision_model:                # 填一个多模态模型（如 gpt-4o）才启用 vision_analyze
 max_iterations: 30           # 单轮最大工具调用迭代数
 max_completion_tokens: 8192  # 单次模型回复的输出 token 上限（默认 8192）。
@@ -52,10 +53,23 @@ language: zh                 # 思考/回复语言引导：zh | en | auto（不�
 specialists:
   enabled: false              # true = 主 agent 可把任务委派给自建专家 agent
 
-# 会话上下文加载控制（xihe.md / AGENTS.md 始终加载）----------------------------
+# 会话（项目上下文加载 + 自动重置）---------------------------------------------
 session:
+  # 项目上下文加载（xihe.md / AGENTS.md 始终加载）
   load_claude_md: true       # 是否把工作目录的 CLAUDE.md 注入系统提示
   load_cursorrules: true     # 是否加载 .cursorrules
+
+  # 会话自动重置：到期后下一条消息换新 session_id（agent 上下文从头开始），
+  # 旧消息仍留在 sessions.db，不删。默认 none —— 同一会话永久延续，历史
+  # 上下文完整（超长由压缩机制收敛）；需要"闲置换轮/每日换轮"时再开启。
+  # default_reset: none        # none=不自动重置（默认）| idle=闲置超时换轮 |
+  #                           # daily=每天定点换轮 | both
+  # idle_minutes: 1440         # idle/both 的闲置阈值（分钟），默认 24 小时
+  # daily_reset_hour: 4        # daily/both 的换轮时刻（本地时区小时），默认凌晨 4 点
+  # platforms:                 # 按平台覆盖（键 = platform 名；子键 reset/idle_minutes/
+  #   wecom:                   # daily_reset_hour，缺省回落上面的全局值）
+  #     reset: idle            # 例：仅企微会话启用闲置换轮
+  #     idle_minutes: 720      # 闲置 12 小时即换轮
 
 # 业务知识库（.biz_kbs 协议；可选）---------------------------------------------
 # 根目录固定为 <agent_home>/.biz_kbs —— 跟随数据根，不单独配路径。
@@ -81,7 +95,7 @@ models:
 #   wecom:
 #     bot_id: "your-wecom-bot-id"
 #     secret: "your-wecom-secret"
-#     ws_url: "wss://your-wecom-ws-url"
+#     ws_url: "wss://openws.work.weixin.qq.com"
 #   # feishu:
 #   #   app_id: "..."
 #   #   app_secret: "..."
@@ -130,6 +144,10 @@ web:
 # 浏览器工具 ------------------------------------------------------------------
 browser:
   cdp_port: 9222            # 复用系统 Chrome/Edge 的 CDP 端口
+
+# 澄清提问（agent 中途向用户提问并等待回答；与审批共用等待骨架）-----------
+clarify:
+  timeout: 300                # 提出澄清后等待回答的秒数，超时按未回答处理
 
 # 危险操作审批 ----------------------------------------------------------------
 # 一次工具调用走这条决策链，从上到下首个命中生效：
@@ -222,3 +240,4 @@ cli:
 # 日志脱敏 --------------------------------------------------------------------
 redact:
   enabled: true             # 是否在日志里脱敏 key/token/secret
+

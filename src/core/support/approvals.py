@@ -26,6 +26,7 @@ import os
 import re
 import threading
 import time
+from typing import Any, Callable, Optional
 import unicodedata
 from pathlib import Path
 
@@ -256,7 +257,7 @@ def _extract_json_object(text: str) -> dict | None:
     return None
 
 
-def _llm_judge_command(command: str, aux) -> dict | None:
+def _llm_judge_command(command: str, aux: Optional[Any]) -> dict | None:
     """用辅助模型对命令做一次语义危险判定；失败/不可用返回 None（fail-open，
     即回退纯正则行为，不因此卡住或误拦）。"""
     if aux is None or not getattr(aux, "is_available", lambda *a: True)():
@@ -324,7 +325,7 @@ def _llm_judge_command(command: str, aux) -> dict | None:
 
 
 def _maybe_llm_judge(name: str, args: dict, config: dict | None,
-                     aux) -> dict | None:
+                     aux: Optional[Any]) -> dict | None:
     """evaluate 尾部的 LLM 复核：返回危险判定 dict，其余情况 None（照常放行）。"""
     if name != "terminal" or aux is None:
         return None
@@ -519,7 +520,8 @@ def remember_rule(session_key: str | None, name: str, args: dict,
 
 
 def evaluate(name: str, args: dict, config: dict | None,
-             session_key: str | None = None, aux=None) -> tuple[str, str]:
+             session_key: str | None = None,
+             aux: Optional[Any] = None) -> tuple[str, str]:
     """三值审批决策：'deny' 配置即拒（不等待、不弹窗）/ 'ask' 弹人工审批 /
     'allow' 放行。aux 传入辅助 LLM 客户端时，正则漏网的 terminal 命令追加
     一次语义判定（漏斗命中才判）。"""
@@ -577,7 +579,7 @@ _DENY_WORDS = {"n", "no", "不", "不行", "否", "拒绝", "不允许", "取消
 _ALWAYS_WORDS = {"a", "always", "ya", "全部", "总是", "不再询问"}
 
 
-def parse_approval_reply(text: str):
+def parse_approval_reply(text: str) -> bool | str | None:
     """把用户在等待审批期间发来的文本折成决议：True 批准 / False 拒绝 /
     "always" 批准且本会话不再询问 / None 无法解析。
 
@@ -593,7 +595,7 @@ def parse_approval_reply(text: str):
     return None
 
 
-def try_resolve_steer(agent, text: str) -> bool:
+def try_resolve_steer(agent: Any, text: str) -> bool:
     """入站文本若是对当前 pending 审批的批复，折成决议并返回 True（调用方
     不应再把它当 steer 注入）。三个模式的 turn 中入站口共用。"""
     pending = getattr(agent, "pending_approval", None)
@@ -620,7 +622,7 @@ _pending_external_lock = threading.Lock()
 
 
 def register_pending(platform: str, chat_id: str, approval_id: str,
-                     resolve) -> None:
+                     resolve: Callable[[bool, bool], None]) -> None:
     with _pending_external_lock:
         _pending_external.setdefault((str(platform), str(chat_id)), []).append(
             (str(approval_id), resolve))
@@ -655,4 +657,72 @@ def resolve_pending_reply(platform: str, chat_id: str, text: str) -> bool:
         logger.warning("resolve background approval failed (id=%s)", approval_id,
                        exc_info=True)
         return False
+    return True
+
+
+# 中继卡路由表：审批/澄清按钮事件的精确裁决路由。与 _pending_external 的
+# "最新挂起者获胜" 不同，这里按 (kind, id) 精确命中——同一聊天先后两张卡，
+# 点旧卡必须裁决旧卡。kind ∈ {"approval", "clarify"}。注册方持闭包 resolve
+# （bot.py / scheduler.py 的 agent 都在作用域内），与 MidturnHub 的按 id 语义
+# 一致，桌面端 _approve 已验证该模式。
+_card_routes: dict[tuple, dict] = {}  # (kind, id) → {resolve, resolved}
+_card_routes_lock = threading.Lock()
+
+
+def register_card(kind: str, card_id: str,
+                  resolve: Callable[[str], bool],
+                  meta: Optional[dict] = None) -> None:
+    """登记一张中继卡。resolve(choice) 接收按钮语义（审批为 parse_approval_reply
+    的 True/False/"always"；澄清为选项原文），返回是否送达。meta 随卡存取
+    （如 summary——终态卡整卡替换时回填用），事件处理器经 card_meta 取。"""
+    with _card_routes_lock:
+        _card_routes[(str(kind), str(card_id))] = {
+            "resolve": resolve, "resolved": False,
+            "meta": dict(meta or {})}
+
+
+def card_meta(kind: str, card_id: str) -> dict:
+    """取登记时的 meta（未登记/已弹出返回空 dict）。点击路径用它拿 summary
+    等渲染终态卡所需的原卡信息。"""
+    with _card_routes_lock:
+        entry = _card_routes.get((str(kind), str(card_id)))
+        return dict(entry["meta"]) if entry else {}
+
+
+def unregister_card(kind: str, card_id: str) -> "str | None":
+    """结果回调侧清理。返回裁决来源：
+    None = 该卡没登记过（纯文本路径）；"clicked" = 按钮点击裁决的（卡面
+    已在点击事件的 5 秒窗口内就地更新终态，调用方不必再发文本裁决）；
+    "unclicked" = 登记过但靠文本/超时了结（调用方发文本裁决）。"""
+    with _card_routes_lock:
+        entry = _card_routes.pop((str(kind), str(card_id)), None)
+    if entry is None:
+        return None
+    return "clicked" if entry["resolved"] else "unclicked"
+
+
+def card_click(kind: str, card_id: str, choice: str) -> bool:
+    """按钮点击的裁决入口。审批 kind 先把 event_key 折成 parse_approval_reply
+    语义再交 resolve；澄清 kind 原文直传。返回 False 表示卡已失效（裁决过/
+    已被结果回调弹出/未知卡），调用方回"该确认已处理"。未识别的审批
+    event_key 不消耗裁决权——卡保持可点，下一个合法按钮仍能裁决。"""
+    key = (str(kind), str(card_id))
+    if kind == "approval":
+        decision = parse_approval_reply(choice)
+        if decision is None:
+            logger.warning("card event_key not an approval choice "
+                           "(id=%s key=%r)", card_id, choice)
+            return True
+        choice = decision
+    with _card_routes_lock:
+        entry = _card_routes.get(key)
+        if entry is None or entry["resolved"]:
+            return False
+        entry["resolved"] = True
+        resolve = entry["resolve"]
+    try:
+        resolve(choice)
+    except Exception:
+        logger.warning("card resolve failed (kind=%s id=%s)", kind, card_id,
+                       exc_info=True)
     return True

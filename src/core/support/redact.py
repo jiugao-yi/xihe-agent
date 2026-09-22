@@ -110,12 +110,12 @@ def redact_sensitive_text(text: str) -> str:
 
     text = _PREFIX_RE.sub(lambda m: _mask_token(m.group(1)), text)
 
-    def _redact_env(m):
+    def _redact_env(m: re.Match) -> str:
         name, quote, value = m.group(1), m.group(2), m.group(3)
         return f"{name}={quote}{_mask_token(value)}{quote}"
     text = _ENV_ASSIGN_RE.sub(_redact_env, text)
 
-    def _redact_json(m):
+    def _redact_json(m: re.Match) -> str:
         key, value = m.group(1), m.group(2)
         return f'{key}: "{_mask_token(value)}"'
     text = _JSON_FIELD_RE.sub(_redact_json, text)

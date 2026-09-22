@@ -12,7 +12,7 @@ tags:
   - scheduler
 status: active
 created: 2026-07-03
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0002_tool-registry-and-dispatch.md
   - wiki/changes/0010_cdp-default-and-cron-job-forms.md
@@ -23,14 +23,23 @@ sources: []
 
 ## 摘要
 
-`tools/cronjob_tools.py` 提供定时任务能力。调度外壳：gateway 进程里的 daemon 线程，每 60s tick，每个 job 到点在一个**全新无状态 agent 会话**里执行（禁 `cronjob` toolset 防递归）。在此基线上叠加 **job 多形态 + 显式跨次状态**模型：job 不再只是 prompt，还可以是脚本驱动，从而支持「循环任务的增量推进 + 去重 + 零 token 静默」。
+调度子系统本体在 **`core/services/scheduler.py`**（循环/存储/锁/执行/投递），`tools/cronjob_tools.py` 只是工具面。daemon 线程每 60s tick，由 `bootstrap_process()` 在**每个模式**启动（gateway / serve / CLI chat 都有，不只 gateway）；跨进程用 `cron/jobs.lock` 文件锁保证同一 agent_home 只有一个进程真正派发 job。每个 job 到点在一个**全新无状态 agent 会话**里执行。在此基线上叠加 **job 多形态 + 显式跨次状态**模型：job 不再只是 prompt，还可以是脚本驱动，从而支持「循环任务的增量推进 + 去重 + 零 token 静默」。
 
 ## 调度基线
 
-- daemon 线程在 gateway 进程内，60s tick（`_scheduler_loop`）。
+- daemon 线程 60s tick（`_scheduler_loop`），`start_scheduler` 由 `bootstrap_process` 接线（`_agent_factory` 注入 `shared_ctx.create_agent`——cron job 的 agent **无名单裁剪**（全量工具），cronjob 工具本身 `subagent_blocked` 但 cron 回合不是子代理，无递归问题）。
 - 每次 `_execute_job` 新建会话（`SessionSource(platform="cron", ...)`），**无记忆**：不能问澄清问题、不被上次会话污染。
 - 因此 **prompt 必须自包含**；跨次进度要 job 自己用文件持久化（读 → 处理 → 写回）。
-- job 状态存 `~/.xihe-agent/cron/jobs.json`（xihe 自动管理，勿手编）；输出存 `~/.xihe-agent/cron/output/<job_id>/`。
+- job 状态存 `${AGENT_HOME}/cron/jobs.json`（xihe 自动管理，勿手编）；输出存 `${AGENT_HOME}/cron/output/<job_id>/`（保留最新 20 份）。
+- job 在**独立线程并行执行**，单 job 超时 `JOB_TIMEOUT=300`s；`scheduler_health()` 暴露给 `/status`。
+
+## 投递（deliver / channels）
+
+job 的 `deliver` 字段决定结果发到哪：`origin`（创建会话）/ `local`（仅落盘）/ `platform:chat_id`，**支持逗号分隔或列表多目标**（部分失败只记日志不整体失败）。出站走 **channels**（`register_channel(name, sender)`，契约 `async send(target, message) -> bool`，按目标平台名路由）；gateway 的平台 adapter 是旧回落。serve 注册 `DesktopChannel`（同时挂 `desktop` 和 `serve` 两个名）——桌面创建的 job `deliver: origin` 会把 `cron_result` WS 事件推回创建它的对话。agent 输出含 `[SILENT]` 标记则完全不投递。CLI 创建可带 `--deliver` 旗标。
+
+**cron 审批卡**：危险命令审批的记忆桶按任务名（`cron_job:{任务名}`）；有投递通道的任务把审批卡发到目标聊天，回复整词 y/n/a 折批复（"a" 落任务名桶后静默放行）；发卡失败维持无人值守即拒。见 [[0037_approval-permission-system]] / [[0039_ask-rules-approval-dimensions]]。
+
+**其它工具动作**：`pause` / `resume`（暂停/恢复时 interrupt 在跑实例）；`repeat.times` 到次数自动删任务。
 
 ## job 的三种形态（`_execute_job` 执行流）
 
@@ -52,17 +61,19 @@ sources: []
 
 ## 脚本约定
 
-- 可复用脚本放 `~/.xihe-agent/scripts/`（用户级）或项目 `scripts/`（版本管理）；`script` 字段填纯文件名，`_resolve_script` 按绝对路径 → CWD → `~/.xihe-agent/scripts/` → 项目 `scripts/` 解析。
+- 可复用脚本放 `${AGENT_HOME}/cron/scripts/`（用户级）或项目 `scripts/`（版本管理）；`script` 字段填纯文件名，`_resolve_script` 按绝对路径 → CWD 相对 → `${AGENT_HOME}/cron/scripts/<name>` → `<cwd>/scripts/<name>` 解析。
 - 扩展名决定执行方式：`.py` → 当前解释器；`.ps1` → powershell；其余 shell（`_run_job_script` 按扩展名派发，避免 Windows 下 `shell=True` 跑 `.py` 失败）。
 - **一次性产物**（数据缓存、调试 dump）放 `scratch/<任务名>/`，不堆项目根目录（见 `BEHAVIOR_RULES` 第 6 条）。
 
 ## 提示词引导
 
-`core/agent/prompts.py` 的 `CRON_GUIDANCE`（`cronjob` 工具加载时注入）指导 agent 按任务逻辑选形态、自建脚本、用 wake gate、链式编排。要点：判定该用脚本时 agent **自己 write_file 到 `~/.xihe-agent/scripts/`** 并自测，不让用户手写。
+`core/agent/prompts.py` 的 `CRON_GUIDANCE`（`cronjob` 工具加载时注入）指导 agent 按任务逻辑选形态、自建脚本、用 wake gate、链式编排。要点：判定该用脚本时 agent **自己 write_file 到 `${AGENT_HOME}/cron/scripts/`** 并自测，不让用户手写。
 
-## 不在当前实现内（后续可补）
+## 原「不在当前实现内」清单的订正（2026-09-14）
 
-per-job 覆盖 model/provider/toolset/workdir/profile、at-most-once（执行前 advance_next_run）、跨进程文件锁、prompt-injection 扫描。xihe 暂未做。
+- ~~at-most-once（执行前 advance_next_run）~~ — **已实现**：循环在锁内先推进 `next_run_at` 再派发线程，不会因执行慢而重复触发。
+- ~~跨进程文件锁~~ — **已实现**：每次 jobs.json 事务都在 `CrossProcessLock(cron/jobs.lock)` 下（注意：锁护的是事务不是循环独占——两个循环可同时 poll 但不可能双派发）。
+- per-job 覆盖 model/provider/workdir/profile、prompt-injection 扫描 — 仍未做。
 
 ## 相关页面
 

@@ -24,6 +24,9 @@ class FakeDb:
     def build_key(self, source):
         return f"agent:main:serve:dm:{source.chat_id}"
 
+    def pending_auto_reset(self, source):
+        return None
+
 
 class FakeCtx:
     """Stands in for SharedContext: create_agent raises or returns a stub."""

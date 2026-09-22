@@ -16,13 +16,15 @@ export type ServeEvent =
   | { type: 'attached'; conv_id: string; running: boolean }
   /** 定时任务结果推送（DesktopChannel）：投递目标会话 + 文本（[定时任务: …] 前缀） */
   | { type: 'cron_result'; conv_id: string; text: string }
-  | { type: 'turn_start'; turn_id: string; conv_id: string; session_key: string }
+  | { type: 'turn_start'; turn_id: string; conv_id: string; session_key: string; auto_reset?: string | null }
   | { type: 'text_delta'; turn_id: string; conv_id: string; text: string; by?: string }
   | { type: 'thought_delta'; turn_id: string; conv_id: string; text: string; by?: string }
   | { type: 'tool_call'; turn_id: string; conv_id: string; name: string; args: string; by?: string; id?: number }
-  | { type: 'tool_result'; turn_id: string; conv_id: string; name: string; result: string; elapsed: number; truncated?: boolean; by?: string }
+  | { type: 'tool_result'; turn_id: string; conv_id: string; name: string; result: string; elapsed: number; truncated?: boolean; by?: string; id?: number }
   | { type: 'approval_request'; turn_id: string; conv_id: string; id: string; name: string; summary: string; args?: string }
   | { type: 'approval_resolved'; turn_id: string; conv_id: string; id: string; approved: boolean; reason: string }
+  | { type: 'clarify_request'; turn_id: string; conv_id: string; id: string; question: string; options: string[] }
+  | { type: 'clarify_resolved'; turn_id: string; conv_id: string; id: string; status: string; answer?: string | null }
   | { type: 'complete'; turn_id: string; conv_id: string; text: string; reason?: string; session_id?: string; usage?: TurnUsage }
   | { type: 'error'; turn_id?: string; conv_id?: string; message: string }
 
@@ -32,18 +34,6 @@ export interface ServeHealth {
   mode: string
   model: string
   capabilities: string[]
-}
-
-export interface ServeAgent {
-  id: string
-  name: string
-  engine: string
-  shape: string
-  model: string
-  status: string
-  capabilities: string[]
-  dataRoot?: string
-  description?: string
 }
 
 // Default to the standard `xihe serve` port. Override with setServeBase()
@@ -89,17 +79,13 @@ export function testConnection(): Promise<TestConnectionResult | null> {
   return postJson<TestConnectionResult>('/test-connection')
 }
 
-export function getAgents(): Promise<ServeAgent[]> {
-  return getJson<{ agents: ServeAgent[] }>('/agents').then((r) => r?.agents ?? [])
-}
-
 export interface HistoryMessage {
   role: string
   content: string
-  /** Stable serve row id on the assistant bubble — the anchor used to
+  /** Stable serve row id (uuid) on the assistant bubble — the anchor used to
    *  lazy-fetch that turn's trace (set for every assistant turn, absent for
    *  user bubbles). */
-  id?: number | null
+  id?: string | null
   /** Tool-call count folded into this assistant turn (>0 → desktop shows a
    *  "N 个工具" trace header before the trace is even loaded). */
   tools?: number
@@ -114,12 +100,29 @@ export interface HistoryMessage {
   ts?: string
   /** Token usage persisted on the turn's final assistant row (cost badge). */
   usage?: TurnUsage
+  /** First folded message of a post-reset round — the client draws a reset
+   *  divider before it. */
+  round_start?: boolean
+  /** Why the reset happened ('manual' | 'idle' | 'daily'); absent when the
+   *  boundary predates reason persistence. */
+  reset_reason?: string
+  /** User-message attachment metadata (name/path/size, images also carry a
+   *  vision `desc`) — the bubble renders content + attachment chips; the
+   *  model-facing hint text never reaches the persisted content. */
+  attachments?: { name: string; path: string; size?: number; desc?: string }[]
 }
 
-export function getHistory(convId: string): Promise<HistoryMessage[]> {
-  return getJson<{ messages: HistoryMessage[] }>(
+export interface HistoryResponse {
+  messages: HistoryMessage[]
+  /** Non-null when a reset happened but its round has no messages yet —
+   *  the client draws a trailing divider ('' = reason unknown). */
+  pending_reset?: string | null
+}
+
+export function getHistory(convId: string): Promise<HistoryResponse | null> {
+  return getJson<HistoryResponse>(
     `/convs/${encodeURIComponent(convId)}/messages`
-  ).then((r) => r?.messages ?? [])
+  )
 }
 
 /** One event in a lazily-loaded historical trace (shape matches the live
@@ -137,14 +140,18 @@ export type HistoryTraceEvent =
        *  enrichment. */
       result?: string
       truncated?: boolean
+      /** 审批决议（危险操作审批门注入 result JSON，trace 端点提取）——
+       *  历史回合里“这次调用被人工批准/拒绝过”的持久痕迹。 */
+      approval?: { decision: string; summary: string; reason?: string; always?: boolean }
     }
   | { kind: 'thought'; text: string }
 
 /** `GET /convs/{id}/trace/{msg_id}` — lazy-fetch a turn's tool calls by the
- *  anchor row id attached to its assistant bubble. Called on trace expand. */
-export function getTrace(convId: string, msgId: number): Promise<HistoryTraceEvent[]> {
+ *  anchor row id (uuid) attached to its assistant bubble. Called on trace
+ *  expand. */
+export function getTrace(convId: string, msgId: string): Promise<HistoryTraceEvent[]> {
   return getJson<{ trace: HistoryTraceEvent[] }>(
-    `/convs/${encodeURIComponent(convId)}/trace/${msgId}`
+    `/convs/${encodeURIComponent(convId)}/trace/${encodeURIComponent(msgId)}`
   ).then((r) => r?.trace ?? [])
 }
 
@@ -168,6 +175,52 @@ export function getToolArgs(id: number): Promise<string | null> {
   )
 }
 
+/** 聊天附件（`POST /convs/{id}/upload`，multipart）：落 serve 的
+ *  AGENT_HOME/uploads/<conv_id>/，返回服务器端绝对路径 + 原始文件名，
+ *  随 send 帧的 attachments 字段回传。null = 上传失败（网络/超限）。
+ * 内容经 preload 的 fs:readAttachment（读小文件的受限桥）拿 ArrayBuffer。 */
+export interface UploadedAttachment {
+  path: string
+  name: string
+  size: number
+}
+
+export async function uploadAttachment(
+  convId: string,
+  filePath: string
+): Promise<UploadedAttachment | null> {
+  try {
+    const buf = await window.desktop.readAttachment(filePath)
+    if (!buf) return null
+    const blob = new Blob([buf])
+    const name = filePath.split(/[\\/]/).pop() || 'attachment'
+    return uploadFile(convId, new File([blob], name))
+  } catch {
+    return null
+  }
+}
+
+/** Paste-path upload: the clipboard already handed us the bytes as a File
+ *  (screenshot / copied file) — no preload disk bridge needed. */
+export async function uploadFile(
+  convId: string,
+  file: File
+): Promise<UploadedAttachment | null> {
+  try {
+    const form = new FormData()
+    form.append('file', file, file.name || 'attachment')
+    const r = await fetch(`${baseUrl}/convs/${encodeURIComponent(convId)}/upload`, {
+      method: 'POST',
+      body: form,
+    })
+    if (!r.ok) return null
+    const data = (await r.json()) as UploadedAttachment
+    return data.path ? data : null
+  } catch {
+    return null
+  }
+}
+
 /** One conversation row from `GET /sessions` (serve platform, recent-first). */
 export interface SessionRow {
   conv_id: string
@@ -175,6 +228,7 @@ export interface SessionRow {
   title: string | null
   updated_at: string | null
   msg_count: number
+  running?: boolean
 }
 
 export function listSessions(): Promise<SessionRow[]> {
@@ -655,8 +709,8 @@ export function getKbsPage(rel: string): Promise<KbsPage | null> {
 }
 
 /** `POST /convs/{id}/truncate` rolls a conversation back: the user row
- * `fromMsgId` and everything after it is deleted (desktop 重新发送). */
-export function truncateConversation(convId: string, fromMsgId: number): Promise<boolean> {
+ * `fromMsgId` (uuid) and everything after it is deleted (desktop 重新发送). */
+export function truncateConversation(convId: string, fromMsgId: string): Promise<boolean> {
   return postJson<{ ok: boolean }>(
     `/convs/${encodeURIComponent(convId)}/truncate`,
     { from_msg_id: fromMsgId }
@@ -711,25 +765,22 @@ export function restartBrowser(): Promise<(BrowserStatus & { restarted?: boolean
   return postJson<BrowserStatus & { restarted?: boolean }>('/browser/restart')
 }
 
-// ---- ssh live terminal (GET /ssh/live, WS /ssh/live/stream, POST
-// /ssh/live/connect). Served by gateway/serve/terminal.py — these
-// back the terminal panel: sessions live in the SERVE process (shared with
-// the agent's ssh tools), the panel is just a viewer + second keyboard.
+// ---- ssh live terminal (GET /ssh/live, WS /ssh/live/stream). Served by
+// gateway/serve/terminal.py — these back the terminal panel: sessions live
+// in the SERVE process (shared with the agent's ssh tools), the panel is
+// just a viewer + second keyboard. Connections are agent-initiated only.
 
 /** One watched ssh session from GET /ssh/live. `key` is the registry key
  *  (`session_key|alias` — the stream route's address); `name` is the display
  *  alias. `offset` is the ring's write cursor (chars ever); `buffered` how
- *  much scrollback is still retained. `origin` is who connected (agent via
- *  ssh_connect vs desktop quick-connect); `session_key` groups
- *  agent-triggered sessions to the conversation that ran them ("" for
- *  desktop-initiated or pre-existing connections). */
+ *  much scrollback is still retained; `session_key` groups sessions to the
+ *  conversation whose agent connected them. */
 export interface SshLiveSession {
   key: string
   name: string
   host: string
   user: string
   mode: string
-  origin: 'agent' | 'desktop' | string
   session_key: string
   cols: number | null
   rows: number | null
@@ -749,41 +800,6 @@ export function getSshLive(): Promise<SshLiveSession[] | null> {
   )
 }
 
-/** POST /ssh/live/connect — desktop-initiated connect through the same
- *  _ssh_connect the agent uses (the session lands in the shared registry).
- *  The token is sent once and never echoed back; on ok the panel attaches to
- *  the session by name. `sessionKey` (the current conversation's key) only
- *  affects grouping in the panel. */
-export interface SshConnectResult {
-  ok: boolean
-  success?: boolean
-  session?: string
-  host?: string
-  mode?: string
-  message?: string
-  error?: string
-}
-
-export function sshConnect(body: {
-  name: string
-  host?: string
-  port?: number
-  user?: string
-  token: string
-  mode?: string
-  sessionKey?: string
-}): Promise<SshConnectResult | null> {
-  return postStoreJson<SshConnectResult>('/ssh/live/connect', {
-    name: body.name,
-    host: body.host || '',
-    port: body.port || 22,
-    user: body.user || '',
-    token: body.token,
-    mode: body.mode || 'shell',
-    session_key: body.sessionKey || '',
-  })
-}
-
 /** Server→client frames on /ssh/live/stream. `d.o` is the char offset AFTER
  *  the frame's text — the resume cursor for reconnects. `i` attributes a
  *  write (agent vs user) on top of the pty echo that's already in the data.
@@ -797,7 +813,6 @@ export type SshStreamFrame =
       host?: string
       user?: string
       mode?: string
-      origin?: string
       session_key?: string
       cols?: number | null
       rows?: number | null
@@ -1024,8 +1039,18 @@ export interface ServeStream {
   /** `cwd` is the workspace workdir for this turn — when set, serve threads it
    *  into the agent so relative paths / terminal resolve there. Omit (undefined)
    *  for unbound conversations; the frame then carries no cwd and serve falls
-   *  back to its process cwd. */
-  sendTurn: (convId: string, text: string, cwd?: string) => void
+   *  back to its process cwd. `plan` runs the turn in plan mode (read-only
+   *  roster + approval card; approval auto-starts the execution turn).
+   *  `regenerate` injects a no-persist "answer independently" hint — the
+   *  user is re-asking after rolling back a previous answer. */
+  sendTurn: (
+    convId: string,
+    text: string,
+    cwd?: string,
+    plan?: boolean,
+    regenerate?: boolean,
+    attachments?: { path: string; name: string; size?: number; desc?: string }[]
+  ) => void
   /** Re-attach this (new) socket to a conv whose turn is still running
    *  server-side after a reconnect — its deltas/complete resume flowing here.
    *  serve acks with an `attached` event carrying `running`; false means no
@@ -1037,6 +1062,8 @@ export interface ServeStream {
   /** Answer the active turn's pending approval (card buttons). always pairs
    *  with approval: remember this exact call for the rest of the session. */
   approve: (convId: string, id: string, approved: boolean, always?: boolean) => void
+  /** Answer the active turn's pending clarify (card option click / free text). */
+  answerClarify: (convId: string, id: string, answer: string) => void
   close: () => void
 }
 
@@ -1063,15 +1090,14 @@ export function connectStream(
       settled = true
       onStatus(true)
       resolve({
-        sendTurn: (convId, text, cwd) => {
-          if (ws.readyState === WebSocket.OPEN)
-            ws.send(
-              JSON.stringify(
-                cwd
-                  ? { type: 'send', conv_id: convId, text, cwd }
-                  : { type: 'send', conv_id: convId, text }
-              )
-            )
+        sendTurn: (convId, text, cwd, plan, regenerate, attachments) => {
+          if (ws.readyState !== WebSocket.OPEN) return
+          const frame: Record<string, unknown> = { type: 'send', conv_id: convId, text }
+          if (cwd) frame.cwd = cwd
+          if (plan) frame.plan = true
+          if (regenerate) frame.regenerate = true
+          if (attachments?.length) frame.attachments = attachments
+          ws.send(JSON.stringify(frame))
         },
         interrupt: (convId) => {
           if (ws.readyState === WebSocket.OPEN)
@@ -1091,6 +1117,10 @@ export function connectStream(
               type: 'approve', conv_id: convId, id, approved,
               always: always || undefined,
             }))
+        },
+        answerClarify: (convId, id, answer) => {
+          if (ws.readyState === WebSocket.OPEN)
+            ws.send(JSON.stringify({ type: 'clarify', conv_id: convId, id, answer }))
         },
         close: () => {
           try {

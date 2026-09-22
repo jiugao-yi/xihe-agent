@@ -52,7 +52,7 @@ def _peek_config_flag() -> Path | None:
     return None
 
 
-def _read_agent_home_from_file(yaml_path) -> str | None:
+def _read_agent_home_from_file(yaml_path: Path | str) -> str | None:
     """Read ``agent_home`` from a ``--config`` instance YAML file.
 
     The user config.yaml lives *inside* AGENT_HOME, so it cannot define
@@ -114,7 +114,7 @@ AGENT_HOME = _resolve_agent_home()
 AGENT_HOME.mkdir(parents=True, exist_ok=True)
 
 
-def expand_agent_vars(text):
+def expand_agent_vars(text: str) -> str:
     """Expand path variables in skill/role text.
 
     ``${AGENT_HOME}`` resolves to AGENT_HOME — the actual data root, whether set
@@ -227,7 +227,7 @@ def _parse_config_file(config_path: str) -> dict:
             # Nested sections (replace — single source, nothing to merge against)
             for section in ("models", "platforms", "session", "auxiliary",
                             "delegation", "external_agents",
-                            "approvals", "kbs", "specialists", "store"):
+                            "approvals", "clarify", "kbs", "specialists", "store"):
                 if section in cfg and isinstance(cfg[section], dict):
                     config[section] = cfg[section]
             if "mcp_servers" in cfg and isinstance(cfg["mcp_servers"], dict):
@@ -237,7 +237,7 @@ def _parse_config_file(config_path: str) -> dict:
 
     for section in ("models", "platforms", "session", "auxiliary",
                     "delegation", "external_agents",
-                    "mcp_servers", "approvals", "kbs", "specialists", "store"):
+                    "mcp_servers", "approvals", "clarify", "kbs", "specialists", "store"):
         config.setdefault(section, {})
     return config
 

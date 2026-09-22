@@ -6,6 +6,8 @@ import remarkBreaks from 'remark-breaks'
 import rehypeHighlight from 'rehype-highlight'
 import 'highlight.js/styles/github-dark.css'
 import { copyText } from '../lib/clipboard'
+import { localImgUrl } from '../lib/localImage'
+import { HtmlRenderer } from './HtmlRenderer'
 
 // mermaid is a ~3MB chunk — only pay for it when a diagram actually shows up.
 const Mermaid = lazy(() => import('./Mermaid'))
@@ -23,12 +25,21 @@ function nodeText(node: unknown): string {
   return props ? nodeText(props.children) : ''
 }
 
-/** Code block with a hover copy button — mermaid sources copy their text. */
-function CodeBlock({ children }: { children: ReactNode }) {
+/** The fence's info string beyond the language (```html type="renderer") —
+ *  lives on the inner code node's data.meta in the hast tree. */
+function fenceMeta(node: unknown): string {
+  const code = (node as { children?: { data?: { meta?: string } }[] } | null)?.children?.[0]
+  return code?.data?.meta ?? ''
+}
+
+/** Code block with a hover copy button — mermaid and html-renderer fences
+ *  render their content instead of showing source (source still copies). */
+function CodeBlock({ children, meta }: { children: ReactNode; meta?: string }) {
   const [copied, setCopied] = useState(false)
   const child = Array.isArray(children) ? children[0] : children
   const cls: string = (child as { props?: { className?: string } })?.props?.className ?? ''
   const isMermaid = cls.includes('language-mermaid')
+  const isHtmlRenderer = cls.includes('language-html') && /renderer/.test(meta ?? '')
   const src = nodeText(child).replace(/\n$/, '')
 
   const copy = (): void => {
@@ -41,7 +52,9 @@ function CodeBlock({ children }: { children: ReactNode }) {
 
   return (
     <div className="relative">
-      {isMermaid ? (
+      {isHtmlRenderer ? (
+        <HtmlRenderer src={src} />
+      ) : isMermaid ? (
         <Suspense fallback={<pre className={PRE_CLASS}>{src}</pre>}>
           <Mermaid code={src} />
         </Suspense>
@@ -108,13 +121,32 @@ const components = {
   hr: () => <hr className="my-4 border-line" />,
   strong: ({ children }: any) => <strong className="font-semibold text-ink">{children}</strong>,
   del: ({ children }: any) => <del className="text-ink-4 line-through">{children}</del>,
+  // Local absolute paths / file:// URLs (agent-embedded rendered charts) go
+  // through the privileged xfile:// protocol — the renderer can't load them
+  // directly from either of its origins. Unresolvable srcs (paths mangled by
+  // markdown escape processing) and failed loads render NOTHING rather than
+  // a broken-image marker.
+  img: ({ src, alt }: any) => {
+    const url = localImgUrl(String(src ?? ''))
+    if (!/^(xfile:|https?:|data:|blob:)/i.test(url)) return null
+    return (
+      <img
+        src={url}
+        alt={alt ?? ''}
+        onError={(e) => {
+          e.currentTarget.style.display = 'none'
+        }}
+        className="my-2 max-w-full rounded-lg border border-line"
+      />
+    )
+  },
   code: ({ className, children }: any) =>
     className ? (
       <code className={`${className} text-[13px]`}>{children}</code>
     ) : (
       <code className="rounded bg-app/70 px-1 py-0.5 text-[13px] text-ink-2">{children}</code>
     ),
-  pre: ({ children }: any) => <CodeBlock>{children}</CodeBlock>,
+  pre: ({ node, children }: any) => <CodeBlock meta={fenceMeta(node)}>{children}</CodeBlock>,
 }
 
 export const Markdown = memo(function Markdown({ content }: { content: string }) {

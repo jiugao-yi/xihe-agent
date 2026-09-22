@@ -4,7 +4,7 @@ These are the cheapest, most stable tests in the suite: deterministic, no IO,
 no model. They guard the CJK-preserving / known-symbol-mapping behavior that
 keeps the Windows console free of boxed-"?" glyphs.
 """
-from cli.chat import _ascii_safe
+from cli.cli import _ascii_safe
 
 
 def test_known_symbols_mapped_to_ascii():

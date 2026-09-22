@@ -2,6 +2,42 @@
 
 > 按时间顺序记录的收录、回写、查询、整理操作。
 
+## 2026-09-21
+
+- **回写**: 企微中继卡体系（用户要求评估企微卡片化调研文档起步，实施中七轮 spike 真连接实测推翻调研文档多处结论，转实测驱动落地）→ 新增变更页 [[0055_wecom-relay-cards]]（审批/clarify 交互卡 + 通用路由表 + 健康探测 + cron 审批卡 + multi_select 全链路）+ 洞察页 [[0056_wecom-aibot-card-protocol]]（毒字段静默丢弃/卡型可用性真相/事件结构/5 秒更新窗/单连接互顶——文档没写或与文档冲突的全部实测结论）；同批收原始快照 `raw/sources/xihe-agent × 企业微信集成方案（调研 + 设计）.md`（调研文档本体，多处协议错误被实测证伪，教训见 insight）。**编号撞号险情**：insight 初编 0030 与打包策略页撞号（0048 同款错误重演），改 0056。同步 index.md（0055 changes 行 + 0056 insights 行 + 页面数 53→55）、active.md（顶部条目）、recent.md。total_pages 53→55。
+
+## 2026-09-20
+
+- **回写**: 会话数据模型重构（用户报「上传附件后原本输入变了」「刷新后审批记录消失」「messages 表存太多」三连实测反馈驱动，一天四批次）→ 新增变更页 [[0054_messages-uuid-meta-refactor]]（附件气泡不变形 API 边界注入 / 审批决议持久化 / system+孤儿清理 / messages uuid 主键 + message_meta 拆分四样附属；ord 三踩坑存档：FTS content_rowid rowid 别名限制、ord 按会话不按轮、max+or 吞 0；不按业务分三张附属表的理由；迁移独立脚本幂等可恢复）；**大订正 [[0048_sessions-messages-reset]]**（messages 表结构 SQL 全替换为 uuid+ord+meta 双表、消息序列示例换 uuid/ord、新增附件注入路径节、reset 生命周期更新为已清理、关键不变量 6→9 条重写）；订正 [[0037]]（新增「审批决议记录」节——记忆与决议两层语义分离）、[[0024]]（历史帧 attachments+uuid 类型、trace approval、truncate uuid 参数、system 过滤注记改为已删除）；同步 index.md（0054 行 + 0048/0037 行更新 + 页面数 48→53、sources 6→10 对齐磁盘实数）、active.md（顶部条目 + 知识库现状）、recent.md。total_pages 52→53。
+
+## 2026-09-17
+
+- **回写**: 三模式调用架构收敛（用户要求沉淀本轮架构调整：turn_runner/xihe_agent/shared_context 职责 + 三模式调用关系 + 按新代码更新 wiki 和 README）→ 新增概念页 [[0052_three-mode-architecture]]（四层职责/调用关系/六条关键决策/排查指引）+ 变更页 [[0053_architecture-refactor]]（plan mode/turn_layers/AgentTurnRunner/chat 拆分/TurnCallbacks/office/技能重组/重名消除九项批次 + 关键决策 + 已知边界）；订正 README（Architecture 树 + 三层编排说明 + CLI /plan 提及 + 目录名）；同步 index.md（0052 concepts 行 + 0053 changes 行）、active.md、recent.md。total_pages 50→52。
+
+## 2026-09-16
+
+- **回写**: 可视化体系（用户要求调研 doubao-visualization 借鉴出 skill，后续多轮驱动定形："网关模式优化"→ 两工具合并"少且精"→"桌面不需要图片/转图仅限无渲染通道"→ 修破图/刷新丢失/空标记三轮）→ 新增变更页 [[0051_visualization-image-render]]（含自定义协议 host 陷阱、markdown 转义吃路径、hint-description 信号一致性、mermaid 无 hbar 四坑存档）；订正 [[0025]]（组件清单 HtmlRenderer + 渲染面互链）；同步 index.md（0051 行）、active.md、recent.md。同日 CLAUDE.md Gotchas 新增"三模式同步考虑"硬规则（用户要求记录，非 wiki 页）。total_pages 49→50。
+
+## 2026-09-15
+
+- **回写**: 终端体系整备（用户报「terminal 自动打开很吵、打印乱」检视后按方案落地，后续追加「快速连接去掉」「本地 tab 没用」「Run 面板做通用终端」「agent 终端 README 缺说明」）→ 新增变更页 [[0050_terminal-panel-overhaul]]（自动打开收敛/打印治乱/快速连接+本地 tab 移除/tab 可见性+viewer 不建频道/Run→ShellPanel/命名文案）；订正 [[0046]]（三源→双源大改写）、[[0025]]（模块清单 terminals.ts/ShellPanel）、[[0043]]（运行面板节已过时注记）；同步 index.md（0046 行重写 + 0050 行）、active.md、recent.md。README「Why xihe」补终端条目。total_pages 48→49。
+- **收录（候选）**: DSH 生态动态皮肤调研（dsh-live-wallpaper / BeautiCode / WE 桥接三路线）→ 新候选 desktop-dynamic-skin（「皮肤=数据不是代码」+ 皮肤目录协议 + 内置渲染器，不引入插件运行时；对现有 UI 影响评估：透明度连续旋钮 + scrim 对比度数学 + Monaco/终端默认不透）+ 快照 `raw/sources/dsh-dynamic-skin.md`。立项与否用户明确待定。开放候选 1→2。
+- **回写**: clarify 一等中途交互（MidturnHub 共享骨架 + 审批迁移其上 + 三模式通道 + 桌面 ClarifyCard）→ 0037 协调层条改写 + clarify 接入注、0024 WS 契约补两行；新测试文件 test_clarify.py（10 项）。
+- **回写**: 自动重置分隔条迟到修复（turn_start 带 auto_reset 预判）→ 0048 分隔条节补机制句。
+- **回写**: 重置分隔条功能（reset_marks 原因持久化 + round_start 派生 + 桌面分隔条/重置按钮 + /history 分隔行）→ 0048 增「重置分隔条」节 + 重置语义补 reset_marks；新测试 3 项。
+- **回写**: 会话重置丢历史+丢标题修复（用户报告 + review 质疑 JOIN 后订正 wiki 表结构块）→ 0048 Reset 节重写 + 表结构 SQL 补 session_key 列、0006 reset 行更新；新测试文件 test_session_rounds.py。
+- **回写**: 能力商店概念页（用户要求收录）→ 新增 [[0049_capability-store]]；先探索代理核实子系统（store.py/admin.py/StorePage/merge_mounts/test_store.py）。
+- **整理**: 目录归类审查（用户要求调整不对的类别）→ 0030 打包策略、0041 server tool 自 concepts/ 迁insights/（git mv + type 更新 + index 行迁段），其余 45 页核验无误。total_pages 47→48。
+
+## 2026-09-14
+
+- **整理**: 全库健康检查（用户要求「wiki 里其他文档依次检查，过时的更新」）——三路并行审计 32 个活引用页，订正 24 页（重灾区 0011 并发叙述/0009 调度器搬家/0034 base 地板/0013 过时注记/0024 WS 契约/0032 两层专家），index.md 七行摘要同步；changes/ 历史页按惯例不动；0017/0028/0029 deprecated 注记核验无误。详见 recent.md 2026-09-14 整理条。
+- **纠错**: 盘存发现会话数据模型页（2026-09-10 收录）误编号 0030 与打包策略页撞号且漏登记 index → 重编号 0048_sessions-messages-reset + 补 frontmatter + recent.md 引用更新；计数对齐磁盘实数 47（concepts 29）。
+- **回写**: 桌面端单 agent 收敛（用户要求「修正多 agent 残留」+「代码改完后同步更新 wiki」）→ 新增变更页 [[0047_desktop-single-agent-collapse]]（store 扁平化 + serve 删 /agents + common.tsx 死文件删除 + cron/complete 列表刷新有意放宽 + 转换陷阱存档；pytest 542 绿 + tsc 0 错 + build 绿）。
+- **订正 ×5**: [[0028]]/[[0029]] 页首加「已过时」注记（ClaudeRunner 双引擎已删除，claude/codex 走 [[0040]] external_agent 工具；用户主动指出 0028 内容已不对）；[[0025]] 加终态更新注记（多 agent 骨架清除 + connector 路线放弃）；[[0024]] REST 表删 /agents 行 + 「UI 按 capability 分支」表述改如实；[[0026]] 补演进记录。同步 index.md（0047 + 三行过时标记 + 0026 行 + 页数 46）、active.md（顶部条目 + 知识库现状 45→46 + 0027-0029 行过时标记）、recent.md。total_pages 45→46。
+- **维护提醒**: `.py` 改动（serve 删 /agents）需重启 serve；桌面 renderer 改动 Ctrl+R 即可。
+- **约定固化**: 用户建议整页过时用 frontmatter 区分 → `status: deprecated` 正式写入 PROTOCOL.md 文件约定（0017 既有实践的正式化）；0028/0029 翻为 `deprecated`。规则：整页过时 = `deprecated` + 页首注记；局部过时 = 保持 `active` + ⚠️ 订正注记。
+
 ## 2026-09-02
 
 - **回写**: 终端面板专门页（用户问「桌面端 terminal相关功能有沉淀wiki吗」→ 确认「收录」）→ 新增概念页 [[0046_shared-session-terminal]]。**先核实再落笔**：通读 `TerminalPanel.tsx`（784 行）/ `main/localPty.ts` / `src/tools/_local_tap.py` / `src/gateway/serve/terminal.py` + store.ts agentTermTarget 状态链，页面与当前代码一致（此前 0043 里的终端小节只有 5 行概览）。[[0043]] 相关页面节补互链。同步 index.md（concepts 段）、active.md（28 concept / 45 总数 + 一行）、recent.md。total_pages 44→45。

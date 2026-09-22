@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useState, type MouseEvent } from 'react'
-import { Brain, Check, ChevronRight, Copy, ExternalLink, Loader2, Navigation, SplitSquareHorizontal, Wrench, X } from 'lucide-react'
+import { Brain, Check, ChevronRight, Copy, ExternalLink, Loader2, Navigation, ShieldAlert, SplitSquareHorizontal, Wrench, X } from 'lucide-react'
 import type { TraceEvent } from '../appStore'
 import { cn } from '../lib/cn'
 import { getFullToolResult, getToolArgs } from '../lib/serveClient'
@@ -38,10 +38,10 @@ export function TurnTrace({
   /** Historical turn: serve reported persisted reasoning — shows a 思考 badge
    *  in the collapsed header before the trace is lazy-loaded. */
   hasReasoning?: boolean
-  /** Serve row id used to lazy-load the trace (historical turns only). */
-  anchor?: number
+  /** Serve row uuid used to lazy-load the trace (historical turns only). */
+  anchor?: string
   /** Expand hook that fires the lazy load. */
-  onLoadTrace?: (anchor: number) => void
+  onLoadTrace?: (anchor: string) => void
 }) {
   const [open, setOpen] = useState(pending)
   const events = trace ?? []
@@ -157,6 +157,29 @@ function parseToolJson(s: string): Record<string, unknown> | null {
   }
 }
 
+/** 历史审批徽章：该工具调用曾被审批门拦下，决议随 result JSON 持久化、
+ *  trace 端点提取而来。title 带完整 summary + 决议原因。 */
+function ApprovalBadge({ approval }: {
+  approval: NonNullable<ToolEv['approval']>
+}) {
+  const approved = approval.decision === 'approved'
+  const label = approved
+    ? (approval.always ? '已批准（不再询问）' : '已批准')
+    : '已拒绝'
+  return (
+    <span
+      title={`${approval.summary}${approval.reason ? ` — ${approval.reason}` : ''}`}
+      className={cn(
+        'inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[10px]',
+        approved ? 'bg-warning/10 text-warning/90' : 'bg-danger/10 text-danger'
+      )}
+    >
+      <ShieldAlert className="h-2.5 w-2.5" />
+      {label}
+    </span>
+  )
+}
+
 const ToolItem = memo(function ToolItem({ ev }: { ev: ToolEv }) {
   const [expanded, setExpanded] = useState(false)
   // Live tool_call events carry a 500-char slice + an id — fetch the full
@@ -208,6 +231,7 @@ const ToolItem = memo(function ToolItem({ ev }: { ev: ToolEv }) {
           <span className="rounded bg-elevated px-1 py-0.5 font-mono text-[11px] text-ink-2">
             {ev.name}
           </span>
+          {ev.approval ? <ApprovalBadge approval={ev.approval} /> : null}
           {ev.status === 'interrupted' ? (
             <span className="text-[10px] text-warning">已中断</span>
           ) : typeof ev.elapsed === 'number' ? (
@@ -229,7 +253,7 @@ const ToolItem = memo(function ToolItem({ ev }: { ev: ToolEv }) {
               }
             }}
             className={cn(
-              'mt-0.5 block w-full text-left font-mono text-ink-4 hover:text-ink-3',
+              'mt-0.5 block w-full select-text text-left font-mono text-ink-4 hover:text-ink-3',
               expanded ? 'whitespace-pre-wrap break-all' : 'truncate'
             )}
             title={argsText}
@@ -307,7 +331,7 @@ const ThoughtItem = memo(function ThoughtItem({ ev }: { ev: ThoughtEv }) {
           <ByBadge by={ev.by} />
           <p
             className={cn(
-              'min-w-0 flex-1 whitespace-pre-wrap italic text-ink-4',
+              'min-w-0 flex-1 select-text whitespace-pre-wrap italic text-ink-4',
               !expanded && tooLong && 'line-clamp-2'
             )}
           >
@@ -360,7 +384,7 @@ function fmtTs(ts?: number): string | null {
 
 // Lines shown before a result card collapses. Long outputs (file reads, search
 // dumps) stay scannable; expand reveals the full server-truncated payload.
-const RESULT_COLLAPSE_LINES = 8
+const RESULT_COLLAPSE_LINES = 5
 
 // Marker line the serve-side spill writes into the preview ("Full output
 // saved to: <path>") — the side-store path /toolresult serves.
@@ -468,7 +492,7 @@ function ResultBlock({
           </button>
         )}
       </div>
-      <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words px-2 py-1.5 font-mono text-[11px] leading-relaxed text-ink-3">
+      <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words px-2 py-1.5 font-mono text-[11px] leading-relaxed text-ink-3">
         {shown}
         {!expanded && collapsible && '\n…'}
       </pre>

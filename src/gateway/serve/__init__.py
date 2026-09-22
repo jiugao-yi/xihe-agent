@@ -12,7 +12,7 @@ from the agent's worker thread to the WebSocket via a stdlib ``queue.Queue`` —
 the same pattern as ``gateway.stream_consumer.StreamConsumer``.
 
 Layout: one file per business module, each owning its routes. ``system.py``
-(system probes), ``chat.py`` (the /stream turn engine + sessions/history),
+(system probes), ``conversations.py`` (the /stream turn engine + sessions/history),
 ``admin.py`` (management panel + specialists + store), ``browser.py``
 (browser panel), ``terminal.py`` (ssh terminal panel), ``knowledge.py``
 (memory + KBS) — the last two stateless, the rest mixins on ServeApp.
@@ -25,7 +25,6 @@ REST (stateless):
     GET  /health                          liveness + capability descriptor
     GET  /readiness                       structured what's-missing report (onboarding UIs)
     POST /test-connection                 server-side model-connection probe (key stays server-side)
-    GET  /agents                          the xihe "self" agent (P0; personas later)
     GET  /sessions                        serve-platform sessions (most-recent first)
     GET  /convs/{conv_id}/messages        transcript for one conversation
     POST /convs/{conv_id}/reset           start a fresh session round for a conversation

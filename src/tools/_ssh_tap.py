@@ -450,7 +450,6 @@ def live_snapshot() -> list[dict]:
                 "host": t.meta.get("host", ""),
                 "user": t.meta.get("user", ""),
                 "mode": t.meta.get("mode", ""),
-                "origin": t.meta.get("origin", "agent"),
                 "session_key": t.meta.get("session_key", ""),
                 "cols": t.meta.get("cols"),
                 "rows": t.meta.get("rows"),

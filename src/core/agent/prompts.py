@@ -10,7 +10,7 @@ import platform as _platform
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -212,13 +212,17 @@ PLATFORM_PROMPTS = {
         "Keep responses concise — WeCom has a 4000 char message limit. "
         "Do not use markdown formatting as WeCom renders it poorly.\n"
         "Media support:\n"
-        "- You CAN send images using the send_image tool.\n"
+        "- You CAN send images using the send_image tool (charts/diagrams: "
+        "image_render first, then send_image with the returned path).\n"
         "- NEVER say you cannot send images — always use the send_image tool.\n"
     ),
     "feishu": (
         "You are connected via Feishu (Lark). "
         "You can use markdown formatting for emphasis, code, and links. "
         "Keep responses focused.\n"
+        "Media support:\n"
+        "- You CAN send images using the send_image tool (charts/diagrams: "
+        "image_render first, then send_image with the returned path).\n"
     ),
     "telegram": (
         "You are connected via Telegram. "
@@ -344,7 +348,7 @@ def _scan_skills_index() -> dict[str, list[tuple[str, str]]]:
     return skills_by_category
 
 
-def build_skills_prompt(allowed: set = None) -> str:
+def build_skills_prompt(allowed: Optional[Iterable[str]] = None) -> str:
     """Build a compact skill index for the system prompt.
 
     ``allowed`` (a set of skill names) restricts the index to those skills;
@@ -429,11 +433,11 @@ class PromptCtx:
 
     tools: set
     platform: str = ""
-    skills_allowed: set = None
-    cwd: str = None
-    identity_override: str = None
-    agent_roster: str = None
-    kbs_preamble: str = None
+    skills_allowed: Optional[Iterable[str]] = None
+    cwd: Optional[Path] = None
+    identity_override: Optional[str] = None
+    agent_roster: Optional[str] = None
+    kbs_preamble: Optional[str] = None
     kbs_read_note: bool = False
     load_claude_md: bool = True
     load_cursorrules: bool = True
@@ -557,7 +561,7 @@ def _project_context(ctx: PromptCtx) -> Optional[str]:
         return None
     from core.agent.prompt_context import load_project_context
     return load_project_context(
-        cwd=ctx.cwd,
+        cwd=str(ctx.cwd) if ctx.cwd else None,
         include_claude_md=ctx.load_claude_md,
         include_cursorrules=ctx.load_cursorrules,
     ) or None
@@ -594,16 +598,16 @@ LAYERS: list[Layer] = [
 def build_system_prompt(
     platform: str = "",
     *,
-    identity_override: str = None,
-    available_tools: set = None,
-    skills_allowed: set = None,
+    identity_override: Optional[str] = None,
+    available_tools: Optional[set] = None,
+    skills_allowed: Optional[Iterable[str]] = None,
     project_context: bool = True,
-    agent_roster: str = None,
+    agent_roster: Optional[str] = None,
     load_claude_md: bool = True,
     load_cursorrules: bool = True,
-    kbs_preamble: str = None,
+    kbs_preamble: Optional[str] = None,
     kbs_read_note: bool = False,
-    cwd: str = None,
+    cwd: Optional[Path] = None,
     language: str = "zh",
 ) -> str:
     """Assemble the system prompt by walking LAYERS with a PromptCtx.
@@ -618,7 +622,7 @@ def build_system_prompt(
         tools=available_tools or set(),
         platform=platform,
         skills_allowed=skills_allowed,
-        cwd=cwd,
+        cwd=Path(cwd) if cwd else None,
         identity_override=identity_override,
         agent_roster=agent_roster,
         kbs_preamble=kbs_preamble,

@@ -1,6 +1,5 @@
 """Terminal tool — execute shell commands."""
 
-import codecs
 import logging
 import os
 import platform
@@ -133,18 +132,17 @@ def _execute_terminal(command: str = "", timeout: int = 120, cwd: str = None, **
         err_parts: list[str] = []
 
         def _drain(pipe, sink: list, decoder) -> None:
+            tap = _local_tap.LineTap(_ch, sink)
             try:
                 while True:
                     data = pipe.read1(65536)
                     if not data:
                         break
-                    s = decoder.decode(data)
-                    if s:
-                        sink.append(s)
-                        _ch.publish(s)
+                    tap.feed(decoder.decode(data))
             except Exception:
                 pass
             finally:
+                tap.flush()
                 try:
                     pipe.close()
                 except Exception:
@@ -152,11 +150,9 @@ def _execute_terminal(command: str = "", timeout: int = 120, cwd: str = None, **
 
         readers = [
             threading.Thread(target=_drain, daemon=True, name="term-out",
-                             args=(proc.stdout, out_parts,
-                                   codecs.getincrementaldecoder("utf-8")("replace"))),
+                             args=(proc.stdout, out_parts, _local_tap.StreamDecoder())),
             threading.Thread(target=_drain, daemon=True, name="term-err",
-                             args=(proc.stderr, err_parts,
-                                   codecs.getincrementaldecoder("utf-8")("replace"))),
+                             args=(proc.stderr, err_parts, _local_tap.StreamDecoder())),
         ]
         for t in readers:
             t.start()

@@ -11,7 +11,7 @@ tags:
   - deployment
 status: active
 created: 2026-08-07
-updated: 2026-09-01
+updated: 2026-09-14
 related_pages:
   - wiki/concepts/0006_session-design.md
   - wiki/concepts/0022_testing-strategy.md
@@ -133,8 +133,8 @@ def _resolve_agent_home() -> Path:
 
 ## 验证
 
-- `pytest -q` → 12 全绿（`conftest.isolate_db` monkeypatch `core.session._DB_PATH` 到 tmp，与 `AGENT_HOME` 取值正交、不受影响）。
-- smoke：`--config configs/smoke.yaml`（`agent_home: .xihe-smoke`）→ `AGENT_HOME` 重定位 ✓、sibling `.env` 的 `MODEL` 压过仓库根 `.env` ✓、`XIHE_CONFIG_FILE` 导出 ✓；不带 `--config` 时默认 `AGENT_HOME=.xihe-agent` 行为不变 ✓。
+- `pytest -q` → 全绿（2026-09-14：542 passed / 20 skipped；`conftest.isolate_db` monkeypatch `core.session._DB_PATH` 到 tmp，与 `AGENT_HOME` 取值正交、不受影响）。
+- smoke（2026-07 当时口径，`.env` 压制项已随单源化消亡）：`--config configs/smoke.yaml`（`agent_home: .xihe-smoke`）→ `AGENT_HOME` 重定位 ✓、`XIHE_CONFIG_FILE` 导出 ✓；不带 `--config` 时默认 `AGENT_HOME=.xihe-agent` 行为不变 ✓。
 
 ## 相关页面
 
