@@ -62,6 +62,10 @@
       "icon": "resources/icon.png",
       "category": "Development"
     },
+    "deb": {
+      "afterInstall": "build/deb-afterinstall.sh",
+      "afterRemove": "build/deb-afterremove.sh"
+    },
     "mac": {
       "target": [
         "dmg"

@@ -17,6 +17,7 @@ import {
   setTermPusher,
 } from './terminals'
 import { desktopDataDir } from './dataDir'
+import { ensureCliOnPath } from './path-register'
 
 // 单实例锁：双击两次（或残留进程 + 新开）会起两个桌面端、两个 serve 抢
 // 127.0.0.1:7788 —— 后到者 bind 失败 (winerror 10048)。拿不到锁的实例直接
@@ -678,6 +679,8 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  // 首启把内嵌 CLI 接入 PATH（幂等、容错、不阻塞），让终端能直接敲 `xihe`
+  void ensureCliOnPath()
   // Windows toasts need an explicit AppUserModelId — without it main-process
   // Notifications (cron results etc.) silently no-op.
   app.setAppUserModelId('com.xihe.desktop')
