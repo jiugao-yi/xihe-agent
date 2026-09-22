@@ -1,12 +1,15 @@
 ; xihe-agent NSIS custom steps: register the embedded CLI on the per-user PATH.
 ; The CLI bundle lives at $INSTDIR\bin\xihe (xihe.exe + _internal/), so the
 ; directory is added to HKCU "Environment" Path on install and removed on
-; uninstall. Uses only native NSIS commands (no third-party plugins).
+; uninstall.
+;
+; Implementation notes:
+;  - Uses only native NSIS instructions (LogicLib + StrCpy/StrLen/IntOp).
+;    No StrFunc.nsh: electron-builder bundles NSIS 3.0.4.1 whose StrFunc
+;    lacks the ${Using:StrFunc}/UnStrStr machinery used by newer NSIS.
+;  - Functions only touch $R0-$R9 so the macros' $0-$9 stay intact.
 
 !include "LogicLib.nsh"
-!include "StrFunc.nsh"
-${StrStr}
-${Using:StrFunc} UnStrStr
 
 Var XiheCliDir
 
@@ -17,8 +20,11 @@ Var XiheCliDir
   ${If} $0 == ""
     StrCpy $0 "$XiheCliDir;"
   ${Else}
-    ${StrStr} $1 $0 "$XiheCliDir"
-    ${If} $1 == ""
+    Push $0
+    Push "$XiheCliDir;"
+    Call Contains
+    Pop $1
+    ${If} $1 == 0
       StrCpy $0 "$XiheCliDir;$0"
     ${EndIf}
   ${EndIf}
@@ -31,21 +37,108 @@ Var XiheCliDir
   StrCpy $XiheCliDir "$INSTDIR\bin\xihe"
   ReadRegStr $0 HKCU "Environment" "Path"
   ${If} $0 != ""
-    ${UnStrStr} $1 $0 "$XiheCliDir;"
-    ${If} $1 != ""
-      StrLen $2 "$XiheCliDir;"
-      StrLen $3 $1
-      StrLen $4 $0
-      IntOp $5 $4 - $3       ; length of the prefix before the entry
-      StrCpy $6 $0 $5        ; prefix
-      StrCpy $7 $1 "" $2     ; suffix after "dir;"
-      StrCpy $0 "$6$7"
-      ${If} $0 == ""
-        DeleteRegValue HKCU "Environment" "Path"
-      ${Else}
-        WriteRegExpandStr HKCU "Environment" "Path" $0
-      ${EndIf}
+    Push $0
+    Push "$XiheCliDir;"
+    Call un.RemoveEntry
+    Pop $0
+    ${If} $0 == ""
+      DeleteRegValue HKCU "Environment" "Path"
+    ${Else}
+      WriteRegExpandStr HKCU "Environment" "Path" $0
     ${EndIf}
   ${EndIf}
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 !macroend
+
+; Contains: (stack top: needle, below: haystack) -> push 1 if haystack
+; contains needle else 0.
+Function Contains
+  Pop $R6
+  Pop $R7
+  StrLen $R0 $R6
+  StrLen $R1 $R7
+  StrCpy $R2 0
+  StrCpy $R4 0
+  ${DoWhile} $R2 <= $R1
+    StrCpy $R3 $R7 $R0 $R2
+    ${If} $R3 == $R6
+      StrCpy $R4 1
+      ${Break}
+    ${EndIf}
+    IntOp $R2 $R2 + 1
+  ${Loop}
+  Push $R4
+FunctionEnd
+
+Function un.Contains
+  Pop $R6
+  Pop $R7
+  StrLen $R0 $R6
+  StrLen $R1 $R7
+  StrCpy $R2 0
+  StrCpy $R4 0
+  ${DoWhile} $R2 <= $R1
+    StrCpy $R3 $R7 $R0 $R2
+    ${If} $R3 == $R6
+      StrCpy $R4 1
+      ${Break}
+    ${EndIf}
+    IntOp $R2 $R2 + 1
+  ${Loop}
+  Push $R4
+FunctionEnd
+
+; RemoveEntry: (stack top: needle, below: haystack) -> push haystack with the
+; first occurrence of needle removed (needle left empty by callers when the
+; entry was not found).
+Function RemoveEntry
+  Pop $R6
+  Pop $R7
+  StrLen $R0 $R6
+  StrLen $R1 $R7
+  StrCpy $R2 0
+  StrCpy $R8 ""
+  StrCpy $R9 0
+  ${DoWhile} $R2 <= $R1
+    StrCpy $R3 $R7 $R0 $R2
+    ${If} $R3 == $R6
+      StrCpy $R8 $R7 $R2
+      IntOp $R5 $R2 + $R0
+      StrCpy $R5 $R7 "" $R5
+      StrCpy $R8 "$R8$R5"
+      StrCpy $R9 1
+      ${Break}
+    ${EndIf}
+    IntOp $R2 $R2 + 1
+  ${Loop}
+  ${If} $R9 == 0
+    StrCpy $R8 $R7
+  ${EndIf}
+  Push $R8
+FunctionEnd
+
+Function un.RemoveEntry
+  Pop $R6
+  Pop $R7
+  StrLen $R0 $R6
+  StrLen $R1 $R7
+  StrCpy $R2 0
+  StrCpy $R8 ""
+  StrCpy $R9 0
+  ${DoWhile} $R2 <= $R1
+    StrCpy $R3 $R7 $R0 $R2
+    ${If} $R3 == $R6
+      StrCpy $R8 $R7 $R2
+      IntOp $R5 $R2 + $R0
+      StrCpy $R5 $R7 "" $R5
+      StrCpy $R8 "$R8$R5"
+      StrCpy $R9 1
+      ${Break}
+    ${EndIf}
+    IntOp $R2 $R2 + 1
+  ${Loop}
+  ${If} $R9 == 0
+    StrCpy $R8 $R7
+  ${EndIf}
+  Push $R8
+FunctionEnd
