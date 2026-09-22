@@ -30,6 +30,7 @@ import {
   deleteSpecialist,
   restartBrowser,
   testConnection,
+  type TestConnectionOverrides,
   type CronJobInfo,
   type CronRunInfo,
   type SpecialistSpec,
@@ -134,16 +135,22 @@ export function SettingsPanel({ onBack }: { onBack: () => void }) {
       setStatus({ kind: 'ok', msg: 'xihe已重启，配置已生效' })
     }
   }, [xiheStatus])
-  // POST /test-connection outcome for the 模型与连接 card. Runs in serve with
-  // the SAVED config.yaml values (the renderer holds no api_key), so unsaved
-  // form edits don't participate — the hint next to the button says so.
+  // POST /test-connection outcome for the 模型与连接 card. Runs in serve;
+  // unsaved form edits (base_url / api_key / model) are passed along so the
+  // test probes what the user just typed, falling back to the saved config.
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<null | { ok: boolean; text: string }>(null)
 
   const testConn = async () => {
     setTesting(true)
     setTestResult(null)
-    const r = await testConnection()
+    // Dirty 表单值随请求传给 serve：测"将要保存的配置"；无改动则测已保存配置
+    const overrides: TestConnectionOverrides = {}
+    if (cfg.baseUrl.trim() && cfg.baseUrl.trim() !== (xiheConfig.base_url ?? '')) overrides.base_url = cfg.baseUrl.trim()
+    if (cfg.apiKey.trim()) overrides.api_key = cfg.apiKey.trim()
+    if (cfg.model.trim() && cfg.model.trim() !== (xiheConfig.model ?? '')) overrides.model = cfg.model.trim()
+    const probingNew = Object.keys(overrides).length > 0
+    const r = await testConnection(probingNew ? overrides : undefined)
     setTesting(false)
     if (!r) {
       setTestResult({ ok: false, text: '探测失败：serve 未响应' })
@@ -152,9 +159,12 @@ export function SettingsPanel({ onBack }: { onBack: () => void }) {
     if (r.ok) {
       const found = r.models.length ? `，发现 ${r.models.length} 个模型` : ''
       const note = r.error ? `（${r.error}）` : ''
-      setTestResult({ ok: true, text: `连接正常${found}${note}` })
+      const scope = probingNew ? '新配置可连接' : '连接正常'
+      const hint = probingNew ? '（保存并重启后生效）' : '（当前已保存配置）'
+      setTestResult({ ok: true, text: `${scope}${found}${note}${hint}` })
     } else {
-      setTestResult({ ok: false, text: r.error ?? `HTTP ${r.status_code}` })
+      const scope = probingNew ? '新配置连接失败：' : ''
+      setTestResult({ ok: false, text: scope + (r.error ?? `HTTP ${r.status_code}`) })
     }
   }
 

@@ -43,14 +43,29 @@ class SystemMixin:
     async def test_connection(self, request):
         """Server-side model-connection test (api_key never crosses the API).
 
-        The desktop's「测试连接」button hits this instead of fetching from
-        the renderer, which has no key.
+        Optional JSON body — {base_url?, api_key?, model?} — overrides the
+        boot-time config so the desktop's「测试连接」can probe *unsaved* form
+        edits ("test what I just typed"); absent fields fall back to the
+        SAVED config.yaml values. The probe never mutates self.config.
         """
         from core.services.diagnostics import check_connectivity
-        result = await asyncio.to_thread(
-            check_connectivity, self.config.get("base_url"),
-            self.config.get("api_key"))
-        result["model_configured"] = self.config.get("model")
+        body = {}
+        try:
+            if request.can_read_body:
+                body = await request.json() or {}
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        def _pick(v: str | None, fallback):
+            v = str(v or "").strip()
+            return v or fallback
+
+        base_url = _pick(body.get("base_url"), self.config.get("base_url"))
+        api_key = _pick(body.get("api_key"), self.config.get("api_key"))
+        result = await asyncio.to_thread(check_connectivity, base_url, api_key)
+        result["model_configured"] = _pick(body.get("model"), self.config.get("model"))
         return web.json_response(result)
 
 

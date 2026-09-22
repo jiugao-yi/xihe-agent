@@ -28,6 +28,7 @@ CORE_DEPS=(
   "mcp>=1.2.0,<2"
   "playwright>=1.40"
   "paramiko>=3.0"
+  "olefile>=0.47"
   "prompt_toolkit>=3.0"
   "RestrictedPython>=8.0"
   "textual>=0.8"

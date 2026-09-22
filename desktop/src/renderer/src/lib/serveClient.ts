@@ -65,8 +65,9 @@ export function getHealth(): Promise<ServeHealth | null> {
 
 /** POST /test-connection — server-side model-endpoint probe (serve GETs
  *  {base_url}/models with the stored key). The renderer never sees the key,
- *  so the test must run inside serve. Tests the SAVED config.yaml values;
- *  unsaved form edits don't participate. */
+ *  so the test must run inside serve. Optional overrides carry *unsaved*
+ *  form edits (base_url / api_key / model) so「测试连接」can probe what the
+ *  user just typed; absent fields fall back to the saved config.yaml. */
 export interface TestConnectionResult {
   ok: boolean
   status_code: number | null
@@ -75,8 +76,14 @@ export interface TestConnectionResult {
   model_configured?: string | null
 }
 
-export function testConnection(): Promise<TestConnectionResult | null> {
-  return postJson<TestConnectionResult>('/test-connection')
+export interface TestConnectionOverrides {
+  base_url?: string
+  api_key?: string
+  model?: string
+}
+
+export function testConnection(overrides?: TestConnectionOverrides): Promise<TestConnectionResult | null> {
+  return postJson<TestConnectionResult>('/test-connection', overrides)
 }
 
 export interface HistoryMessage {

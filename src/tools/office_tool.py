@@ -186,6 +186,150 @@ def _word_write(args: dict, kw: dict) -> str:
                        blocks=len(blocks))
 
 
+def _read_legacy_doc(path: Path, max_chars: int) -> tuple[str, bool]:
+    """Extract text from a Word 97-2003 .doc (OLE2 compound document).
+
+    Pure-python via olefile: the document text lives in the WordDocument
+    stream, stored as UTF-16LE or CP1252 runs. Rather than reimplementing
+    the fragile FIB/piece-table walk, best-effort scan the stream for
+    printable runs — plenty for reading prose back. RTF / HTML files that
+    masquerade as .doc are sniffed and handled directly.
+    """
+    import olefile
+
+    raw = path.read_bytes()
+    head = raw[:1024].lstrip()
+
+    # Some "old Word" files are actually RTF or single-file HTML with a .doc
+    # extension — handle those before the OLE2 path.
+    if head.lower().startswith(b"{\\rtf"):
+        text = _strip_rtf(raw.decode("latin-1", "replace"))
+        if text.strip():
+            return _truncate_text(text, max_chars)
+    if b"<html" in raw[:4096].lower():
+        from html.parser import HTMLParser
+
+        class _TextParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.parts = []
+
+            def handle_data(self, data):
+                if data.strip():
+                    self.parts.append(data.strip())
+
+        parser = _TextParser()
+        try:
+            parser.feed(raw.decode("utf-8", "replace"))
+        except Exception:
+            pass
+        text = "\n".join(parser.parts)
+        if text.strip():
+            return _truncate_text(text, max_chars)
+
+    if not olefile.isOleFile(path):
+        raise ValueError("not an OLE2 compound document (no real .doc either)")
+    ole = olefile.OleFileIO(path)
+    try:
+        if not ole.exists("WordDocument"):
+            raise ValueError(".doc missing WordDocument stream")
+        data = ole.openstream("WordDocument").read()
+    finally:
+        ole.close()
+
+    text = _scan_utf16_text(data)
+    ansi = _scan_ansi_text(data)
+    # UTF-16 misreading ANSI text yields dense CJK-noise with almost no
+    # whitespace; real text (CJK or Latin) has visible space/newline ratio.
+    # Pick ANSI when it looks like spaced words and UTF-16 does not.
+    if ansi and _ws_ratio(ansi) > 0.05 and _ws_ratio(ansi) > _ws_ratio(text) * 2:
+        text = ansi
+    if not text.strip():
+        raise ValueError("no readable text found in WordDocument stream")
+    return _truncate_text(text, max_chars)
+
+
+def _ws_ratio(t: str) -> float:
+    if not t:
+        return 0.0
+    return sum(1 for c in t if c in " \n\t") / len(t)
+
+
+def _scan_utf16_text(data: bytes) -> str:
+    """Collect printable UTF-16LE runs (>=4 chars) from a binary stream."""
+    runs: list[str] = []
+    cur: list[str] = []
+    n = len(data)
+    i = 0
+    while i + 1 < n:
+        code = data[i] | (data[i + 1] << 8)
+        i += 2
+        if code in (0x0D, 0x0A, 0x09):
+            if len(cur) >= 4:
+                runs.append("".join(cur))
+            cur = []
+            continue
+        if 0x20 <= code <= 0x7E or (code >= 0x80 and not (0xD800 <= code <= 0xDFFF)
+                                    and not 0xE000 <= code <= 0xF8FF):
+            cur.append(chr(code))
+        else:
+            if len(cur) >= 4:
+                runs.append("".join(cur))
+            cur = []
+    if len(cur) >= 4:
+        runs.append("".join(cur))
+    return "\n".join(runs)
+
+
+def _scan_ansi_text(data: bytes) -> str:
+    """Collect printable CP1252/latin-1 runs (>=6 chars) from a binary stream."""
+    runs: list[str] = []
+    cur: list[str] = []
+    for b in data:
+        if b in (0x0D, 0x0A, 0x09) or 0x20 <= b < 0x7F or b >= 0xA0:
+            cur.append(chr(b))
+        else:
+            if len(cur) >= 6:
+                runs.append("".join(cur))
+            cur = []
+    if len(cur) >= 6:
+        runs.append("".join(cur))
+    return "\n".join(runs)
+
+
+def _strip_rtf(rtf: str) -> str:
+    """Minimal RTF-to-text: drop control words/params/groups, keep text runs."""
+    out: list[str] = []
+    i, n = 0, len(rtf)
+    while i < n:
+        c = rtf[i]
+        if c == "\\":
+            j = i + 1
+            if j < n and rtf[j] == "'":      # \'hh hex escape
+                i = j + 3
+                continue
+            while j < n and rtf[j].isalpha():
+                j += 1
+            while j < n and (rtf[j].isdigit() or rtf[j] == "-"):
+                j += 1
+            if j < n and rtf[j] == " ":
+                j += 1
+            i = j
+            continue
+        if c in "{}":
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "\n".join(line.strip() for line in "".join(out).splitlines() if line.strip())
+
+
+def _truncate_text(text: str, max_chars: int) -> tuple[str, bool]:
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
 def _word_read(args: dict, kw: dict) -> str:
     try:
         from docx import Document
@@ -207,6 +351,16 @@ def _word_read(args: dict, kw: dict) -> str:
     except (TypeError, ValueError):
         max_chars = 20000
     max_chars = max(500, min(max_chars, 100000))
+
+    # Legacy Word 97-2003 .doc (OLE2) — extract via olefile before the
+    # python-docx path, which only understands .docx.
+    if p.suffix.lower() == ".doc":
+        try:
+            text, truncated = _read_legacy_doc(p, max_chars)
+        except Exception as e:
+            return tool_error(f"cannot read legacy .doc '{p}': {e}")
+        return tool_result(success=True, action="word_read", path=str(p),
+                           text=text, truncated=truncated)
 
     doc = Document(str(p))
     lines = []
@@ -256,7 +410,8 @@ registry.register(
             "name": "office",
             "description": (
                 "Create and read office documents offline (xlsx via openpyxl, "
-                "docx via python-docx) — the deterministic way to deliver "
+                "docx via python-docx, legacy .doc via olefile) — the "
+                "deterministic way to deliver "
                 "real file artifacts (reports, data exports, memos). Gateway "
                 "chats deliver the file with send_file(file_path=...); on "
                 "desktop a relative path lands in the conversation's "
@@ -270,7 +425,7 @@ registry.register(
                 "properties": {
                     "action": {"type": "string", "enum": list(_ACTIONS)},
                     "path": {"type": "string",
-                             "description": "File path (.xlsx/.docx); relative = workspace"},
+                             "description": "File path (.xlsx/.docx/.doc); relative = workspace"},
                     "sheets": {
                         "type": "array",
                         "description": "excel_write: [{name, rows: [[...]], header?: bool}]",

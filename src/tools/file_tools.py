@@ -357,6 +357,11 @@ def _read_file(args: dict, **kw) -> str:
             return tool_error(f"Cannot read '{path}': this is a device file that would block or produce infinite output.")
 
         if _has_binary_extension(path):
+            if Path(path).suffix.lower() == ".doc":
+                return tool_error(
+                    "`*.doc` is the legacy Word 97-2003 OLE2 binary format — "
+                    "use the office tool (action='word_read') to extract its "
+                    "text; docx and doc are both supported.")
             return tool_error(f"Cannot read binary file '{path}' ({Path(path).suffix}). Use terminal to inspect binary files.")
 
         p = Path(path).expanduser().resolve()
