@@ -1,0 +1,35 @@
+# --- repo-local backups; live data root is ~/.xihe-agent/ ---
+/.xihe-agent/
+/.biz_kbs/
+
+# --- IDE ---
+.idea/
+
+# --- desktop/ (Electron; separate Node toolchain) ---
+desktop/node_modules/
+desktop/out/
+desktop/dist/
+# 各环境镜像割裂(公网 npmmirror vs 内网 wnpm),lockfile 无法跨环境共享,各自本地生成
+desktop/package-lock.json
+
+# --- misc ---
+*.log
+.DS_Store
+*.egg-info/
+/xihe-store/
+
+# --- real-LLM routing eval artifacts (tests/test_routing_eval.py) ---
+/tests/evals/
+__pycache__/
+*.pyc
+
+# --- 内网敏感信息（推送前必须排除） ---
+/src/skills/ssh-access/assets/*.json
+
+# --- build artifacts ---
+/build/
+/dist/
+/desktop/release/
+/desktop/resources/bin/
+/desktop/resources/config.example.yaml
+/xihe-agent.iml
