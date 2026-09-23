@@ -298,17 +298,17 @@ def _run_single_child(
                 except Exception:
                     logger.debug("child tool_result forward failed", exc_info=True)
 
-        chat_kwargs = {}
-        if parent_stream:
-            chat_kwargs["stream_delta_callback"] = _child_stream
-        if parent_tool_start:
-            chat_kwargs["tool_call_start_callback"] = _child_tool_start
-        if parent_tool_done:
-            chat_kwargs["tool_call_callback"] = parent_tool_done
-        if parent_tool_result:
-            chat_kwargs["tool_result_callback"] = _child_tool_result
-
-        response = child.chat(source=source, user_message=goal, **chat_kwargs)
+        # chat() 的流式回调已收敛进 TurnCallbacks（旧扁平参数
+        # stream_delta_callback/... 已从签名移除，传了会 TypeError）。
+        # 只注入非空回调；approval/clarify 走父代理注入的 shared 引用。
+        from core.agent.agent import TurnCallbacks
+        chat_callbacks = TurnCallbacks(
+            stream_delta=_child_stream if parent_stream else None,
+            tool_call_start=_child_tool_start if parent_tool_start else None,
+            tool_call=parent_tool_done if parent_tool_done else None,
+            tool_result=_child_tool_result if parent_tool_result else None,
+        )
+        response = child.chat(source=source, user_message=goal, callbacks=chat_callbacks)
 
         duration = round(time.monotonic() - child_start, 2)
 

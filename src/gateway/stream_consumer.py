@@ -99,7 +99,7 @@ class StreamConsumer:
     Usage::
 
         consumer = StreamConsumer(adapter, chat_id, reply_req_id)
-        # Pass consumer.on_delta as stream_delta_callback to agent.chat()
+        # Pass consumer.on_delta via TurnCallbacks(stream_delta=...) to agent.chat()
         task = asyncio.create_task(consumer.run())
         # ... run agent in thread pool ...
         consumer.finish()
