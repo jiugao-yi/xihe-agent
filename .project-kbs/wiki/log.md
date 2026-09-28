@@ -2,6 +2,10 @@
 
 > 按时间顺序记录的收录、回写、查询、整理操作。
 
+## 2026-09-28
+
+- **补写**: 09-24~28 大批次（已随代码提交 cb0242f）回写进**既有页面**（用户指定不加新页）——[[0057_context-compression-v32]] 追加「委派/trace 链后续批次」节（delegate_task 单 tasks 形态收敛/bridge by+tool_call_id 修复/specialist 编号/sync 指纹幂等/message_meta.children+created_at 下钻/流中断掐断 115s→亚秒/registry 截断参数自愈+write_file 长度提示，frontmatter affected_modules 与 updated 同步）；[[0058_desktop-scroll-follow-race]] 扩为桌面体验批（滚动条拖拽盲区补丁/trace 子代理展示体系：两级分组+仪表盘+位置保真+色条/Ctrl+F/Enter 语义/工作空间绑定入口/图片 MD 适配/文件覆盖层/Office 不做决策，title 与 affected_modules 同步）。同步 index.md 0057/0058 两行。未回写项（goal 展示、tool 参数语义化、@ 选文件）：暂挂待做，对话在案。
+
 ## 2026-09-24
 
 - **收录候选 specialist-parallel-dispatch**（用户要求"先记录到 wiki 后面再评估"）：专家 agent 并发派发的 parallel_safe 调度分组方案——起于两起实测（delegate_task 三连单调用串行 30+ 分钟、run_explore_agent 三连 tool_call 被 `_dispatch_tools` 的 read_only 分组串行化——模型协议原生的并行表达被调度层浪费）。核心设计：注册表新维度 parallel_safe 与 read_only 模式同构、按专家 def 字段计算（sticky ∨ 写面 → 串行，纯只读专家并行，零新配置）、四个已核实交互点（sticky 会话共写/MidturnHub 单 pending 构造假设/取号竞态/中断与回填安全）、两条已否决替代路径（goals 数组、YAML 显式声明）。~1.5 天量级，暂不实施，触发信号与已落地配套存档。开放候选 2→3。

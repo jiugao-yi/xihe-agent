@@ -6,14 +6,18 @@ change_type: refactor
 risk_level: high
 status: completed
 created: 2026-09-23
-updated: 2026-09-23
+updated: 2026-09-28
 affected_modules:
   - src/core/session.py
   - src/core/agent/compressor.py
   - src/core/agent/agent.py
   - src/core/context.py
   - src/core/config.py
+  - src/core/registry.py
   - src/core/support/tool_result_storage.py
+  - src/tools/delegate_tool.py
+  - src/tools/specialist_agent_tool.py
+  - src/tools/file_tools.py
   - src/gateway/commands.py
   - src/gateway/serve/conversations.py
   - src/cli/doctor.py
@@ -63,6 +67,18 @@ related_pages:
 - `/compress` 命令（CLI+gateway 同一 handler）走 `load_context_messages` + compress，文案注明完整历史保留
 - serve `get_messages` 响应附带 `compactions` 数组（按全部 round 的 session_id 聚合）——桌面折叠卡片数据先行
 - serve `/test-connection` 与 `xihe doctor` 传 model（见 0059）
+
+## 委派/trace 链后续批次（2026-09-24~28 追加，同提交落地）
+
+压缩架构之上的委派链与中断修复，实测驱动（用户报「停止好久才能成功」「历史看不到子代理过程」「JSON 截断错误」）：
+
+- **delegate_task 收敛单一 tasks 形态**：goal/context/toolsets 顶层参数删除，只认 `tasks` 数组（1-3 项）——双轨形态让模型连发三次单任务调用串行化了本应并行的三个调研子代理（实测 30+ 分钟）；description 点名 "separate calls serialize" 反模式 + 补失败语义（status 六值/error 字段/批量内互不影响）与时间预期（"minutes, not seconds"）
+- **bridge 工具事件标签修复**：`tool_call`（done）裸传丢 `by` 标签、`tool_call_start/result` 未透传 `tool_call_id`——子代理工具流此前完全不可见或无标签归主代理名下；探针（FakeClient 直穿 bridge）四事件全带标签验证
+- **specialist 派发编号**：label 从裸 slug 改 `explore-N`（与 delegate 共享父级 `_delegate_seq` 计数器）——多次派发在桌面分组渲染中不再塌成一个未区分块
+- **sync_specialist_agent_tools 指纹幂等**：每条消息构建 agent 时的例行 sync 曾全量重注册（registry 版本 bump → get_schemas 缓存失效 + 日志刷屏）；现在按 def 指纹跳过未变项，"手编辑 yaml 下次 list 读取收敛"契约保留
+- **message_meta.children + created_at**：委派 tool 行的 meta 记 `[{session_key,label}]` 指针（dispatch 时经 `_children_sink` 收集、持久化写入；**不进模型可见的结果 JSON**——0054 分类标准的延续）；serve `get_trace` 按指针下钻 `load_transcript`，历史刷新显示子代理思考/工具（批内按 label 尾号排任务序，消除完成竞速错位）；存量库一次性 ALTER（`scripts/migrate_meta_children.py` 幂等，created_at 从消息行回填）
+- **流中断掐断在途请求**：agent 持有 `_active_stream`，interrupt() 主动 close()——GLM 长思考期下一 chunk 数分钟不来的窗口，停止延迟实测 115s → 亚秒；掐断异常按"中断=保留部分结果"处理（与循环内 break 同语义），不误报 API 错误
+- **registry 截断参数自愈**：流式 tool_call 参数被 completion 上限截断（实测 20KB+ write_file content 三连失败）时返回明确指引（"参数不完整、未执行、请重发"）而非裸 JSONDecodeError——模型可自愈重试而非误判工具故障；write_file description 同步加 <8000 字符/分段 append 提示
 
 ## 关键决策
 
