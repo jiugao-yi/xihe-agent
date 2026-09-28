@@ -157,11 +157,11 @@ export function SettingsPanel({ onBack }: { onBack: () => void }) {
       return
     }
     if (r.ok) {
-      const found = r.models.length ? `，发现 ${r.models.length} 个模型` : ''
-      const note = r.error ? `（${r.error}）` : ''
+      const tested = r.model_configured ? `，模型 ${r.model_configured} 可用` : ''
+      const note = r.note ? `（${r.note}）` : ''
       const scope = probingNew ? '新配置可连接' : '连接正常'
       const hint = probingNew ? '（保存并重启后生效）' : '（当前已保存配置）'
-      setTestResult({ ok: true, text: `${scope}${found}${note}${hint}` })
+      setTestResult({ ok: true, text: `${scope}${tested}${note}${hint}` })
     } else {
       const scope = probingNew ? '新配置连接失败：' : ''
       setTestResult({ ok: false, text: scope + (r.error ?? `HTTP ${r.status_code}`) })

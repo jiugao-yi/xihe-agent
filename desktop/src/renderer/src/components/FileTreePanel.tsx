@@ -11,6 +11,7 @@ import {
   FolderPlus,
   FolderTree,
   GitBranch,
+  Maximize2,
   PanelLeftClose,
   PanelRightClose,
   Pencil,
@@ -41,6 +42,9 @@ interface Props {
   onCollapse?: () => void
   /** Run-panel prefill (Play hover action on runnable files). */
   onRunFile?: (command: string) => void
+  /** Present → the drawer viewer gains an "expand" action; App mounts the
+   *  full-content-area overlay with this path (big reading surface). */
+  onExpandFile?: (path: string) => void
 }
 
 /** 扁平（单链目录合并）展示 preference — app-wide (both tree instances share
@@ -796,7 +800,7 @@ function RowActions({ runCmd, onRunFile, onRename, onDelete }: {
 /** Chat-mode file panel: the tree plus a single-file viewer drawer (Monaco,
  *  lazily loaded). In workbench mode the tree is embedded bare and files open
  *  as editor tabs instead — see App.tsx. */
-export function FileTreePanel({ workspace, className, onCollapse, onRunFile }: Props) {
+export function FileTreePanel({ workspace, className, onCollapse, onRunFile, onExpandFile }: Props) {
   const fsVersion = useStore((s) => s.fsVersion)
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [content, setContent] = useState<Content>({ state: 'idle' })
@@ -957,6 +961,15 @@ export function FileTreePanel({ workspace, className, onCollapse, onRunFile }: P
                   {saving ? '保存中…' : '保存'}
                 </button>
               </>
+            )}
+            {onExpandFile && selectedFile && (
+              <button
+                onClick={() => onExpandFile(selectedFile)}
+                title="在大视图中打开（覆盖对话区）"
+                className="rounded p-0.5 text-ink-4 transition hover:text-ink-2"
+              >
+                <Maximize2 className="h-3 w-3" />
+              </button>
             )}
             <button
               onClick={() => {

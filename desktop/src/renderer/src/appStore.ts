@@ -283,6 +283,12 @@ interface DesktopState {
   addWorkspace: (workdir: string, name?: string) => void
   removeWorkspace: (id: string) => void
   openConversationInWorkspace: (workspaceId: string) => void
+  /** Bind (or unbind with null) a conversation's workspace AFTER creation —
+   *  the header buttons' "先绑定工作空间" entry point. Binding is metadata
+   *  only: the file tree / workbench / sidebar scoping follow immediately,
+   *  and the agent picks up the cwd on the NEXT send (prior turns ran
+   *  unscoped and are not re-interpreted). */
+  bindConversationWorkspace: (convId: string, workspaceId: string | null) => void
   /** Enter a workspace: scope the sidebar to its conversations, pick the most
    *  recent bound one (or seed a fresh bound conv if it has none), land on the
    *  chat tab. The middle/right panes follow because the active conv is bound. */
@@ -1406,6 +1412,18 @@ export const useStore = create<DesktopState>()((set, get) => {
           if (wid !== id) convWorkspace[cid] = wid
         }
         return { workspaces, convWorkspace }
+      })
+      persistWs()
+    },
+
+    bindConversationWorkspace: (convId, workspaceId) => {
+      set((s) => {
+        if (!s.conversations.some((c) => c.id === convId)) return {}
+        if (workspaceId && !s.workspaces.some((w) => w.id === workspaceId)) return {}
+        const convWorkspace = { ...s.convWorkspace }
+        if (workspaceId) convWorkspace[convId] = workspaceId
+        else delete convWorkspace[convId]   // null = unbind back to 通用
+        return { convWorkspace }
       })
       persistWs()
     },

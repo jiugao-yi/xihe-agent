@@ -11,12 +11,13 @@ tags:
   - storage
 status: active
 created: 2026-09-10
-updated: 2026-09-20
+updated: 2026-09-23
 related_pages:
   - wiki/concepts/0006_session-design.md
   - wiki/concepts/0024_desktop-serve-protocol.md
   - wiki/insights/0026_desktop-agent-model-built-in-xihe.md
   - wiki/changes/0054_messages-uuid-meta-refactor.md
+  - wiki/changes/0057_context-compression-v32.md
 ---
 
 # 会话数据模型：sessions / messages 表与 reset 机制
@@ -119,14 +120,37 @@ CREATE TABLE message_meta (        -- 应用附属（1:1 从属；写一次跟�
   └─ _create_session() → INSERT sessions 行，生成新 session_id
 ```
 
-### 消息持久化（agent loop）
+### 消息持久化（agent loop，2026-09-23 起 append-only）
 
 ```
 agent.chat() 内部，每次迭代结束调 _persist_messages(session_id, messages)
-  → rewrite_messages()：增量前缀匹配（对比上次写入的行哈希——只哈希模型面向列，
-    meta 不参与 diff；meta 只随主行创建写一次），
-    按 ord 定位分歧行，只 DELETE 分歧行（显式连删 meta）+ INSERT 尾部新行
-    （新行 uuid 主键、ord 接续会话内 max+1）→ O(增量) 而非 O(全量)
+  → rewrite_messages()：append-only——历史永不重写/删除（只有 truncate/delete
+    会话级操作删行）。load_messages 给每行带稳定 _id（uuid，下划线内部键），
+    重 append 时带 _id 的行跳过（天然幂等），只 INSERT 未持久化的新尾部行
+    （新行 uuid 主键、ord 接续会话内 max+1）；_compaction 标记的合成摘要行跳过
+```
+
+旧版按行哈希做增量前缀匹配（分歧行 DELETE + 尾部 INSERT）已删除——压缩产物
+物理覆盖 DB 的语义随 v3.2 取消（见 [[0057_context-compression-v32]]）：
+压缩改写 compactions 表，messages 行零删改。
+
+### 上下文压缩视图（compactions 表，2026-09-23）
+
+```
+compress(view, session_key, session_id):
+  _align_head → head 锚（system + 首个语义完整回合, hard_cap=8）
+  _find_tail_start → tail 锚（~20K tokens, CJK-aware 口径）
+  中间区间 → aux 七段摘要（PREVIOUS SUMMARY 从 compactions 读——渐进摘要不依赖内存）
+  → INSERT compactions(id, session_id, head_end_id, tail_start_id, summary, ...)
+  messages 表零写操作
+
+load_context_messages(session_id)：模型每轮的视图 = raw 行 + 最新 compaction
+  = head 原文 + 合成摘要行（_compaction 标记，仅内存）+ tail 原文
+  锚点行已被 truncate 删 → 删该记录、退回全量（安全降级，下轮重新触发）
+
+桌面端 load_messages / load_transcript 照常返回全量原文——压缩对人类不可见，
+被摘要的对话与工具调用全部可查；serve /convs/{id}/messages 附带 compactions
+数组供桌面折叠卡片（UI 后续批次）。
 ```
 
 一轮（turn）的消息序列（DB 中的行；id 为 uuid 示意缩写）：
@@ -272,11 +296,13 @@ _reset（自动 or 手动，2026-09-15 修订）:
 ## 5. 关键不变量
 
 1. **session_key 是确定性的**：同一个 (platform, chat_id, user_id, chat_type) 永远生成同一个 key
-2. **messages 只增不删**（除非 reset/delete）——正常迭代中 `rewrite_messages` 是前缀追加
+2. **messages 只增不删**（除非 truncate/delete 会话级操作）——迭代持久化是 append（带 `_id` 幂等跳过）；**压缩也不删行**（v3.2 起：压缩只写 compactions，模型视图与桌面历史解耦）
 3. **agent loop 每次迭代后落库**——中断/崩溃不丢已完成的工作
 4. **部分中断文本带标记落库**（2026-09-10 加）——刷新后保留 + fold 识别为未完成
-5. **reset 换 session_id 不删旧消息**——旧消息跨轮可达（session_key 键控）
+5. **reset 换 session_id 不删旧消息**——旧消息跨轮可达（session_key 键控）；compactions 按 round（session_id）隔离，reset 后新 round 视图自动干净
 6. **`_reshape_history` 的 settled 判据**：无 tool_calls 的 assistant 行 = 最终回复；带 `[被中断` 标记的除外
 7. **content 是模型面向的纯净通道**（2026-09-20 起）：用户原文不拼附件块、工具输出不带审批判决、system 不落库——应用附属数据全在 message_meta，模型历史和展示各取所需（2026-09-10 版的「reset 后不可达」表述随孤儿清理与 key 键控失效）
-8. **meta 写一次跟主行**：`_persist_row_key` 不哈希 meta——meta 随主行创建落一次库，后续 rewrite 前缀匹配不会重写它；load_messages 用下划线内部键（`_reasoning`/`_usage`/`_attachments`）带回，`_prepare_api_messages` 剥离（approval 例外：永不回模型）
+8. **meta 写一次跟主行**：meta 随主行创建落一次库；append-only（v3.2 起）下行 id 永不变 → meta 关联永稳，无需 rewrite 续命；load_messages 用下划线内部键（`_reasoning`/`_usage`/`_attachments`/`_id`）带回，`_prepare_api_messages` 剥离（approval 例外：永不回模型）
 9. **uuid 行序靠 ord**：所有「按行序」的 SQL（load/转录/truncate 定位/usage 定位）必须 ORDER BY / 比较 `ord`，绝不能 ORDER BY id（uuid 随机序）；跨会话无全局序（search 的 LIKE 回退退化为 created_at 近似排序）
+10. **压缩只写 compactions**（2026-09-23 起）：模型侧信息有损只允许发生在 aux 摘要一步；其余环节（微压缩占位、side-store 存根）只允许"可寻址的移出"——tail 里的 `<persisted-output>` 存根随视图保留，模型仍能按路径 read_file 取回
+11. **触发基数用真实 usage**：`sessions.last_prompt_tokens`（上轮最后请求的真实 prompt_tokens）跨 agent 实例持久化——gateway 每消息新建 agent，实例字段必失效；估算只负责响应后的增量

@@ -953,13 +953,15 @@ registry.register(
                 "Write content to a file, completely replacing existing content. "
                 "Creates parent directories automatically. OVERWRITES the entire file — use patch for targeted edits. "
                 "Refused when the file changed since you last read it (read_file again, or force=true). "
-                "Protected paths (.ssh, .aws, /etc) are blocked — use terminal with sudo for system files."
+                "Protected paths (.ssh, .aws, /etc) are blocked — use terminal with sudo for system files. "
+                "Keep content under ~8000 chars per call (longer gets truncated "
+                "mid-JSON); write long documents in parts with mode='append'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path to write"},
-                    "content": {"type": "string", "description": "Content to write"},
+                    "content": {"type": "string", "description": "Content to write (<8000 chars; longer → write in parts + append)"},
                     "mode": {"type": "string", "enum": ["overwrite", "append"], "description": "Write mode (default: overwrite)"},
                     "encoding": {"type": "string", "description": "File encoding (default: utf-8)"},
                     "force": {"type": "boolean",

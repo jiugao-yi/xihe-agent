@@ -243,7 +243,7 @@ def core():
                           model=config["model"], config=config)
     compressor = ContextCompressor(
         context_length=XiheAgent._get_context_length_static(config, config["model"]),
-        threshold_percent=config["compression_threshold"], aux=aux)
+        threshold_percent=config["compression_threshold"], aux=aux, db=db)
     main_toolsets, main_skills = merge_mounts(
         "main", *resolve_roster(config, where="config.yaml"))
 

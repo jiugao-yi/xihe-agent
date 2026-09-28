@@ -200,7 +200,7 @@ def _parse_config_file(config_path: str) -> dict:
         "api_key": "",
         "platform": "wecom",
         "max_iterations": 30,
-        "compression_threshold": 0.50,
+        "compression_threshold": 0.75,
         # 思考/回复语言引导：zh | en | auto（不引导）。桌面端可配置。
         "language": "zh",
         # GLM-class thinking models spend completion tokens on reasoning too;
@@ -257,7 +257,7 @@ def seed_default_config(config_path: str | None = None) -> bool:
     if not src.is_file():
         return False
     try:
-        header = ("# xihe 首次启动时按模板生成——填好 api_key（并按需调整 model/toolsets）后即可使用。\n")
+        header = "# xihe 首次启动时按模板生成——填好 api_key（并按需调整 model/toolsets）后即可使用。\n"
         path.write_text(header + src.read_text(encoding="utf-8"), encoding="utf-8")
         return True
     except OSError:

@@ -78,7 +78,23 @@ const desktop = {
   },
   // Pull bridge: current xihe status snapshot, fetched on mount to cover the
   // pre-did-finish-load window where an early `running` push can be dropped.
-  getXiheStatus: (): Promise<unknown> => ipcRenderer.invoke('xihe:status')
+  getXiheStatus: (): Promise<unknown> => ipcRenderer.invoke('xihe:status'),
+  // In-page find (Ctrl+F): renderer draws the search bar, main drives
+  // webContents.findInPage. onFindOpen fires on Ctrl+F; onFindNext on F3
+  // (direction ±1). Empty text → main stops the find and clears highlights.
+  findStart: (text: string, forward?: boolean) =>
+    ipcRenderer.invoke('find:start', text, forward),
+  findStop: () => ipcRenderer.invoke('find:stop'),
+  onFindOpen: (cb: () => void): (() => void) => {
+    const handler = () => cb()
+    ipcRenderer.on('find:open', handler)
+    return () => ipcRenderer.removeListener('find:open', handler)
+  },
+  onFindNext: (cb: (dir: number) => void): (() => void) => {
+    const handler = (_e: unknown, dir: number) => cb(dir)
+    ipcRenderer.on('find:next', handler)
+    return () => ipcRenderer.removeListener('find:next', handler)
+  }
 }
 
 contextBridge.exposeInMainWorld('desktop', desktop)

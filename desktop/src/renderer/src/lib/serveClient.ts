@@ -63,16 +63,17 @@ export function getHealth(): Promise<ServeHealth | null> {
   return getJson<ServeHealth>('/health')
 }
 
-/** POST /test-connection — server-side model-endpoint probe (serve GETs
- *  {base_url}/models with the stored key). The renderer never sees the key,
- *  so the test must run inside serve. Optional overrides carry *unsaved*
- *  form edits (base_url / api_key / model) so「测试连接」can probe what the
- *  user just typed; absent fields fall back to the saved config.yaml. */
+/** POST /test-connection — server-side model-endpoint probe (serve POSTs a
+ *  minimal chat completion to {base_url}/chat/completions with the stored
+ *  key). The renderer never sees the key, so the test must run inside serve.
+ *  Optional overrides carry *unsaved* form edits (base_url / api_key / model)
+ *  so「测试连接」can probe what the user just typed; absent fields fall back
+ *  to the saved config.yaml. */
 export interface TestConnectionResult {
   ok: boolean
   status_code: number | null
-  models: string[]
   error: string | null
+  note?: string | null
   model_configured?: string | null
 }
 

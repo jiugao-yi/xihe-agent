@@ -662,6 +662,43 @@ function createWindow(): void {
   })
   mainWin.on('closed', () => { mainWin = null; mainShown = false })
 
+  // In-page find (Ctrl+F / F3 / Shift+F3): the renderer owns the search-bar
+  // UI (app-styled) but findInPage/stopFindInPage live on webContents (main
+  // side only, contextIsolation). forward:true on F3/Enter wraps around.
+  mainWin.webContents.on('before-input-event', (e, input) => {
+    if (input.type !== 'keyDown') return
+    const ctrl = input.control || input.meta
+    const wc = mainWin?.webContents
+    if (!wc) return
+    if (ctrl && input.key.toLowerCase() === 'f') {
+      wc.send('find:open')
+      e.preventDefault()
+    } else if (input.key === 'F3') {
+      wc.send('find:next', input.shift ? -1 : 1)
+      e.preventDefault()
+    }
+  })
+
+  // Search text in → webContents.findInPage; '' or missing → stopFindInPage
+  // (clears Chromium's yellow highlights). findInPage highlights LIVE DOM
+  // text only — collapsed trace cards / virtualized-off messages are not
+  // searched until expanded/scroll-into-view (known limit).
+  ipcMain.handle('find:start', (e, text: unknown, forward: unknown) => {
+    const wc = mainWin?.webContents
+    if (!wc) return null
+    const q = typeof text === 'string' ? text : ''
+    if (!q) {
+      wc.stopFindInPage('clearSelection')
+      return null
+    }
+    wc.findInPage(q, { forward: forward !== false, findNext: true })
+    return null
+  })
+  ipcMain.handle('find:stop', () => {
+    mainWin?.webContents.stopFindInPage('clearSelection')
+    return null
+  })
+
   // NOTE: no ready-to-show → show(). The window stays hidden until serve is
   // ready (maybeShowMain).
   mainWin.webContents.setWindowOpenHandler(({ url }) => {

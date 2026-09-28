@@ -96,35 +96,46 @@ def probe_system_browser() -> str | None:
     return None
 
 
-def check_connectivity(base_url: str, api_key: str, timeout: float = 8.0) -> dict:
-    """GET {base_url}/models — reachable + auth accepted, plus model list.
+def check_connectivity(base_url: str, api_key: str, timeout: float = 8.0,
+                       model: str = "") -> dict:
+    """Probe the model endpoint with a minimal chat completion — the same
+    request shape a real conversation uses, so the verdict tests the
+    capability users actually need (a /models listing proves nothing: many
+    internal gateways don't expose it while /chat/completions works fine).
 
-    404 counts as reachable (some internal gateways don't expose /models);
-    401/403 means the key is bad, which is the answer users actually need.
+    ``ok`` is the single verdict consumers branch on; ``error`` carries the
+    failure reason and ``note`` an explanatory detail (never rendered as a
+    failure). The model list is NOT fetched here — the config names the model
+    to test, and that is the only one that matters.
     """
     import httpx
-    url = f"{str(base_url or '').rstrip('/')}/models"
+    url = f"{str(base_url or '').rstrip('/')}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    payload = {
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 8,
+    }
+    if model:
+        payload["model"] = model
     try:
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         with httpx.Client(timeout=timeout) as client:
-            resp = client.get(url, headers=headers)
+            resp = client.post(url, headers=headers, json=payload)
     except Exception as e:
-        return {"ok": False, "status_code": None, "models": [], "error": str(e)}
+        return {"ok": False, "status_code": None, "error": str(e), "note": None}
     out = {"ok": resp.status_code < 400, "status_code": resp.status_code,
-           "models": [], "error": None}
-    if resp.status_code == 200:
-        try:
-            data = resp.json().get("data", [])
-            out["models"] = sorted(str(m.get("id")) for m in data
-                                   if isinstance(m, dict) and m.get("id"))
-        except Exception:
-            pass
-    elif resp.status_code in (401, 403):
+           "error": None, "note": None}
+    if resp.status_code in (401, 403):
         out["error"] = f"HTTP {resp.status_code} — api_key 无效或无权限"
-    elif resp.status_code == 404:
-        out["error"] = "端点可达，但不提供 GET /models（不影响使用）"
-    else:
-        out["error"] = f"HTTP {resp.status_code}"
+    elif resp.status_code == 404 and "chat/completions" not in str(resp.json().get("error", "")):
+        pass
+    elif resp.status_code >= 400:
+        try:
+            data = resp.json()
+            msg = (data.get("error") or {}).get("message") if isinstance(data.get("error"), dict) \
+                else data.get("message") or data.get("error")
+            out["error"] = f"HTTP {resp.status_code}: {msg}" if msg else f"HTTP {resp.status_code}"
+        except Exception:
+            out["error"] = f"HTTP {resp.status_code}"
     return out
 
 

@@ -242,34 +242,6 @@ class SessionEntry:
         )
 
 
-# Cap on the per-session persisted-row cache (see rewrite_messages). Bounded so
-# a long-lived gateway/serve process doesn't pin unbounded per-session state.
-_PERSIST_CACHE_LIMIT = 64
-
-
-def _persist_row_key(msg: dict) -> int:
-    """Hash of exactly the model-facing columns rewrite_messages persists for
-    one message.
-
-    Mirrors the INSERT column list — any field not in this tuple changing
-    wouldn't be persisted anyway, any field in it changing must force a
-    rewrite of that row (agent.py mutates the last tool-result dict in place
-    for budget nudges, so identity checks are not enough). Meta payloads
-    (``_reasoning``/``_usage``/``_attachments``/``_approval``) are excluded:
-    they live in message_meta, written once at row creation, never diffed.
-    """
-    content = msg.get("content")
-    tc = msg.get("tool_calls")
-    return hash((
-        msg.get("role"),
-        # str/None bind to sqlite directly; anything else would fail the INSERT
-        # — repr keeps the key hashable so that failure still surfaces there.
-        content if isinstance(content, (str, bytes, type(None))) else repr(content),
-        json.dumps(tc, ensure_ascii=False) if tc else None,
-        msg.get("tool_call_id"),
-    ))
-
-
 def _strip_approval(content: str) -> tuple[str, dict | None]:
     """从 tool 结果 JSON 中剥离审批痕迹，返回 (净 content, 决议 record)。
 
@@ -329,7 +301,8 @@ class SessionDB:
                 auto_reset_reason TEXT,
                 model TEXT,             -- per-session model override (/model switching)
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                last_prompt_tokens INTEGER DEFAULT 0
             )
         """)
         self._execute("""
@@ -365,6 +338,11 @@ class SessionDB:
                                         -- (agent._prepare_api_messages), never persisted
                 approval TEXT,          -- approval verdict JSON (tool rows that passed the
                                         -- gate); stripped from content at persist time
+                children TEXT,          -- delegation pointers [{session_key,label}] (tool
+                                        -- rows of delegate_task/run_*_agent); display-only —
+                                        -- get_trace drills into each child session
+                created_at TEXT,        -- row creation time (audit/sort; meta rows are
+                                        -- write-once, so this never updates)
                 FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
             )
         """)
@@ -392,6 +370,26 @@ class SessionDB:
             CREATE INDEX IF NOT EXISTS idx_reset_marks_key
             ON reset_marks(session_key)
         """)
+        # Context compaction records — one row per L1 compression. The summary
+        # replaces rows [head_end_id .. tail_start_id) in the MODEL's view only:
+        # messages rows themselves are append-only and never touched. Scoped to
+        # the round (session_id) so a reset naturally drops out of agent context;
+        # anchors are message uuids, stable across truncations of OTHER rounds.
+        self._execute("""
+            CREATE TABLE IF NOT EXISTS compactions (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                head_end_id TEXT NOT NULL,  -- last KEPT message id before the gap
+                tail_start_id TEXT NOT NULL, -- first KEPT message id after the gap
+                summary TEXT NOT NULL,
+                summary_role TEXT,           -- role of the synthetic summary message
+                created_at TEXT
+            )
+        """)
+        self._execute("""
+            CREATE INDEX IF NOT EXISTS idx_compactions_session
+            ON compactions(session_id, created_at)
+        """)
 
         self._init_fts()
 
@@ -399,10 +397,6 @@ class SessionDB:
 
         # In-memory entry cache (mirrors sessions table for fast lookups)
         self._entries: dict[str, SessionEntry] = {}
-        # session_id → per-row _persist_row_key list of what rewrite_messages
-        # last wrote (see rewrite_messages). Invalidated by every non-rewrite
-        # row mutation (delete/truncate).
-        self._persisted: dict[str, list[int]] = {}
         self._load_entries()
 
     def _execute(self, sql: str, params: Sequence = ()) -> sqlite3.Cursor:
@@ -665,6 +659,11 @@ class SessionDB:
         dead = self._execute(
             "SELECT id FROM messages WHERE session_key = ? OR session_id = ?",
             (session_key, session_id)).fetchall()
+        # rounds of this conversation = all session_ids the messages carried —
+        # captured BEFORE the delete (compactions sweep depends on it).
+        rounds = [r[0] for r in self._execute(
+            "SELECT DISTINCT session_id FROM messages WHERE session_key = ? "
+            "OR session_id = ?", (session_key, session_id)).fetchall()]
         self._execute(
             "DELETE FROM messages WHERE session_key = ? OR session_id = ?",
             (session_key, session_id))
@@ -675,9 +674,11 @@ class SessionDB:
                 [d[0] for d in dead])
         self._execute("DELETE FROM reset_marks WHERE session_key = ?", (session_key,))
         self._execute("DELETE FROM sessions WHERE session_key = ?", (session_key,))
+        if rounds:
+            ph = ",".join("?" * len(rounds))
+            self._execute(f"DELETE FROM compactions WHERE session_id IN ({ph})", rounds)
         self._commit()
         self._entries.pop(session_key, None)
-        self._persisted.pop(session_id, None)
         return True
 
     def get_entry(self, session_key: str) -> Optional[SessionEntry]:
@@ -773,34 +774,42 @@ class SessionDB:
             f"DELETE FROM messages WHERE id IN ({ph})", dead_ids)
         self._execute(
             f"DELETE FROM message_meta WHERE message_id IN ({ph})", dead_ids)
+        # Compactions anchored inside the deleted span are invalid (their view
+        # would slice at missing rows) — drop them; load_context_messages on a
+        # full view just returns the truncated history.
+        dead_set = set(dead_ids)
+        for comp in self.compactions_for_session(session_id):
+            if comp["head_end_id"] in dead_set or comp["tail_start_id"] in dead_set:
+                self.delete_compaction(comp["id"])
         self._commit()
-        # Row positions no longer match the rewrite cache — force its next
-        # call onto the full-rewrite path.
-        self._persisted.pop(session_id, None)
         return cur.rowcount
 
     def load_messages(self, session_id: str) -> list[dict]:
         """Load all messages for a session in order.
 
+        Each dict carries ``_id`` (the row's stable uuid) — append_messages
+        uses it to skip already-persisted rows, and ``load_context_messages``
+        uses it to place compaction anchors. ``_prepare_api_messages`` strips
+        underscore keys, so the API request shape is unaffected.
+
         Meta annotations (``reasoning``/``usage``/``attachments``) come back as
-        underscore-prefixed internal keys so the next turn's rewrite_messages
-        can re-persist them — without the reload, every _persist_messages call
-        (DELETE + re-INSERT) would wipe them for completed turns.
+        underscore-prefixed internal keys — without the reload, append would
+        duplicate rows whose meta annotations were written once at creation.
         ``_prepare_api_messages`` strips underscore keys (after re-injecting the
         attachment hint block), so the API request shape is unaffected.
         ``approval`` is NOT returned — it is human-facing audit data; the model
         never sees it (content stays pure tool output).
         """
         rows = self._execute(
-            "SELECT m.role, m.content, m.tool_calls, m.tool_call_id, "
-            "mt.reasoning, mt.usage, mt.attachments FROM messages m "
+            "SELECT m.id, m.role, m.content, m.tool_calls, m.tool_call_id, "
+            "mt.reasoning, mt.usage, mt.attachments, mt.children FROM messages m "
             "LEFT JOIN message_meta mt ON mt.message_id = m.id "
             "WHERE m.session_id = ? ORDER BY m.ord",
             (session_id,),
         ).fetchall()
         messages = []
-        for role, content, tool_calls_json, tool_call_id, reasoning, usage_json, att_json in rows:
-            msg = {"role": role}
+        for mid, role, content, tool_calls_json, tool_call_id, reasoning, usage_json, att_json, children_json in rows:
+            msg = {"role": role, "_id": mid}
             if content is not None:
                 msg["content"] = content
             if tool_calls_json:
@@ -822,16 +831,51 @@ class SessionDB:
                     msg["_attachments"] = json.loads(att_json)
                 except json.JSONDecodeError:
                     pass
+            if children_json:
+                try:
+                    msg["_children"] = json.loads(children_json)
+                except json.JSONDecodeError:
+                    pass
             if role == "assistant" and not content and not tool_calls_json:
                 continue
             messages.append(msg)
         return messages
 
+    def load_context_messages(self, session_id: str) -> list[dict]:
+        """The MODEL's view of a session: raw rows with the newest compaction
+        applied — head rows + one synthetic summary message + tail rows. The
+        summary message exists only in this list (no messages row); the desk-
+        top reads raw rows via load_transcript, so both views share one store.
+
+        A compaction whose anchors no longer resolve (its round was truncated)
+        is deleted and the full history returned — next trigger re-compacts.
+        """
+        rows = self.load_messages(session_id)
+        comp = self.latest_compaction(session_id)
+        if not comp:
+            return rows
+        ids = [m.get("_id") for m in rows]
+        try:
+            head_end = len(ids) - 1 - ids[::-1].index(comp["head_end_id"])
+            tail_start = ids.index(comp["tail_start_id"])
+        except ValueError:
+            logger.warning("load_context_messages: compaction %s anchors stale "
+                           "(session %s) — dropping, full view returned",
+                           comp["id"], session_id)
+            self.delete_compaction(comp["id"])
+            return rows
+        if tail_start <= head_end:
+            self.delete_compaction(comp["id"])
+            return rows
+        summary = {"role": comp["summary_role"], "content": comp["summary"],
+                   "_compaction": True}
+        return rows[:head_end + 1] + [summary] + rows[tail_start:]
+
     @staticmethod
     def _rows_to_display(rows: Sequence) -> list[dict]:
         out = []
         for (mid, role, content, tool_calls_json, tool_call_id, reasoning,
-             usage_json, created_at, sid, att_json, approval_json) in rows:
+             usage_json, created_at, sid, att_json, approval_json, children_json) in rows:
             msg = {"id": mid, "role": role, "session_id": sid}
             if created_at:
                 msg["created_at"] = created_at
@@ -861,6 +905,11 @@ class SessionDB:
                     msg["approval"] = json.loads(approval_json)
                 except json.JSONDecodeError:
                     pass
+            if children_json:
+                try:
+                    msg["children"] = json.loads(children_json)
+                except json.JSONDecodeError:
+                    pass
             if role == "assistant" and not content and not tool_calls_json:
                 continue
             out.append(msg)
@@ -879,7 +928,7 @@ class SessionDB:
         """
         rows = self._execute(
             "SELECT m.id, m.role, m.content, m.tool_calls, m.tool_call_id, "
-            "mt.reasoning, mt.usage, m.created_at, m.session_id, mt.attachments, mt.approval "
+            "mt.reasoning, mt.usage, m.created_at, m.session_id, mt.attachments, mt.approval, mt.children "
             "FROM messages m LEFT JOIN message_meta mt ON mt.message_id = m.id "
             "WHERE m.session_id = ? ORDER BY m.ord",
             (session_id,),
@@ -892,7 +941,7 @@ class SessionDB:
         stays per-round (load_messages on the current session_id)."""
         rows = self._execute(
             "SELECT m.id, m.role, m.content, m.tool_calls, m.tool_call_id, "
-            "mt.reasoning, mt.usage, m.created_at, m.session_id, mt.attachments, mt.approval "
+            "mt.reasoning, mt.usage, m.created_at, m.session_id, mt.attachments, mt.approval, mt.children "
             "FROM messages m LEFT JOIN message_meta mt ON mt.message_id = m.id "
             "WHERE m.session_key = ? ORDER BY m.ord",
             (session_key,),
@@ -920,19 +969,70 @@ class SessionDB:
         )
         self._commit()
 
-    def rewrite_messages(self, session_id: str, messages: list[dict]) -> None:
-        """Make the session's rows equal ``messages`` — incrementally.
+    # ---- context compactions (the L1 compression records) ----
 
-        The agent loop calls this after EVERY iteration with the full list,
-        where all previous rows are unchanged and only the tail grew. The old
-        unconditional DELETE-all + re-INSERT made a turn cost O(turn²) SQLite
-        writes (FTS triggers firing per row per iteration) — the long-turn
-        stall under the DB lock. Instead, match the longest unchanged prefix
-        against what we last wrote (per-row content hashes, NOT dict identity:
-        the loop mutates the last tool-result dict in place for budget
-        nudges), delete only rows past it, insert only the tail. A mid-list
-        change (context compression replaces the list) naturally falls back
-        to a full rewrite at the first divergent row.
+    def add_compaction(self, session_id: str, head_end_id: str,
+                       tail_start_id: str, summary: str,
+                       summary_role: str = "user") -> str:
+        """Record one compression: rows between the anchors are replaced by
+        ``summary`` in the model's view only. Messages rows stay untouched."""
+        cid = uuid.uuid4().hex
+        self._execute(
+            "INSERT INTO compactions (id, session_id, head_end_id, tail_start_id, "
+            "summary, summary_role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (cid, session_id, head_end_id, tail_start_id, summary,
+             summary_role, _now()))
+        self._commit()
+        return cid
+
+    def latest_compaction(self, session_id: str) -> Optional[dict]:
+        row = self._execute(
+            "SELECT id, head_end_id, tail_start_id, summary, summary_role "
+            "FROM compactions WHERE session_id = ? "
+            "ORDER BY created_at DESC LIMIT 1", (session_id,)).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "head_end_id": row[1], "tail_start_id": row[2],
+                "summary": row[3], "summary_role": row[4] or "user"}
+
+    def compactions_for_session(self, session_id: str) -> list[dict]:
+        rows = self._execute(
+            "SELECT id, head_end_id, tail_start_id, summary, summary_role, created_at "
+            "FROM compactions WHERE session_id = ? ORDER BY created_at",
+            (session_id,)).fetchall()
+        return [{"id": r[0], "head_end_id": r[1], "tail_start_id": r[2],
+                 "summary": r[3], "summary_role": r[4] or "user",
+                 "created_at": r[5]} for r in rows]
+
+    def delete_compaction(self, compaction_id: str) -> None:
+        self._execute("DELETE FROM compactions WHERE id = ?", (compaction_id,))
+        self._commit()
+
+    # ---- last real prompt_tokens (cross-instance compression trigger) ----
+
+    def get_last_prompt_tokens(self, session_key: str) -> int:
+        row = self._execute(
+            "SELECT last_prompt_tokens FROM sessions WHERE session_key = ?",
+            (session_key,)).fetchone()
+        return row[0] if row and row[0] else 0
+
+    def set_last_prompt_tokens(self, session_key: str, tokens: int) -> None:
+        self._execute(
+            "UPDATE sessions SET last_prompt_tokens = ? WHERE session_key = ?",
+            (tokens, session_key))
+        self._commit()
+
+    def rewrite_messages(self, session_id: str, messages: list[dict]) -> None:
+        """Append not-yet-persisted rows from ``messages`` — append-only.
+
+        History is never rewritten or deleted here (only truncate/delete
+        sessions remove rows). The agent loop calls this after every iteration
+        with the full list; rows loaded from the DB carry ``_id`` and are
+        skipped, so only genuinely new tail rows get INSERTed. A context
+        compaction shrinks the in-memory list (head + synthetic summary +
+        tail) but no messages row is removed — the summary lives in the
+        compactions table, and the next append re-converges because every
+        historical row still matches by ``_id``.
 
         system rows are NOT persisted: the prompt is rebuilt every turn from
         code/config/skills and re-inserted at the API-boundary copy's head
@@ -942,45 +1042,19 @@ class SessionDB:
         stripped here into message_meta.approval — content stays pure tool
         output (the model-facing rejection error TEXT remains in content; only
         the human-facing verdict moves to meta).
+
+        The compaction summary row (marked ``_compaction``) is skipped: it has
+        no row of its own.
         """
         messages = [m for m in messages if m.get("role") != "system"]
         with self._db_lock:
-            cached = self._persisted.get(session_id)
-            prefix = 0
-            if cached:
-                for i in range(min(len(cached), len(messages))):
-                    if _persist_row_key(messages[i]) == cached[i]:
-                        prefix = i + 1
-                    else:
-                        break
-            if cached is not None and prefix == len(cached) == len(messages):
-                return  # nothing changed since the last write
-
-            # Drop rows at/after the first divergent position (by ord — uuids
-            # are unordered). The OFFSET subquery is empty (NULL) when
-            # prefix == row count → deletes nothing; surplus cached rows (list
-            # shrank) are covered because the delete is positioned, not
-            # counted. Meta rows for deleted messages go with them (explicit —
-            # foreign_keys is off, CASCADE would not fire).
-            dead = self._execute(
-                "SELECT id FROM messages WHERE session_id = ? AND ord >= ("
-                "SELECT ord FROM messages WHERE session_id = ? "
-                "ORDER BY ord LIMIT 1 OFFSET ?)",
-                (session_id, session_id, prefix),
-            ).fetchall()
-            if dead:
-                dead_ids = [d[0] for d in dead]
-                ph = ",".join("?" * len(dead_ids))
-                self._execute(f"DELETE FROM messages WHERE id IN ({ph})", dead_ids)
-                self._execute(
-                    f"DELETE FROM message_meta WHERE message_id IN ({ph})", dead_ids)
             conv_key = self._key_for_sid(session_id)
-            # ord continues the conversation-wide sequence (across reset
-            # rounds), not the in-list position — a new round's prefix starts
-            # at 0 but its rows must sort after everything already stored.
             next_ord = self._next_ord(session_id)
             now = _now()
-            for i, msg in enumerate(messages[prefix:]):
+            inserted = False
+            for msg in messages:
+                if msg.get("_compaction") or msg.get("_id"):
+                    continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 tool_calls = json.dumps(msg["tool_calls"], ensure_ascii=False) if msg.get("tool_calls") else None
@@ -996,31 +1070,26 @@ class SessionDB:
                     if rec is not None:
                         approval = json.dumps(rec, ensure_ascii=False)
                 mid = uuid.uuid4().hex
+                msg["_id"] = mid  # back-annotate so later appends skip it
                 self._execute(
                     "INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, ord, created_at, session_key) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (mid, session_id, role, content, tool_calls, tool_call_id,
-                     next_ord + i, now, conv_key),
+                     next_ord, now, conv_key),
                 )
-                # Meta annotations ride their row's creation (rare: most rows
-                # have none).
+                next_ord += 1
+                children = json.dumps(msg["_children"], ensure_ascii=False) \
+                    if msg.get("_children") else None
                 if reasoning is not None or usage is not None or atts is not None \
-                        or approval is not None:
+                        or approval is not None or children is not None:
                     self._execute(
-                        "INSERT INTO message_meta (message_id, reasoning, usage, attachments, approval) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (mid, reasoning, usage, atts, approval),
+                        "INSERT INTO message_meta (message_id, reasoning, usage, attachments, approval, children, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (mid, reasoning, usage, atts, approval, children, now),
                     )
-            self._commit()
-
-            if cached is None and len(self._persisted) >= _PERSIST_CACHE_LIMIT:
-                self._persisted.pop(next(iter(self._persisted)), None)
-            # Prefix keys were already compared equal — reuse instead of
-            # re-hashing the whole transcript.
-            self._persisted[session_id] = (
-                (cached[:prefix] if cached else [])
-                + [_persist_row_key(m) for m in messages[prefix:]]
-            )
+                inserted = True
+            if inserted:
+                self._commit()
 
     def list_sessions(self, limit: int = 50, platform: Optional[str] = None,
                       user_id: Optional[str] = None,

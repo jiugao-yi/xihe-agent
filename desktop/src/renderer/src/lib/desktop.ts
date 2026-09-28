@@ -231,6 +231,14 @@ export interface DesktopAPI {
   onXiheStatus: (cb: (s: XiheStatus) => void) => () => void
   /** Current xihe process-status snapshot (pulled on mount). */
   getXiheStatus: () => Promise<XiheStatus | null>
+  /** In-page find (Ctrl+F): main runs webContents.findInPage; empty text
+   *  stops the find and clears Chromium's highlights. */
+  findStart: (text: string, forward?: boolean) => Promise<null>
+  findStop: () => Promise<null>
+  /** Ctrl+F push from main (before-input-event) — open/focus the search bar. */
+  onFindOpen: (cb: () => void) => () => void
+  /** F3 / Shift+F3 push — jump to next (1) / previous (-1) match. */
+  onFindNext: (cb: (dir: number) => void) => () => void
 }
 
 /** Shell-panel event pushed by main, per session id. `w` is the session's

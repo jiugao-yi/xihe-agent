@@ -36,7 +36,7 @@ vision_model:                # 填一个多模态模型（如 gpt-4o）才启用
 max_iterations: 30           # 单轮最大工具调用迭代数
 max_completion_tokens: 8192  # 单次模型回复的输出 token 上限（默认 8192）。
                              # 长报告/长代码单轮写不完会被拦腰截断——按需调大
-compression_threshold: 0.30  # 历史超过模型上下文窗口的比例时触发压缩
+compression_threshold: 0.75  # 历史超过模型上下文窗口的比例时触发压缩
 language: zh                 # 思考/回复语言引导：zh | en | auto（不引导，模型自选）。
                              # 作用于主/子/专家 agent 的系统提示词，zh 时 external_agent
                              # 给 claude 的 prompt 附带"思考用中文"指令

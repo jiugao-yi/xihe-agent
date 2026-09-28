@@ -148,8 +148,15 @@ def _make_handler(agent_def):
                                       args.get("continue_session")),
             chat_type="dm",
         )
+        # Event label carries a per-parent sequence (shared counter with
+        # delegate_task's subagent-N): successive dispatches of the same
+        # specialist read as explore-1, explore-2… instead of colliding into
+        # one undifferentiated "explore" bucket on the client trace.
+        seq = getattr(parent, "_delegate_seq", 0) + 1
+        parent._delegate_seq = seq
         entry = _run_single_child(0, user_message, child, parent, source=source,
-                                  label=agent_def.slug)
+                                  label=f"{agent_def.slug}-{seq}",
+                                  context=kw.get("context"))
         entry.pop("task_index", None)
         return tool_result(agent=agent_def.name, **entry)
 
@@ -249,6 +256,22 @@ def specialists_enabled(config: dict = None) -> bool:
 # run_* tools this module registered — the sync's ownership ledger, so a
 # same-named static tool is never deregistered by a yaml disappearing.
 _specialist_tools: set = set()
+# name → def fingerprint at registration. Syncs run on EVERY message-built
+# agent; re-registering unchanged defs re-bumped the registry version each
+# time (get_schemas cache invalidated + log spam). A change in the
+# fingerprint (hand-edited yaml converging on the next list read, PUT
+# /specialists) is the only thing that legitimately re-registers.
+_specialist_fp: dict = {}
+
+
+def _def_fingerprint(d) -> str:
+    from core.services.agent_defs import AgentDef
+    fields = AgentDef.__dataclass_fields__
+    stable = tuple(
+        (f, getattr(d, f)) for f in fields
+        if f not in ("name",)  # name derives from persona-free title
+    )
+    return repr(stable)
 
 
 def sync_specialist_agent_tools(config: dict = None) -> None:
@@ -272,18 +295,22 @@ def sync_specialist_agent_tools(config: dict = None) -> None:
         if name not in want:
             registry.deregister(name)
             _specialist_tools.discard(name)
+            _specialist_fp.pop(name, None)
             logger.info("Specialist agent unregistered: %s", name)
 
     for name, agent_def in want.items():
-        if name not in _specialist_tools and registry.get_schema(name) is not None:
+        fp = _def_fingerprint(agent_def)
+        if name in _specialist_tools:
+            if _specialist_fp.get(name) == fp:
+                continue  # unchanged since registration — nothing to do
+            logger.info("Specialist agent updated: %s (%s)",
+                        agent_def.name, name)
+        elif registry.get_schema(name) is not None:
             logger.warning(
                 "agents/%s.yaml: tool name '%s' collides with an existing tool; skipped",
                 agent_def.slug, name,
             )
             continue
-        if name in _specialist_tools:
-            logger.info("Specialist agent updated: %s (%s)",
-                        agent_def.name, name)
         else:
             logger.info("Specialist agent registered: %s (%s)",
                         agent_def.name, name)
@@ -295,6 +322,7 @@ def sync_specialist_agent_tools(config: dict = None) -> None:
             subagent_blocked=True,
         )
         _specialist_tools.add(name)
+        _specialist_fp[name] = fp
 
     if not want and not _specialist_tools:
         logger.info("No specialist agents in effect (no bundled files, user "

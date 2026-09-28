@@ -284,17 +284,47 @@ def _run_single_child(
                 except Exception:
                     logger.debug("child stream forward failed", exc_info=True)
 
-        def _child_tool_start(name, args, by=None):
+        def _child_tool_start(name, args, by=None, tool_call_id=None):
             if parent_tool_start:
                 try:
-                    parent_tool_start(name, args, by=_tag(by))
+                    parent_tool_start(name, args, by=_tag(by),
+                                      tool_call_id=tool_call_id)
+                except TypeError:
+                    # older callback shape without the ring-id param
+                    try:
+                        parent_tool_start(name, args, by=_tag(by))
+                    except Exception:
+                        logger.debug("child tool_start forward failed",
+                                     exc_info=True)
                 except Exception:
                     logger.debug("child tool_start forward failed", exc_info=True)
 
-        def _child_tool_result(name, result, elapsed, by=None):
+        def _child_tool_done(name, args, elapsed, by=None, tool_call_id=None):
+            if parent_tool_done:
+                try:
+                    parent_tool_done(name, args, elapsed, by=_tag(by),
+                                     tool_call_id=tool_call_id)
+                except TypeError:
+                    try:
+                        parent_tool_done(name, args, elapsed, by=_tag(by))
+                    except Exception:
+                        logger.debug("child tool_call forward failed",
+                                     exc_info=True)
+                except Exception:
+                    logger.debug("child tool_call forward failed", exc_info=True)
+
+        def _child_tool_result(name, result, elapsed, by=None,
+                               tool_call_id=None):
             if parent_tool_result:
                 try:
-                    parent_tool_result(name, result, elapsed, by=_tag(by))
+                    parent_tool_result(name, result, elapsed, by=_tag(by),
+                                       tool_call_id=tool_call_id)
+                except TypeError:
+                    try:
+                        parent_tool_result(name, result, elapsed, by=_tag(by))
+                    except Exception:
+                        logger.debug("child tool_result forward failed",
+                                     exc_info=True)
                 except Exception:
                     logger.debug("child tool_result forward failed", exc_info=True)
 
@@ -305,7 +335,7 @@ def _run_single_child(
         chat_callbacks = TurnCallbacks(
             stream_delta=_child_stream if parent_stream else None,
             tool_call_start=_child_tool_start if parent_tool_start else None,
-            tool_call=parent_tool_done if parent_tool_done else None,
+            tool_call=_child_tool_done if parent_tool_done else None,
             tool_result=_child_tool_result if parent_tool_result else None,
         )
         response = child.chat(source=source, user_message=goal, callbacks=chat_callbacks)
@@ -354,6 +384,24 @@ def _run_single_child(
         elif status in ("api_timeout", "api_error"):
             entry["error"] = response
 
+        # Register the child-session pointer for the display layer: the
+        # parent's dispatch attaches the collected list onto this call's
+        # tool row, and persist writes it to message_meta.children (never
+        # into the model-visible result JSON). get_trace drills into the
+        # child session on history loads. The sink rides the tool CONTEXT
+        # dict (kw['context']['_children_sink']) — the agent loop rebuilds
+        # it per dispatch call.
+        try:
+            ctx = _kwargs.get("context") or {}
+            sink = ctx.get("_children_sink")
+            if isinstance(sink, list):
+                sink.append({
+                    "session_key": child.db.build_key(source),
+                    "label": label,
+                })
+        except Exception:
+            logger.debug("children sink append failed", exc_info=True)
+
         return entry
 
     except Exception as exc:
@@ -372,9 +420,6 @@ def _run_single_child(
 
 
 def _delegate_task(args: dict, **kw) -> str:
-    goal = args.get("goal", "")
-    context = args.get("context", "")
-    toolsets = args.get("toolsets")
     tasks = args.get("tasks")
     max_iterations = args.get("max_iterations")
 
@@ -395,15 +440,11 @@ def _delegate_task(args: dict, **kw) -> str:
         DEFAULT_MAX_ITERATIONS * 2,  # hard cap
     )
 
-    if tasks and isinstance(tasks, list):
-        task_list = tasks[:MAX_CONCURRENT_CHILDREN]
-    elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "toolsets": toolsets}]
-    else:
-        return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
-
+    if not isinstance(tasks, list) or not tasks:
+        return tool_error("Provide 'tasks': an array of 1-3 task objects.")
+    task_list = tasks[:MAX_CONCURRENT_CHILDREN]
     for i, task in enumerate(task_list):
-        if not task.get("goal", "").strip():
+        if not isinstance(task, dict) or not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
     overall_start = time.monotonic()
@@ -418,7 +459,7 @@ def _delegate_task(args: dict, **kw) -> str:
             task_index=i,
             goal=t["goal"],
             context=t.get("context"),
-            toolsets=t.get("toolsets") or toolsets,
+            toolsets=t.get("toolsets"),
             model=model_override,
             max_iterations=effective_max_iter,
             parent_agent=agent,
@@ -436,7 +477,8 @@ def _delegate_task(args: dict, **kw) -> str:
         # Single task — run directly on current thread (no pool overhead)
         _i, _t, child = children[0]
         result = _run_single_child(_i, _t["goal"], child, agent,
-                                   label=f"subagent-{seq}")
+                                   label=f"subagent-{seq}",
+                                   context=kw.get("context"))
         results.append(result)
     else:
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHILDREN) as executor:
@@ -449,6 +491,7 @@ def _delegate_task(args: dict, **kw) -> str:
                     child=child,
                     parent_agent=agent,
                     label=f"subagent-{seq + i}",
+                    context=kw.get("context"),
                 )
                 futures[future] = i
 
@@ -484,9 +527,8 @@ registry.register(
                 "Spawn subagent(s) for isolated multi-step tasks. Each subagent gets "
                 "its own conversation and restricted toolset. Only the final summary "
                 "is returned — intermediate results never enter your context.\n\n"
-                "MODES (one of 'goal' or 'tasks' is required):\n"
-                "1. Single task: provide 'goal' (+ optional context, toolsets)\n"
-                "2. Batch (parallel): provide 'tasks' array with up to 3 items.\n\n"
+                "Provide 'tasks': 1-3 task objects. Multiple independent tasks in ONE "
+                "call run in parallel — always batch them; separate calls serialize.\n\n"
                 "WHEN TO USE:\n"
                 "- Reasoning-heavy subtasks (debugging, code review, research)\n"
                 "- Tasks that would flood your context with intermediate data\n"
@@ -496,74 +538,67 @@ registry.register(
                 "have each return a conclusion + evidence (file:line), then you synthesize. "
                 "This catches paths a single linear grep misses.\n\n"
                 "WHEN NOT TO USE:\n"
-                "- Single tool call -> just call the tool directly\n"
+                "- Single tool call or a seconds-scale lookup -> do it yourself; "
+                "subagents run for minutes, not seconds\n"
                 "- Tasks needing user interaction -> subagents cannot use clarify\n"
                 "- A configured specialist agent covers the domain -> prefer its "
                 "run_<name>_agent tool\n\n"
                 "IMPORTANT:\n"
                 "- Subagents have NO memory of your conversation. Pass all relevant "
-                "info via the 'context' field.\n"
+                "info via each task's 'context' field.\n"
                 "- Subagents CANNOT call tools in the blocked set (recursion, user "
                 "interaction, scheduling, persistent mutation) — an error about a "
                 "missing tool means handle that part yourself.\n"
-                "- Results are always returned as an array, one entry per task."
+                "- Results are an array, one entry per task. Each carries 'status': "
+                "completed | error | interrupted | max_iterations | api_timeout | "
+                "api_error; on failure 'error' holds the reason — siblings in the "
+                "same batch are unaffected, decide retries per task."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "goal": {
-                        "type": "string",
-                        "description": (
-                            "What the subagent should accomplish. Be specific and "
-                            "self-contained — the subagent knows nothing about your "
-                            "conversation history."
-                        ),
-                    },
-                    "context": {
-                        "type": "string",
-                        "description": (
-                            "Background information the subagent needs: file paths, "
-                            "error messages, project structure, constraints."
-                        ),
-                    },
-                    "toolsets": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Toolsets to enable for this subagent (files, terminal, "
-                            "dev_tool, http, web, media, memory, mcp, ssh, scheduler, "
-                            "skills, kbs, external_agents, meta). Omitted → default: "
-                            "files, terminal, dev_tool, http, web, media. "
-                            "[\"*\"] = everything. Read faces (file reads, skills/"
-                            "memory/kbs lookups, todo, model_info) are always included "
-                            "via the base toolset; write faces stay opt-in. A small "
-                            "blocked set (recursion, user interaction, scheduling, "
-                            "persistent mutation of shared assets) is stripped "
-                            "regardless. external_agent is allowed (claude holds no "
-                            "xihe tools — no recursion; each subagent gets its own "
-                            "claude session)."
-                        ),
-                    },
                     "tasks": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "goal": {"type": "string", "description": "Task goal"},
-                                "context": {"type": "string", "description": "Task-specific context"},
+                                "goal": {
+                                    "type": "string",
+                                    "description": (
+                                        "What the subagent should accomplish. Be "
+                                        "specific and self-contained — the subagent "
+                                        "knows nothing about your conversation history."
+                                    ),
+                                },
+                                "context": {
+                                    "type": "string",
+                                    "description": (
+                                        "Background information the subagent needs: "
+                                        "file paths, error messages, project structure, "
+                                        "constraints."
+                                    ),
+                                },
                                 "toolsets": {
                                     "type": "array",
                                     "items": {"type": "string"},
-                                    "description": "Toolsets for this specific task.",
+                                    "description": (
+                                        "Toolsets to enable beyond the always-on read "
+                                        "floor (files, terminal, dev_tool, http, web, "
+                                        "media, memory, mcp, ssh, scheduler, skills, "
+                                        "kbs, external_agents). Default: files, "
+                                        "terminal, dev_tool, http, web, media. "
+                                        "[\"*\"] = everything. Subagents cannot "
+                                        "delegate further or interact with the user."
+                                    ),
                                 },
                             },
                             "required": ["goal"],
                         },
+                        "minItems": 1,
                         "maxItems": 3,
                         "description": (
-                            "Batch mode: up to 3 tasks to run in parallel. Each gets "
-                            "its own subagent with isolated context. When provided, "
-                            "top-level goal/context/toolsets are ignored."
+                            "1-3 tasks. One task = single delegation; multiple tasks "
+                            "run in parallel, each with its own isolated subagent."
                         ),
                     },
                     "max_iterations": {
@@ -574,7 +609,7 @@ registry.register(
                         ),
                     },
                 },
-                "required": [],
+                "required": ["tasks"],
             },
         },
     },

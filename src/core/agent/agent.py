@@ -163,6 +163,10 @@ class XiheAgent:
 
         self._turn_usage = {"prompt": 0, "completion": 0, "total": 0, "calls": 0}
         self._last_prompt_tokens = 0
+        # The streaming response currently being consumed by _streaming_call
+        # (None outside one). interrupt() closes it to abort a thinking-phase
+        # request instead of waiting minutes for the next chunk.
+        self._active_stream = None
 
         # Structured exit reason of the last chat() call. Set at every return
         # path so callers (delegate/cron/gateway/cli) classify outcomes by
@@ -214,6 +218,7 @@ class XiheAgent:
                 context_length=context_length,
                 threshold_percent=self.config["compression_threshold"],
                 aux=self.aux,
+                db=self.db,
             )
 
     def _build_system_prompt(self, platform: str = "",
@@ -341,6 +346,7 @@ class XiheAgent:
                 context_length=new_len,
                 threshold_percent=self.config["compression_threshold"],
                 aux=self.aux,
+                db=self.db,
             )
             logger.info("Global model switched to %s (context=%d)", model_name, new_len)
         return True
@@ -369,6 +375,17 @@ class XiheAgent:
         propagates to any running child agents.
         """
         self._interrupt_requested = True
+        # Abort the in-flight streaming response if one is being consumed:
+        # the chunk loop checks the flag only on the NEXT chunk, and a
+        # thinking-phase model can hold it for minutes (the measured
+        # 115s stop delay). Closing wakes the iterator immediately; the
+        # loop's own close-path already treats that as a partial result.
+        stream = getattr(self, "_active_stream", None)
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
         # Kill subprocesses spawned by this agent's tools so /stop unblocks
         # them promptly (their wait/communicate returns, then the loop notices
         # the flag). Subprocesses spawned by delegated children are killed when
@@ -796,9 +813,21 @@ class XiheAgent:
             "platform": source.platform,
             "session_key": session_key,
             "user_id": source.user_id or "",
+            # Per-dispatch sink for delegation child pointers: _dispatch_tools
+            # refreshes it before each tool call and attaches the collected
+            # list to that call's tool row (→ message_meta.children).
+            "_children_sink": [],
         }
 
-        messages = self.db.load_messages(session_id)
+        messages = self.db.load_context_messages(session_id)
+
+        # Seed the compression trigger with the session's last real usage —
+        # gateway/serve build a fresh agent per message, so an instance field
+        # alone always starts at 0 and the usage shortcut never fires there.
+        try:
+            self._last_prompt_tokens = self.db.get_last_prompt_tokens(session_key)
+        except Exception:
+            logger.debug("last_prompt_tokens seed skipped", exc_info=True)
 
         messages = self._repair_dangling_tool_calls(messages)
         messages = self._inject_recovery_hint(messages)
@@ -853,7 +882,8 @@ class XiheAgent:
 
         if self._should_compress(messages):
             self._notify_compressing(cb.stream_delta)
-            messages = self.compressor.compress(messages, session_key=session_key)
+            messages = self.compressor.compress(messages, session_key=session_key,
+                                                session_id=session_id)
             # Reset file dedup cache — original content is lost after compression
             try:
                 from tools.file_tools import reset_file_dedup
@@ -867,7 +897,6 @@ class XiheAgent:
                 new_prompt = self._build_system_prompt(source.platform, session_key)
                 if messages and messages[0].get("role") == "system":
                     messages[0]["content"] = new_prompt
-            self.db.rewrite_messages(session_id, messages)
 
         # Aggregate tool-result budget applies to THIS turn's rows (this index
         # on), not just the current iteration's batch — a 40-iteration turn of
@@ -1049,7 +1078,8 @@ class XiheAgent:
 
                 if self._should_compress(messages):
                     self._notify_compressing(cb.stream_delta)
-                    messages = self.compressor.compress(messages, session_key=session_key)
+                    messages = self.compressor.compress(messages, session_key=session_key,
+                                                        session_id=session_id)
                     turn_base = 0
                     # Strip stale budget warnings from compressed history
                     _strip_budget_warnings(messages)
@@ -1057,7 +1087,6 @@ class XiheAgent:
                         new_prompt = self._build_system_prompt(source.platform, session_key)
                         if messages and messages[0].get("role") == "system":
                             messages[0]["content"] = new_prompt
-                    self.db.rewrite_messages(session_id, messages)
             else:
                 # Empty content with no tool calls is a gateway/model hiccup,
                 # not a completion — two known shapes: thinking models burning
@@ -1087,7 +1116,8 @@ class XiheAgent:
                         self._last_prompt_tokens)
                     messages.append(assistant_msg)
                     self._notify_compressing(cb.stream_delta)
-                    messages = self.compressor.compress(messages, session_key=session_key)
+                    messages = self.compressor.compress(messages, session_key=session_key,
+                                                        session_id=session_id)
                     turn_base = 0
                     _strip_budget_warnings(messages)
                     messages.append({"role": "user", "content": _EMPTY_NUDGE})
@@ -1227,6 +1257,9 @@ class XiheAgent:
                     t0 = _time.monotonic()
                     logger.info("Tool call: %s(%s)", tc["name"],
                                 tc["arguments"][:200])
+                    # Fresh sink for THIS call — a delegation tool appends its
+                    # child pointers here during dispatch.
+                    tool_context["_children_sink"] = []
                     # Bind this agent so the tool's is_interrupted() polls
                     # THIS agent's flag — per-session, not a global event.
                     from core.support.interrupt import bind_current_agent, reset_current_agent
@@ -1257,8 +1290,15 @@ class XiheAgent:
                                                  tool_call_id=tc["id"])
                         except Exception:
                             pass
-                    messages.append({"role": "tool", "content": result,
-                                     "tool_call_id": tc["id"]})
+                    tool_row = {"role": "tool", "content": result,
+                                "tool_call_id": tc["id"]}
+                    # Delegation tools registered their child-session pointers
+                    # into the sink during dispatch — attach to the tool row so
+                    # persist writes them to message_meta.children.
+                    children = tool_context.get("_children_sink")
+                    if children:
+                        tool_row["_children"] = children
+                    messages.append(tool_row)
 
         # Reset read-loop counter when non-read tools are called
 
@@ -1381,10 +1421,11 @@ class XiheAgent:
         message, a prefill assistant message, underscore-prefixed internal
         keys (e.g. ``_reasoning``) stripped, and the attachment hint block
         folded into its user message (``_attachments`` rides the history
-        unpersisted; the stored user row stays the literal input)."""
-        # Copy-elision: skip the per-message rebuild when no internal keys are
-        # present (the common history shape) — the list and its dicts are only
-        # read by the SDK from here on.
+        unpersisted; the stored user row stays the literal input). Old large
+        tool outputs are placeholder-pruned on this copy only (micro-prune:
+        recent 20 tool results keep their content, older ones collapse)."""
+        from core.agent.compressor import ContextCompressor
+        messages = ContextCompressor.lightweight_prune(messages)
         _src = messages
         if any(k.startswith("_") for m in messages for k in m):
             # The rebuild is index-aligned (neither adds nor drops entries), so
@@ -1457,6 +1498,12 @@ class XiheAgent:
             return self.llm_client.chat.completions.create(**kwargs)
 
         stream = self._call_with_retry(_call)
+        # Publish the live stream so interrupt() can abort it mid-think: the
+        # chunk loop below only sees the flag on the NEXT chunk, and a GLM
+        # long-thinking phase can hold the next chunk for minutes — the
+        # "stop did nothing for ages" symptom. Closing the stream here wakes
+        # the loop immediately (iterator raises, caught as a partial result).
+        self._active_stream = stream
 
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -1464,74 +1511,88 @@ class XiheAgent:
         # over hundreds of argument deltas is quadratic
         tool_calls_acc: dict = {}  # index -> {id, name, arguments: list[str]}
 
-        for chunk in stream:
-            # Honor a mid-generation interrupt: stop consuming the stream and
-            # return whatever content arrived so far. interrupt() can't cancel
-            # the in-flight HTTP request, but breaking here drops the
-            # connection server-side and lets the caller react instantly
-            # instead of waiting for the model to finish a long answer. Partial
-            # tool-call deltas are discarded — they'd be malformed if dispatched.
-            if self._interrupt_requested:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-                logger.info("Streaming interrupted mid-generation; %d content chars kept",
-                            len("".join(content_parts)))
-                tool_calls_acc.clear()
-                break
-            # Capture usage from final chunk (choices empty, usage present)
-            if hasattr(chunk, 'usage') and chunk.usage:
-                self._record_usage_obj(chunk.usage)
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-
-            reasoning_delta = getattr(delta, "reasoning_content", None)
-            if reasoning_delta and stream_delta_callback is not None:
-                reasoning_parts.append(reasoning_delta)
-                try:
-                    stream_delta_callback(reasoning_delta, kind="reasoning")
-                except TypeError:
-                    # Callback doesn't support kind parameter — treat as content
+        try:
+            for chunk in stream:
+                # Honor a mid-generation interrupt: stop consuming the stream and
+                # return whatever content arrived so far. interrupt() can't cancel
+                # the in-flight HTTP request, but breaking here drops the
+                # connection server-side and lets the caller react instantly
+                # instead of waiting for the model to finish a long answer. Partial
+                # tool-call deltas are discarded — they'd be malformed if dispatched.
+                if self._interrupt_requested:
                     try:
-                        stream_delta_callback(reasoning_delta)
+                        stream.close()
                     except Exception:
                         pass
-                except Exception:
-                    pass
+                    logger.info("Streaming interrupted mid-generation; %d content chars kept",
+                                len("".join(content_parts)))
+                    tool_calls_acc.clear()
+                    break
+                # Capture usage from final chunk (choices empty, usage present)
+                if hasattr(chunk, 'usage') and chunk.usage:
+                    self._record_usage_obj(chunk.usage)
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
 
-            if delta.content:
-                dc = delta.content
-                if dc.strip().startswith("[System:") and dc.strip().endswith("]"):
-                    dc = ""
-                if dc and stream_delta_callback is not None:
-                    content_parts.append(dc)
+                reasoning_delta = getattr(delta, "reasoning_content", None)
+                if reasoning_delta and stream_delta_callback is not None:
+                    reasoning_parts.append(reasoning_delta)
                     try:
-                        stream_delta_callback(dc, kind="content")
+                        stream_delta_callback(reasoning_delta, kind="reasoning")
                     except TypeError:
+                        # Callback doesn't support kind parameter — treat as content
                         try:
-                            stream_delta_callback(dc)
+                            stream_delta_callback(reasoning_delta)
                         except Exception:
                             pass
                     except Exception:
                         pass
 
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {
-                            "id": "", "name": "", "arguments": [],
-                        }
-                    if tc_delta.id:
-                        tool_calls_acc[idx]["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tool_calls_acc[idx]["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tool_calls_acc[idx]["arguments"].append(
-                                tc_delta.function.arguments)
+                if delta.content:
+                    dc = delta.content
+                    if dc.strip().startswith("[System:") and dc.strip().endswith("]"):
+                        dc = ""
+                    if dc and stream_delta_callback is not None:
+                        content_parts.append(dc)
+                        try:
+                            stream_delta_callback(dc, kind="content")
+                        except TypeError:
+                            try:
+                                stream_delta_callback(dc)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {
+                                "id": "", "name": "", "arguments": [],
+                            }
+                        if tc_delta.id:
+                            tool_calls_acc[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tool_calls_acc[idx]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tool_calls_acc[idx]["arguments"].append(
+                                    tc_delta.function.arguments)
+        except Exception:
+            # interrupt() closes _active_stream to abort a thinking-phase
+            # request; the iterator then raises. With the flag set that is
+            # the SAME partial-result outcome as the in-loop break (partial
+            # tool-call deltas discarded); without the guard a stop would
+            # surface as an API error and lose the turn's partial text.
+            if self._interrupt_requested:
+                logger.info("Streaming aborted by interrupt; %d content chars kept",
+                            len("".join(content_parts)))
+                tool_calls_acc.clear()
+            else:
+                self._active_stream = None
+                raise
 
         content = "".join(content_parts)
         if content and content.strip().startswith("[System:") and content.strip().endswith("]"):
@@ -1545,6 +1606,7 @@ class XiheAgent:
                 "arguments": "".join(acc["arguments"]),
             })
 
+        self._active_stream = None
         return content, tool_calls, "".join(reasoning_parts)
 
     def _record_usage(self, response: object) -> None:
@@ -1581,6 +1643,11 @@ class XiheAgent:
             except Exception:
                 # display-only badge — never fail the turn over it
                 logger.warning("persist turn usage failed", exc_info=True)
+        if session_key and self._last_prompt_tokens:
+            try:
+                self.db.set_last_prompt_tokens(session_key, self._last_prompt_tokens)
+            except Exception:
+                logger.debug("last_prompt_tokens persist skipped", exc_info=True)
         logger.info(
             "Token usage [turn]: model=%s calls=%d prompt=%d completion=%d total=%d",
             model, u["calls"], u["prompt"], u["completion"], u["total"],

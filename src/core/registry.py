@@ -294,7 +294,19 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
-            args = json.loads(arguments) if arguments else {}
+            try:
+                args = json.loads(arguments) if arguments else {}
+            except json.JSONDecodeError as e:
+                # Streamed tool-call arguments arrived truncated (gateway cut
+                # the stream mid-argument / generation aborted). A raw raise
+                # surfaces as "Tool execution failed" — the model can't tell
+                # its own output was broken from a real tool failure. Return
+                # a self-healing error instead: re-issue the call complete.
+                return tool_error(
+                    f"Arguments JSON is incomplete/truncated ({e}). "
+                    "The tool was NOT executed. Re-issue the tool call with "
+                    "complete arguments."
+                )
             kw = dict(kwargs)
             if context:
                 kw["context"] = context

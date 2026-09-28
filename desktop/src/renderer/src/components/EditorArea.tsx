@@ -2,8 +2,10 @@ import { Suspense, lazy, useEffect, useRef, useState } from 'react'
 import { FileDiff, Play, X } from 'lucide-react'
 import { desktop, type ReadResult } from '../lib/desktop'
 import { detectLanguage } from '../lib/lang'
+import { localImgUrl } from '../lib/localImage'
 import { useStore } from '../appStore'
 import { cn } from '../lib/cn'
+import { Markdown } from './Markdown'
 
 const MonacoPane = lazy(() =>
   import('./monaco/MonacoPane').then((m) => ({ default: m.MonacoPane }))
@@ -22,9 +24,16 @@ export function guessRunCommand(path: string): string | null {
   return null
 }
 
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|svg|bmp|ico)$/i
+const MD_EXT = /\.md$/i
+
+function isImagePath(p: string): boolean { return IMAGE_EXT.test(p) }
+function isMdPath(p: string): boolean { return MD_EXT.test(p) }
+
 type Content =
   | { state: 'loading' }
   | { state: 'ok'; text: string; truncated: boolean }
+  | { state: 'image' }
   | { state: 'binary' }
   | { state: 'error' }
 
@@ -67,10 +76,15 @@ export function EditorArea({ className }: { className?: string }) {
     .filter((t) => t.kind === 'file' && t.path)
     .map((t) => t.path as string)
 
-  // Load a tab's file on first open.
+  // Load a tab's file on first open. Image tabs skip the text pipeline —
+  // they render from the path via xfile:// (see FileBody's image branch).
   useEffect(() => {
     for (const p of openPaths) {
       if (p in filesRef.current) continue
+      if (isImagePath(p)) {
+        setFiles((f) => ({ ...f, [p]: { state: 'image' } }))
+        continue
+      }
       setFiles((f) => ({ ...f, [p]: { state: 'loading' } }))
       void desktop.readFile(p).then((r) => {
         setFiles((f) => {
@@ -292,8 +306,31 @@ function FileBody({
   onReload,
   onDismissExternal,
 }: FileBodyProps) {
+  const [mdPreview, setMdPreview] = useState(true)
   if (!content || content.state === 'loading') {
     return <div className="p-3 text-xs text-ink-4">读取中…</div>
+  }
+  // Local images render via the privileged xfile:// protocol (chat attachments
+  // use the same path) — no text pipeline, no draft/save.
+  if (content.state === 'image') {
+    return (
+      <div
+        className="h-full overflow-auto p-3"
+        style={{
+          backgroundImage:
+            'linear-gradient(45deg,#8882 25%,transparent 25%,transparent 75%,#8882 75%),linear-gradient(45deg,#8882 25%,transparent 25%,transparent 75%,#8882 75%)',
+          backgroundSize: '16px 16px',
+          backgroundPosition: '0 0,8px 8px',
+        }}
+      >
+        <img
+          src={localImgUrl(path)}
+          alt={path}
+          className="mx-auto max-h-full max-w-full object-contain"
+          draggable={false}
+        />
+      </div>
+    )
   }
   if (content.state === 'binary') {
     return <div className="p-3 text-xs text-ink-4">二进制文件，无法编辑</div>
@@ -320,6 +357,24 @@ function FileBody({
           {saveFail}
         </div>
       )}
+      {isMdPath(path) && (
+        <div className="absolute right-2 top-1.5 z-20 flex items-center rounded-md border border-line bg-panel/95 shadow-sm">
+          <button
+            onClick={() => setMdPreview(true)}
+            className={cn('rounded-l-md px-2 py-0.5 text-[10px] transition',
+              mdPreview ? 'bg-contrast text-sky-300' : 'text-ink-4 hover:text-ink-2')}
+          >
+            预览
+          </button>
+          <button
+            onClick={() => setMdPreview(false)}
+            className={cn('rounded-r-md px-2 py-0.5 text-[10px] transition',
+              !mdPreview ? 'bg-contrast text-sky-300' : 'text-ink-4 hover:text-ink-2')}
+          >
+            源码
+          </button>
+        </div>
+      )}
       {external && draft !== undefined && (
         <div className="absolute inset-x-0 top-0 z-10 flex items-center gap-2 border-b border-warning/40 bg-warning/10 px-3 py-1.5 text-[11px] text-warning">
           <span className="flex-1">文件已在磁盘上被修改（agent 或其他程序写入）。</span>
@@ -339,6 +394,11 @@ function FileBody({
           </button>
         </div>
       )}
+      {isMdPath(path) && mdPreview && draft !== undefined ? (
+        <div className="h-full overflow-auto px-6 py-4">
+          <Markdown content={draft} />
+        </div>
+      ) : (
       <Suspense fallback={<div className="p-3 text-xs text-ink-4">编辑器加载中…</div>}>
         <MonacoPane
           path={path}
@@ -350,6 +410,7 @@ function FileBody({
           minimap
         />
       </Suspense>
+      )}
       {saving && (
         <div className="absolute bottom-2 right-3 rounded bg-panel px-2 py-0.5 text-[10px] text-ink-3">
           保存中…

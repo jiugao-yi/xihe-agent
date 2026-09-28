@@ -64,8 +64,10 @@ class SystemMixin:
 
         base_url = _pick(body.get("base_url"), self.config.get("base_url"))
         api_key = _pick(body.get("api_key"), self.config.get("api_key"))
-        result = await asyncio.to_thread(check_connectivity, base_url, api_key)
-        result["model_configured"] = _pick(body.get("model"), self.config.get("model"))
+        model = _pick(body.get("model"), self.config.get("model"))
+        result = await asyncio.to_thread(check_connectivity, base_url, api_key,
+                                         model=model)
+        result["model_configured"] = model
         return web.json_response(result)
 
 

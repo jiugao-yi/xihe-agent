@@ -347,13 +347,14 @@ def handle_command(text: str, ctx: dict) -> str | None:
         session_id = _get_session_id(db, sk)
         if not session_id:
             return "No messages to compress."
-        messages = db.load_messages(session_id)
+        messages = db.load_context_messages(session_id)
         if not messages:
             return "No messages to compress."
         if compressor.should_compress(messages):
-            compressed = compressor.compress(messages, session_key=sk)
-            db.rewrite_messages(session_id, compressed)
-            return f"Compressed: {len(messages)} -> {len(compressed)} messages."
+            compressed = compressor.compress(messages, session_key=sk,
+                                             session_id=session_id)
+            return (f"Compressed: {len(messages)} -> {len(compressed)} messages. "
+                    f"完整历史保留，可在桌面端查看。")
         return "No compression needed (context within limits)."
 
     elif cmd == "/tools":

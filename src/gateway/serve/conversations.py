@@ -16,6 +16,7 @@ from aiohttp import web
 from gateway.serve._common import (
     _DEFAULT_USER,
     _PLATFORM,
+    _WS_ARGS_LIMIT,
     _WS_REASONING_LIMIT,
     _WS_RESULT_LIMIT,
 )
@@ -685,16 +686,36 @@ class ChatMixin:
             # only (load_messages on the live session_id).
             rows = self.ctx.db.load_transcript(session_key)
             marks = self.ctx.db.reset_marks(session_key)
+            # Compaction records per round: the desktop renders a "compacted,
+            # expand for originals" card at each boundary (raw rows are always
+            # present in this response — the record just marks where the model
+            # sees a summary).
+            compactions: list[dict] = []
+            entry = self.ctx.db.get_entry(session_key)
+            sids = {r.get("session_id") for r in rows}
+            if entry:
+                sids.add(entry.session_id)
+            for sid in sids:
+                if not sid:
+                    continue
+                for c in self.ctx.db.compactions_for_session(sid):
+                    compactions.append({
+                        "session_id": sid,
+                        "head_end_id": c["head_end_id"],
+                        "tail_start_id": c["tail_start_id"],
+                        "summary": c["summary"],
+                        "created_at": c["created_at"],
+                    })
             # A reset whose new round has no messages yet: flag it so the
             # client draws a trailing divider right after the reset, instead
             # of the divider only appearing with the next message.
             pending_reset = None
-            entry = self.ctx.db.get_entry(session_key)
             if entry and all(r.get("session_id") != entry.session_id for r in rows):
                 pending_reset = marks.get(entry.session_id, "")
             return {"conv_id": conv_id,
                     "messages": _reshape_history(rows, marks),
-                    "pending_reset": pending_reset}
+                    "pending_reset": pending_reset,
+                    "compactions": compactions}
 
         # SQLite reads + the fold run off-loop: a long transcript must not stall
         # WS streaming (all turns share one event loop).
@@ -754,10 +775,51 @@ class ChatMixin:
                             fn = tc.get("function") or {}
                             ordered.append(("tool", tc.get("id"), fn.get("name", "tool"),
                                             fn.get("arguments", "") or ""))
+                def _child_events(session_key: str, label: str) -> list:
+                    """Drill into a subagent's session: its reasoning + tool
+                    calls as trace events tagged by=<label>, so a REFRESHED
+                    conversation renders the same grouped subagent view the
+                    live stream showed. Nested delegation drills one level
+                    only (its children's rows appear as plain tool events)."""
+                    try:
+                        crows = self.ctx.db.load_transcript(session_key)
+                    except Exception:
+                        return []
+                    out: list = []
+                    for cm in crows:
+                        role = cm.get("role")
+                        if role == "assistant":
+                            r = cm.get("reasoning")
+                            if r:
+                                text = r[:_WS_REASONING_LIMIT]
+                                out.append({"kind": "thought", "text": text,
+                                            "by": label})
+                            for ctc in (cm.get("tool_calls") or []):
+                                fn = (ctc.get("function") or {})
+                                out.append({
+                                    "kind": "tool",
+                                    "id": ctc.get("id"),
+                                    "name": fn.get("name", "tool"),
+                                    "args": (fn.get("arguments") or "")[:_WS_ARGS_LIMIT],
+                                    "status": "done", "by": label,
+                                })
+                        elif role == "tool":
+                            # Pair a result to the last tool event by id.
+                            tcid = cm.get("tool_call_id")
+                            for ev in reversed(out):
+                                if ev.get("kind") == "tool" and ev.get("id") == tcid:
+                                    result = cm.get("content")
+                                    if isinstance(result, str):
+                                        ev["result"] = result[:_WS_RESULT_LIMIT]
+                                        ev["truncated"] = len(result) > _WS_RESULT_LIMIT
+                                    break
+                    return out
+
                 for item in ordered:
                     if item[0] == "thought":
                         trace.append({"kind": "thought", "text": item[1]})
                         continue
+                    child_pending: list = []
                     _, tcid, name, args = item
                     te = {"kind": "tool", "name": name, "args": args, "status": "done"}
                     row = results_by_id.get(tcid)
@@ -772,7 +834,28 @@ class ChatMixin:
                             truncated = len(result) > _WS_RESULT_LIMIT
                             te["result"] = result[:_WS_RESULT_LIMIT] if truncated else result
                             te["truncated"] = truncated
+                            # Subagent drill-down: the tool row's meta.children
+                            # holds [{session_key,label}] pointers (written at
+                            # persist time from the dispatch sink — never inside
+                            # the result JSON the model sees). Children's events
+                            # follow the tool row at ITS position in the main
+                            # round (the delegation point), ordered by task
+                            # sequence: the label carries the dispatch order
+                            # (subagent-1/2/3), while the sink appends on
+                            # completion — sort restores intent over racing.
+                            def _task_seq(p: dict) -> tuple:
+                                tail = str(p.get("label") or "").rsplit("-", 1)[-1]
+                                return (0, int(tail)) if tail.isdigit() else (1, 0)
+                            for ptr in sorted(
+                                    (p for p in row.get("children") or []
+                                     if isinstance(p, dict) and p.get("session_key")),
+                                    key=_task_seq):
+                                child_pending.extend(
+                                    _child_events(ptr["session_key"],
+                                                  ptr.get("label") or ""))
                     trace.append(te)
+                    if child_pending:
+                        trace.extend(child_pending)
             return {"conv_id": conv_id, "trace": trace}
 
         loop = asyncio.get_running_loop()

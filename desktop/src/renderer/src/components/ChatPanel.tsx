@@ -511,7 +511,7 @@ const UserRow = memo(function UserRow({ m, i, editing, editText, copied, disable
             value={editText}
             onChange={(e) => cbs.onEditText(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
+              if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
                 e.preventDefault()
                 cbs.onConfirmEdit(i, editText)
               } else if (e.key === 'Escape') {
@@ -593,43 +593,23 @@ const UserRow = memo(function UserRow({ m, i, editing, editText, copied, disable
   )
 })
 
-/** 重新生成 truncates this turn AND everything after it — destructive enough
- *  to deserve a two-step confirm (click → armed with a timeout → click again
- *  to fire). Later turns the user hasn't read may vanish. */
+/** 重新生成 truncates this turn AND everything after it. Fires directly —
+ *  the two-step confirm was dropped per user request (the title still tells
+ *  what happens; truncation is rollback-able by re-sending). */
 function RegenButton({ index, pending, onRegenerate }: {
   index: number
   pending: boolean
   onRegenerate: (index: number) => void
 }) {
-  const [armed, setArmed] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useEffect(() => () => {
-    if (timerRef.current) clearTimeout(timerRef.current)
-  }, [])
-  const click = (): void => {
-    if (armed) {
-      if (timerRef.current) clearTimeout(timerRef.current)
-      setArmed(false)
-      onRegenerate(index)
-      return
-    }
-    setArmed(true)
-    timerRef.current = setTimeout(() => setArmed(false), 3_000)
-  }
   return (
     <button
-      onClick={click}
+      onClick={() => onRegenerate(index)}
       disabled={pending}
       title="重新生成本轮回答；该轮之后的对话将被删除"
-      className={cn(
-        'flex select-none items-center gap-1 text-[10px] transition disabled:opacity-30',
-        armed
-          ? 'rounded bg-warning/15 px-1.5 py-0.5 text-warning'
-          : 'text-ink-4 hover:text-ink-2'
-      )}
+      className="flex select-none items-center gap-1 text-[10px] text-ink-4 transition hover:text-ink-2 disabled:opacity-30"
     >
       <RefreshCw className="h-3 w-3" />
-      {armed ? '确认删除后续对话并重新生成？' : '重新生成'}
+      重新生成
     </button>
   )
 }
@@ -926,6 +906,10 @@ export function ChatPanel() {
   // the view stranded mid-way. Anchoring to the sentinel re-resolves on every
   // layout change, including late image loads.
   const bottomRef = useRef<HTMLDivElement>(null)
+  // Set just before a programmatic follow-scroll; onScroll consumes it (one
+  // shot) so the yank's own near-bottom reading can't re-arm stick mode
+  // against a user who just scrolled up.
+  const programmaticScroll = useRef(false)
 
   useEffect(() => {
     stickRef.current = true
@@ -934,6 +918,7 @@ export function ChatPanel() {
     // paint), so the sentinel exists at its final position.
     const raf = requestAnimationFrame(() => {
       requestAnimationFrame(() => {
+        programmaticScroll.current = true
         bottomRef.current?.scrollIntoView({ block: 'end' })
       })
     })
@@ -946,6 +931,7 @@ export function ChatPanel() {
     // during a stream; aligning the scroll to paint avoids stacking layout
     // reads between commits.
     const raf = requestAnimationFrame(() => {
+      programmaticScroll.current = true
       bottomRef.current?.scrollIntoView({ block: 'end' })
     })
     return () => cancelAnimationFrame(raf)
@@ -984,6 +970,41 @@ export function ChatPanel() {
     ta.style.height = `${ta.scrollHeight}px`
   }, [input, activeConvId])
 
+  // User scroll INTENT disengages bottom-follow immediately. onScroll's
+  // distance heuristic alone loses the race against streaming: each ~50ms
+  // delta flush calls scrollIntoView, whose programmatic scroll then re-reads
+  // as "at bottom" and re-arms the follow — the user can never escape during
+  // a fast stream. wheel/touch/key carry direction, so only upward intent
+  // disengages; scrolling back down re-arms via onScroll's near-bottom check.
+  const onUserScrollIntent = (e: React.WheelEvent | React.TouchEvent | React.KeyboardEvent) => {
+    let up = false
+    if ('deltaY' in e) up = e.deltaY < 0
+    else if ('touches' in e) {
+      const t = e.touches[0]
+      if (t && lastTouchY.current !== null) up = t.clientY > lastTouchY.current
+      if (t) lastTouchY.current = t.clientY
+    } else {
+      const k = e as React.KeyboardEvent
+      up = k.key === 'PageUp' || k.key === 'ArrowUp' || k.key === 'Home'
+    }
+    if (up) stickRef.current = false
+  }
+  const lastTouchY = useRef<number | null>(null)
+
+  // Scrollbar drag: pointerdown near the container's right edge = the bar —
+  // it fires NO wheel/touch/key events (the pointer never touches content),
+  // so it bypassed the intent handlers entirely. Mark the drag; onScroll
+  // while dragging disengages the follow the moment the bar leaves the
+  // bottom zone.
+  const scrollbarDrag = useRef(false)
+  const onPointerDown = (e: React.PointerEvent) => {
+    const el = scrollRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (el.clientWidth > 0 && e.clientX > rect.right - 16) scrollbarDrag.current = true
+  }
+  const onPointerUpWindow = () => { scrollbarDrag.current = false }
+
   const onScroll = () => {
     const el = scrollRef.current
     if (!el) return
@@ -991,9 +1012,26 @@ export function ChatPanel() {
     // collapse below scrollTop for one frame — that programmatic jump must
     // not read as "user scrolled up to read". Content shrunk, so distance
     // would exceed the container height; a real upward scroll is a smaller,
-    // bounded distance.
+    // bounded distance. Re-arm ONLY on the user's own return toward the
+    // bottom: a programmatic yank (stream-follow scrollIntoView) also lands
+    // at distance ≈ 0, and re-arming on it would launder the yank back into
+    // stick mode after the user disengaged.
     const distance = el.scrollHeight - el.scrollTop - el.clientHeight
-    stickRef.current = distance < 80 || distance > el.clientHeight
+    // Scrollbar drag in progress: the user owns the scroll position — any
+    // drag that isn't parked at the very bottom disengages the follow.
+    if (scrollbarDrag.current && distance >= 80) {
+      stickRef.current = false
+      return
+    }
+    if (distance > el.clientHeight) {
+      stickRef.current = true   // rollback collapse (bounded by intent path)
+    } else if (distance < 80) {
+      if (programmaticScroll.current) {
+        programmaticScroll.current = false
+      } else {
+        stickRef.current = true
+      }
+    }
   }
 
   // Hooks must ALL run before this point — the early return below would
@@ -1135,7 +1173,17 @@ export function ChatPanel() {
 
   return (
     <div className="flex h-full flex-col">
-      <div ref={scrollRef} onScroll={onScroll} className="flex-1 space-y-4 overflow-y-auto px-6 py-5">
+      <div
+        ref={scrollRef}
+        onScroll={onScroll}
+        onWheel={onUserScrollIntent}
+        onTouchMove={onUserScrollIntent}
+        onKeyDown={onUserScrollIntent}
+        onPointerDown={onPointerDown}
+        onPointerUp={onPointerUpWindow}
+        onPointerLeave={onPointerUpWindow}
+        className="flex-1 space-y-4 overflow-y-auto px-6 py-5"
+      >
         {messages.length === 0 && xiheConfig.api_key_set === false && (
           <div className="mt-10 flex justify-center">
             <WelcomeCard onGoSettings={() => setTab('manage')} />
@@ -1336,14 +1384,19 @@ export function ChatPanel() {
               })
             }}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
+              // Only a bare Enter sends; Shift+Enter and Ctrl+Enter both
+              // newline (textarea default inserts the line for either —
+              // Ctrl alone types nothing extra, the Enter carries it).
+              if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
                 e.preventDefault()
                 onPrimary()
               }
             }}
             rows={1}
             placeholder={
-              running ? '追加指示（steer 改向，不打断）…' : '输入消息，Enter 发送…'
+              running
+                ? '追加指示（steer 改向，不打断）…'
+                : '输入消息，Enter 发送，Shift/Ctrl+Enter 换行…'
             }
             className="max-h-32 flex-1 resize-none bg-transparent text-sm outline-none placeholder:text-ink-4"
           />

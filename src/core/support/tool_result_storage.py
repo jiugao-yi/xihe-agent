@@ -66,14 +66,16 @@ def _ensure_storage_dir() -> Path:
 
 
 def _generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE) -> tuple[str, bool]:
-    """Truncate at last newline within max_chars. Returns (preview, has_more)."""
+    """Head+tail preview (equal halves within max_chars). Logs and command
+    output carry their verdict (errors, exit codes) at the END — a head-only
+    preview hid exactly the lines the model needed to decide what to do."""
     if len(content) <= max_chars:
         return content, False
-    truncated = content[:max_chars]
-    last_nl = truncated.rfind("\n")
-    if last_nl > max_chars // 2:
-        truncated = truncated[:last_nl + 1]
-    return truncated, True
+    half = max_chars // 2
+    return (
+        content[:half] + "\n...[truncated]...\n" + content[-half:],
+        True,
+    )
 
 
 def _write_to_file(content: str, tool_use_id: str) -> Optional[str]:

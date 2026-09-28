@@ -12,12 +12,17 @@ type ThoughtEv = Extract<TraceEvent, { kind: 'thought' }>
 type SteerEv = Extract<TraceEvent, { kind: 'steer' }>
 
 /** Collapsible trace of one assistant turn's reasoning + tool calls, rendered
- * ABOVE the answer bubble. Events appear in arrival order — 思考 and 工具调用
- * interleave exactly as they did during the turn, since reasoning and tool
- * calls alternate mid-turn; splitting them into separate cards would lose that
- * ordering. Open state is fully user-controlled; initial state follows
- * `pending` (a running turn mounts open so live progress shows; a finished or
- * historical turn mounts collapsed).
+ * ABOVE the answer bubble. Events with no source (``by``) belong to the main
+ * agent; attributed events (subagent-N / specialist slug / claude / codex …)
+ * group into their own collapsible sections — mixed multi-source turns read
+ * per-actor instead of as one interleaved stream. Within a section the
+ * original arrival order is kept (reasoning and tool calls alternate there
+ * exactly as they did).
+ *
+ * Open state is fully user-controlled; initial state follows `pending` (a
+ * running turn mounts open so live progress shows; a finished or historical
+ * turn mounts collapsed). Sub-sources default to expanded while their tools
+ * still run, collapsed once settled.
  *
  * Historical turns arrive with only a folded tool count, a serve row anchor,
  * and a `hasReasoning` flag — reasoning + tool calls are lazy-loaded via
@@ -44,6 +49,10 @@ export function TurnTrace({
   onLoadTrace?: (anchor: string) => void
 }) {
   const [open, setOpen] = useState(pending)
+  // Per-source fold state; keys are the `by` labels. A key absent = follow
+  // the default (main always open; a source folds once it has no running
+  // tools) — entries only appear when the user has explicitly toggled.
+  const [foldedSources, setFoldedSources] = useState<Record<string, boolean>>({})
   const events = trace ?? []
   const tools = events.filter((t): t is ToolEv => t.kind === 'tool')
   const running = tools.filter((t) => t.status === 'running').length
@@ -62,6 +71,71 @@ export function TurnTrace({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, trace, anchor])
 
+  // Two-level display model over the raw event stream:
+  //
+  // 1. Chronological runs: consecutive same-`by` events form a run; thought
+  //    deltas inside a run merge into one text (streaming fragments read as
+  //    prose). Main-agent runs (by='') render bare, exactly where they
+  //    happened — the delegation's before/after stays in true order.
+  // 2. Parallel-interleave collapse: concurrently running subagents inter-
+  //    leave their deltas, so one source can appear as many tiny runs
+  //    ("subagent-1 0个工具, subagent-2 1个工具, subagent-1 2个工具…").
+  //    When a non-main source occurs in MULTIPLE runs, its runs merge into
+  //    ONE visual block (placed at the source's first appearance, internal
+  //    order kept, counts summed) — the block reads as "this subagent's
+  //    session", not as N timestamp slices. A source with a single
+  //    contiguous run is untouched.
+  type Block = { key: string; tools: number; running: number; items: TraceEvent[] }
+  const blocks = useMemo(() => {
+    // Pass 1 — chronological runs with in-run thought merging.
+    const runs: Block[] = []
+    for (const t of events) {
+      const key = (t as ToolEv | ThoughtEv).by ?? ''
+      const last = runs[runs.length - 1]
+      const mergeThought = (
+        last && last.key === key && t.kind === 'thought'
+        && last.items.length > 0
+        && last.items[last.items.length - 1].kind === 'thought')
+      if (mergeThought) {
+        const prev = last.items[last.items.length - 1] as ThoughtEv
+        prev.text += t.text
+        continue
+      }
+      if (!last || last.key !== key) {
+        runs.push({ key, tools: 0, running: 0, items: [] })
+      }
+      const cur = runs[runs.length - 1]
+      cur.items.push(t)
+      if (t.kind === 'tool') {
+        cur.tools += 1
+        if (t.status === 'running') cur.running += 1
+      }
+    }
+    // Pass 2 — collapse multi-run non-main sources into one block at the
+    // first-run position; main ('') runs pass through in place.
+    const counts = new Map<string, number>()
+    for (const r of runs) counts.set(r.key, (counts.get(r.key) ?? 0) + 1)
+    const out: Block[] = []
+    const merged = new Map<string, Block>()
+    for (const r of runs) {
+      if (r.key === '' || (counts.get(r.key) ?? 0) === 1) {
+        out.push(r)
+        continue
+      }
+      let m = merged.get(r.key)
+      if (!m) {
+        m = { key: r.key, tools: 0, running: 0, items: [] }
+        merged.set(r.key, m)
+        out.push(m)   // at first-run position
+      }
+      m.items.push(...r.items)
+      m.tools += r.tools
+      m.running += r.running
+    }
+    return out
+  }, [events])
+  const hasSources = blocks.some((s) => s.key !== '')
+
   if (!toolCount && !hasThought && !steerCount && !hasReasoning) return null
 
   // Click anywhere on the panel (not just the header) toggles — a long 思考
@@ -73,6 +147,34 @@ export function TurnTrace({
     if (t.closest('button, a, input, textarea, pre')) return
     if (window.getSelection()?.toString()) return
     setOpen((v) => !v)
+  }
+
+  const renderEvent = (t: TraceEvent, i: number, child = false) =>
+    t.kind === 'tool' ? <ToolItem key={i} ev={t} child={child} /> :
+    t.kind === 'thought' ? <ThoughtItem key={i} ev={t} child={child} /> :
+    <SteerItem key={i} ev={t} />
+
+  /** One block's items with ALL its thought events coalesced into a single
+   *  prose block at the top (one 🧠, one paragraph) and the tool rows below
+   *  — the main agent's thinking renders as one continuous block, so a
+   *  subagent's must too. Thought text merges with delta-boundary newlines
+   *  normalized (\r\n → \n, 3+ blank lines → 2) — the fragments were one
+   *  stream before the store split them. ``child`` styles the rows as
+   *  subagent content (smaller/lighter) so they read subordinate to the
+   *  main agent's own rows. */
+  const renderBlockItems = (items: TraceEvent[], child = false) => {
+    const thoughtText = items
+      .filter((t): t is ThoughtEv => t.kind === 'thought')
+      .map((t) => t.text.replace(/\r\n/g, '\n'))
+      .join('')
+      .replace(/\n{3,}/g, '\n\n')
+    const rest = items.filter((t) => t.kind !== 'thought')
+    return (
+      <>
+        {thoughtText && <ThoughtItem key="thought" child={child} ev={{ kind: 'thought', text: thoughtText, ts: rest[0] && (rest[0] as ToolEv).ts } as ThoughtEv} />}
+        {rest.map((t, i) => renderEvent(t, i, child))}
+      </>
+    )
   }
 
   return (
@@ -109,18 +211,19 @@ export function TurnTrace({
             {steerCount} 改向
           </span>
         )}
+        {hasSources && (
+          <span className="ml-auto font-mono text-[10px] text-ink-4">
+            {Array.from(new Set(blocks.map((s) => s.key).filter(Boolean))).join(' · ')}
+          </span>
+        )}
       </button>
       {open && (
         <div className="space-y-1.5 border-t border-line/70 px-2.5 py-2">
           {trace ? (
-            events.map((t, i) =>
-              t.kind === 'tool' ? (
-                <ToolItem key={i} ev={t} />
-              ) : t.kind === 'thought' ? (
-                <ThoughtItem key={i} ev={t} />
-              ) : (
-                <SteerItem key={i} ev={t} />
-              )
+            hasSources ? (
+              <SubagentDashboard blocks={blocks} renderBlockItems={renderBlockItems} foldedSources={foldedSources} setFoldedSources={setFoldedSources} />
+            ) : (
+              events.map((t, i) => renderEvent(t, i))
             )
           ) : (
             <div className="px-1 py-0.5 text-ink-4">加载工具调用…</div>
@@ -133,16 +236,127 @@ export function TurnTrace({
 
 const ARGS_PREVIEW = 60
 
-/** Source tag on trace rows: absent = the main agent; otherwise the child's
- *  label — a specialist slug, a per-child "subagent-N" (delegate_task), or
- *  "claude" for the external claude CLI's own tool/thinking activity (an
- *  inner source wins over the outer label). */
-function ByBadge({ by }: { by?: string }) {
-  if (!by) return null
+/** Per-source accent colors: label tail number (subagent-1/2/3, explore-2…)
+ *  cycles this low-saturation palette. Colors the status-row name and the
+ *  expand area's left bar — one color per actor, readable at a glance. */
+const SOURCE_COLORS = [
+  { text: 'text-sky-400', bar: 'border-l-2 border-sky-500/70' },
+  { text: 'text-emerald-400', bar: 'border-l-2 border-emerald-500/70' },
+  { text: 'text-amber-400', bar: 'border-l-2 border-amber-500/70' },
+  { text: 'text-violet-400', bar: 'border-l-2 border-violet-500/70' },
+]
+
+function _taskSeqNo(key: string): number {
+  const tail = key.split('-').pop() ?? ''
+  const n = Number(tail)
+  return Number.isFinite(n) && n > 0 ? n : 1
+}
+
+/** Activity dashboard for delegated subagent activity (the Manus-pattern
+ *  "global status + single-focus detail"): every source renders as ONE
+ *  status row — state icon (✓ done / ⟳ running / ✗ interrupted), name,
+ *  tool count, and the LATEST tool call as a one-line "what it's doing"
+ *  cue. Clicking a row expands that subagent's full process inline (one
+ *  focus at a time — concurrent streams are never live-tiled).
+ *
+ *  Position keeps the main agent's narrative true: subagent blocks cluster
+ *  into a dashboard card rendered at the DELEGATION point — a dashboard
+ *  flushes right BEFORE the next main-agent block, so "what the main agent
+ *  did after dispatching" still reads in order. */
+function SubagentDashboard({ blocks, renderBlockItems, foldedSources, setFoldedSources }: {
+  blocks: { key: string; tools: number; running: number; items: TraceEvent[] }[]
+  renderBlockItems: (items: TraceEvent[], child?: boolean) => React.ReactNode
+  foldedSources: Record<string, boolean>
+  setFoldedSources: React.Dispatch<React.SetStateAction<Record<string, boolean>>>
+}) {
+  type Row = { key: string; tools: number; running: number; items: TraceEvent[] }
+  // Walk blocks in order; subagent runs merge per-source into a pending
+  // dashboard that flushes when the next MAIN block (or the end) arrives.
+  const parts: Array<{ kind: 'main'; items: TraceEvent[] } | { kind: 'dash'; rows: Row[] }> = []
+  let pending: Map<string, Row> | null = null
+  const flush = () => {
+    if (pending && pending.size > 0) {
+      parts.push({ kind: 'dash', rows: [...pending.values()] })
+    }
+    pending = null
+  }
+  for (const b of blocks) {
+    if (b.key === '') {
+      flush()
+      parts.push({ kind: 'main', items: b.items })
+      continue
+    }
+    if (!pending) pending = new Map()
+    let r = pending.get(b.key)
+    if (!r) {
+      r = { key: b.key, tools: 0, running: 0, items: [] }
+      pending.set(b.key, r)
+    }
+    r.items.push(...b.items)
+    r.tools += b.tools
+    r.running += b.running
+  }
+  flush()
+
   return (
-    <span className="shrink-0 rounded bg-elevated px-1 py-0.5 font-mono text-[10px] text-ink-3">
-      {by}
-    </span>
+    <>
+      {parts.map((p, pi) => p.kind === 'main' ? (
+        <div key={pi} className="space-y-1.5">{renderBlockItems(p.items)}</div>
+      ) : (
+        <div key={pi} className="rounded-lg border border-line/60 divide-y divide-line/40">
+          {p.rows.map((r) => {
+            const done = r.running === 0
+            const interrupted = r.items.some(
+              (t) => t.kind === 'tool' && t.status === 'interrupted')
+            // Latest tool call = the one-line "what it's doing" cue.
+            const lastTool = [...r.items].reverse().find((t) => t.kind === 'tool') as ToolEv | undefined
+            const isOpen = r.key in foldedSources ? !foldedSources[r.key] : false
+            const shortArgs = lastTool ? lastTool.args.replace(/\s+/g, ' ').slice(0, 48) : ''
+            // Per-owner color: label tail number cycles a low-sat palette;
+            // colors the status-row NAME and the expand area's left bar so
+            // color alone answers "whose output is this".
+            const accent = SOURCE_COLORS[
+              ((_taskSeqNo(r.key) - 1) % SOURCE_COLORS.length + SOURCE_COLORS.length) % SOURCE_COLORS.length]
+            return (
+              <div key={r.key}>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setFoldedSources((m) => ({ ...m, [r.key]: isOpen }))
+                  }}
+                  className="flex w-full items-center gap-2 px-2 py-1 text-left hover:bg-elevated/40"
+                >
+                  <span className="inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center">
+                    {interrupted ? (
+                      <X className="h-3 w-3 text-warning" />
+                    ) : done ? (
+                      <Check className="h-3 w-3 text-success/80" />
+                    ) : (
+                      <Loader2 className="h-3 w-3 animate-spin text-ink-4" />
+                    )}
+                  </span>
+                  <span className={cn('shrink-0 font-mono text-[10px]', accent.text)}>{r.key}</span>
+                  <span className="shrink-0 text-[10px] text-ink-4">{r.tools} 工具</span>
+                  {lastTool && (
+                    <span className="min-w-0 flex-1 truncate text-[10px] text-ink-4">
+                      <span className="font-mono text-ink-3">{lastTool.name}</span>
+                      {shortArgs && <span className="ml-1">{shortArgs}</span>}
+                    </span>
+                  )}
+                  <ChevronRight className={cn('h-3 w-3 shrink-0 text-ink-5 transition-transform', isOpen && 'rotate-90')} />
+                </button>
+                {isOpen && (
+                  <div className={cn('space-y-1.5 border-t border-line/40 bg-app/40 py-1.5 pl-4', accent.bar)}>
+                    {renderBlockItems(r.items, true)}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      ))}
+    </>
   )
 }
 
@@ -180,7 +394,7 @@ function ApprovalBadge({ approval }: {
   )
 }
 
-const ToolItem = memo(function ToolItem({ ev }: { ev: ToolEv }) {
+const ToolItem = memo(function ToolItem({ ev, child }: { ev: ToolEv; child?: boolean }) {
   const [expanded, setExpanded] = useState(false)
   // Live tool_call events carry a 500-char slice + an id — fetch the full
   // args on first expand (history trace events already carry full args, no id).
@@ -227,8 +441,10 @@ const ToolItem = memo(function ToolItem({ ev }: { ev: ToolEv }) {
       </span>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
-          <ByBadge by={ev.by} />
-          <span className="rounded bg-elevated px-1 py-0.5 font-mono text-[11px] text-ink-2">
+          <span className={cn(
+            'rounded px-1 py-0.5 font-mono',
+            child ? 'bg-transparent text-[10px] text-ink-4' : 'bg-elevated text-[11px] text-ink-2'
+          )}>
             {ev.name}
           </span>
           {ev.approval ? <ApprovalBadge approval={ev.approval} /> : null}
@@ -319,19 +535,19 @@ const ToolItem = memo(function ToolItem({ ev }: { ev: ToolEv }) {
 
 const THOUGHT_PREVIEW = 160
 
-const ThoughtItem = memo(function ThoughtItem({ ev }: { ev: ThoughtEv }) {
+const ThoughtItem = memo(function ThoughtItem({ ev, child }: { ev: ThoughtEv; child?: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const tooLong = ev.text.length > THOUGHT_PREVIEW
   const ts = fmtTs(ev.ts)
   return (
     <div className="flex items-start gap-1.5">
-      <Brain className="mt-0.5 h-3 w-3 shrink-0 text-ink-4" />
+      <Brain className={cn('mt-0.5 h-3 w-3 shrink-0', child ? 'text-ink-5/70' : 'text-ink-4')} />
       <div className="min-w-0 flex-1">
         <div className="flex items-start gap-1.5">
-          <ByBadge by={ev.by} />
           <p
             className={cn(
-              'min-w-0 flex-1 select-text whitespace-pre-wrap italic text-ink-4',
+              'min-w-0 flex-1 select-text whitespace-pre-wrap italic',
+              child ? 'text-[11px] leading-snug text-ink-5' : 'text-ink-4',
               !expanded && tooLong && 'line-clamp-2'
             )}
           >

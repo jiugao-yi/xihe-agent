@@ -2,6 +2,10 @@
 
 > 当前进行中的需求、变更、待决问题。会话开始时优先查阅。
 
+## 已完成：上下文压缩 v3.2 + 桌面滚动竞态修复 + 连通性探针改对话（2026-09-23，全量 pytest 绿 + tsc 0 错 + build 绿）
+
+[[0057]] [[0058]] [[0059]] 三页沉淀本批。核心：**压缩架构从"物理覆盖 DB"改为 append-only + compactions 视图**——messages 行零删改（rewrite_messages 改只增，hash 前缀缓存删除），压缩写 compactions 记录（head/tail message-id 锚点），模型看 `load_context_messages` 视图、桌面照常查 raw 全量历史（"压缩吞掉桌面历史"实测质询驱动的架构反转）；CJK tail 口径统一（修压缩震荡）、_align_head 语义回合保护、闭环校验、七段通用摘要+事实枚举（零元数据推导）、usage 校准触发跨实例化、微压缩入 API 边界、阈值 0.75、**零新增配置项**（4 个开关与归档表/后台压缩/L0.5/msg_type 全否决，决策链存档页内）。另：桌面流式滚动竞态（用户上滑被程序化 scrollIntoView 洗掉——意图事件立即解除 + programmaticScroll 一次性标记）、连通性探针弃 GET /models 改最小对话（POST /chat/completions，ok/error/note 分离）。存量损坏测试 test_stream_attribution 顺手修（TurnCallbacks 收敛漏改）。**注意：sessions 表加列 + compactions 新表，旧库不兼容（开发阶段约定）；serve/gateway/桌面需重启。桌面压缩折叠卡片 UI 待做（serve 数据已先行）。**
+
 ## 已完成：企微中继卡体系——审批/clarify 交互卡 + 协议实测（2026-09-21，pytest 593 全量绿）
 
 [[0055]] 沉淀实现、[[0056]] 沉淀协议实测。功能面：**审批按钮卡**（批准/拒绝/总是允许，点击即裁决 + 5 秒窗卡面终态 + desc 回填 summary）、**clarify 选择卡**（vote 官方 schema，单选/多选由模型 multi_select 声明，选项原文随卡登记、oN 序号折回原文作答）、**通用中继卡路由表**（approvals.py，按 (kind,id) 精确命中）、**健康探测持久化**（wecom_cards.json，2 张 0 事件自动停用回落文本）、cron 后台审批卡。文本 y/n/a 通道并存。**协议实测七轮 spike**（insight 0056）：毒字段静默丢弃（task_id 冒号/source/错 schema）、卡型可用性真相、5 秒更新窗、单连接互顶。**自检工具**：scripts/wecom_card_spike.py（审批）/ wecom_clarify_spike.py（clarify）。**注意：gateway 需重启生效；企微幻觉文件 scripts/wecom_longconn_card.py 建议删除（未删，待定）。**

@@ -11,6 +11,8 @@ import { EditorArea } from './components/EditorArea'
 import { BrowserPanel } from './components/BrowserPanel'
 import { TerminalPanel } from './components/TerminalPanel'
 import { ShellPanel } from './components/ShellPanel'
+import { FileOverlay } from './components/FileOverlay'
+import { FindBar } from './components/FindBar'
 import { Resizer, usePanelSize } from './components/Resizer'
 import { cn } from './lib/cn'
 import { desktop } from './lib/desktop'
@@ -153,6 +155,20 @@ export default function App() {
   // and the layout toggle itself is hidden.
   const inWorkbench = !!activeWs && layoutMode === 'workbench'
   const dismissBrowserPanel = useStore((s) => s.dismissBrowserPanel)
+  const bindConversationWorkspace = useStore((s) => s.bindConversationWorkspace)
+  // Workspace-picker popover for UNBOUND conversations: the two
+  // workspace-gated header buttons (workbench toggle, file tree) open it —
+  // "先绑定工作空间" became an entry point, not a dead end.
+  const [wsPickerOpen, setWsPickerOpen] = useState(false)
+  // Click-outside close: a single document listener while open.
+  useEffect(() => {
+    if (!wsPickerOpen) return
+    const close = () => setWsPickerOpen(false)
+    document.addEventListener('click', close)
+    return () => document.removeEventListener('click', close)
+  }, [wsPickerOpen])
+  // Full-content-area file overlay (non-workbench file tree's "expand").
+  const [overlayFile, setOverlayFile] = useState<string | null>(null)
 
   // The browser panel belongs to the conversation that opened it — switching
   // conversations hides the Chrome first (main), then closes the panel without
@@ -177,8 +193,8 @@ export default function App() {
       <main className="flex min-w-0 flex-1 flex-col">
         <>
           <header className="flex items-center gap-3 border-b border-line px-5 py-3">
-              <div className="ml-auto flex items-center gap-1">
-                {activeWs && (
+              <div className="ml-auto relative flex items-center gap-1">
+                {activeWs ? (
                   <button
                     onClick={() => void setLayoutMode(inWorkbench ? 'chat' : 'workbench')}
                     title="工作台布局（文件树 + 编辑器为中心）"
@@ -191,25 +207,90 @@ export default function App() {
                   >
                     <CodeXml className="h-4 w-4" />
                   </button>
+                ) : (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setWsPickerOpen((v) => !v) }}
+                    title="绑定工作空间后可用 — 点击选择"
+                    className={cn(
+                      'rounded-lg p-1.5 transition text-ink-3 hover:bg-elevated hover:text-ink',
+                      wsPickerOpen && 'bg-elevated text-ink'
+                    )}
+                  >
+                    <CodeXml className="h-4 w-4" />
+                  </button>
                 )}
-                <button
-                  onClick={() =>
-                    inWorkbench
-                      ? setTreeCollapsed((v) => !v)
-                      : setRightTreeCollapsed((v) => !v)
-                  }
-                  disabled={!activeWs}
-                  title={activeWs ? '显示/隐藏文件树' : '先绑定工作空间'}
-                  className={cn(
-                    'rounded-lg p-1.5 transition',
-                    activeWs && (inWorkbench ? !treeCollapsed : !rightTreeCollapsed)
-                      ? 'bg-contrast text-sky-300'
-                      : 'text-ink-3 hover:bg-elevated hover:text-ink',
-                    !activeWs && 'cursor-not-allowed opacity-40'
-                  )}
-                >
-                  <FolderTree className="h-4 w-4" />
-                </button>
+                {activeWs ? (
+                  <button
+                    onClick={() =>
+                      inWorkbench
+                        ? setTreeCollapsed((v) => !v)
+                        : setRightTreeCollapsed((v) => !v)
+                    }
+                    title="显示/隐藏文件树"
+                    className={cn(
+                      'rounded-lg p-1.5 transition',
+                      inWorkbench ? !treeCollapsed : !rightTreeCollapsed
+                        ? 'bg-contrast text-sky-300'
+                        : 'text-ink-3 hover:bg-elevated hover:text-ink'
+                    )}
+                  >
+                    <FolderTree className="h-4 w-4" />
+                  </button>
+                ) : (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setWsPickerOpen((v) => !v) }}
+                    title="绑定工作空间后可用 — 点击选择"
+                    className={cn(
+                      'rounded-lg p-1.5 transition text-ink-3 hover:bg-elevated hover:text-ink',
+                      wsPickerOpen && 'bg-elevated text-ink'
+                    )}
+                  >
+                    <FolderTree className="h-4 w-4" />
+                  </button>
+                )}
+                {wsPickerOpen && (
+                  <div
+                    className="absolute right-0 top-full z-40 mt-1 w-72 rounded-lg border border-line bg-elevated p-1.5 shadow-lg"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="px-2 py-1 text-[10px] uppercase tracking-wide text-ink-5">
+                      绑定工作空间 — 当前对话
+                    </div>
+                    {workspaces.length === 0 && (
+                      <div className="px-2 py-2 text-xs text-ink-4">
+                        尚无工作空间。在左侧边栏创建后即可绑定。
+                      </div>
+                    )}
+                    {workspaces.map((w) => (
+                      <button
+                        key={w.id}
+                        onClick={() => {
+                          if (activeConvId) {
+                            bindConversationWorkspace(activeConvId, w.id)
+                            void setLayoutMode('workbench')
+                          }
+                          setWsPickerOpen(false)
+                        }}
+                        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-app"
+                      >
+                        <FolderTree className="h-3.5 w-3.5 shrink-0 text-ink-4" />
+                        <span className="min-w-0 flex-1 truncate text-xs text-ink-2">{w.name}</span>
+                        <span className="min-w-0 max-w-[45%] truncate text-[10px] text-ink-5">{w.workdir}</span>
+                      </button>
+                    ))}
+                    {activeWs && (
+                      <button
+                        onClick={() => {
+                          if (activeConvId) bindConversationWorkspace(activeConvId, null)
+                          setWsPickerOpen(false)
+                        }}
+                        className="mt-0.5 flex w-full items-center rounded-md px-2 py-1.5 text-left text-xs text-ink-4 hover:bg-app hover:text-ink-2"
+                      >
+                        取消绑定（变回通用对话）
+                      </button>
+                    )}
+                  </div>
+                )}
                 <button
                   onClick={() => setShowBrowser(!showBrowser)}
                   title="浏览器面板（agent 的 Chrome 吸附于此）"
@@ -348,6 +429,7 @@ export default function App() {
                         className="shrink-0 border-l border-line"
                         onCollapse={() => setRightTreeCollapsed(true)}
                         onRunFile={(c) => openShellPanel(c)}
+                        onExpandFile={(p) => setOverlayFile(p)}
                       />
                     )}
                     {activeWs && rightTreeCollapsed && (
@@ -388,6 +470,8 @@ export default function App() {
       {activeTab === 'manage' && <SettingsPanel onBack={() => setTab('chat')} />}
       {activeTab === 'store' && <StorePage onBack={() => setTab('chat')} />}
       {activeTab === 'knowledge' && <KnowledgePage onBack={() => setTab('chat')} />}
+      {overlayFile && <FileOverlay path={overlayFile} onClose={() => setOverlayFile(null)} />}
+      <FindBar />
     </>
   )
 }

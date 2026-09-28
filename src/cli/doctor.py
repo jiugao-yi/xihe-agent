@@ -89,13 +89,13 @@ def run_doctor(args) -> int:
         print("\n[连通性] 跳过（--no-net）")
     else:
         print("\n[连通性]")
-        net = check_connectivity(config.get("base_url"), config.get("api_key"))
+        net = check_connectivity(config.get("base_url"), config.get("api_key"),
+                                 model=config.get("model"))
         if net["ok"]:
-            tail = (f" — 发现 {len(net['models'])} 个模型"
-                    + (f": {', '.join(net['models'][:8])}" if net["models"] else ""))
+            tail = f" — 模型 {config.get('model')} 对话可用" if config.get("model") else ""
             print(f"  {_mark(True)} {config.get('base_url')}{tail}")
-            if net.get("error"):
-                print(f"      ({net['error']})")
+            if net.get("note"):
+                print(f"      ({net['note']})")
         else:
             print(f"  {_mark(False)} {config.get('base_url')} — {net['error']}")
             problems += 1

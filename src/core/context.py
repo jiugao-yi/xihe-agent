@@ -48,6 +48,7 @@ class SharedContext:
             context_length=context_length,
             threshold_percent=config["compression_threshold"],
             aux=self.aux,
+            db=self.db,
         )
         # Shared main-model client: per-message agents otherwise each pay a
         # fresh httpx pool (TCP+TLS handshake) on their first call. Built only

@@ -73,14 +73,14 @@ class FakeChild:
     def __init__(self):
         self.chat_kwargs = None
 
-    def chat(self, source=None, user_message=None, **kwargs):
-        self.chat_kwargs = kwargs
+    def chat(self, source=None, user_message=None, callbacks=None, **kwargs):
+        self.chat_kwargs = {"callbacks": callbacks, **kwargs}
         # Fire exactly as agent.py does: kind= as kwarg, tools positionally.
-        kwargs["stream_delta_callback"]("thinking", kind="reasoning")
-        kwargs["tool_call_start_callback"]("read_file", "args")
-        kwargs["tool_result_callback"]("read_file", "res", 1.0)
+        callbacks.stream_delta("thinking", kind="reasoning")
+        callbacks.tool_call_start("read_file", "args")
+        callbacks.tool_result("read_file", "res", 1.0)
         # Inner source (claude under a specialist) must win over the label.
-        kwargs["tool_call_start_callback"]("Read", "a", by="claude")
+        callbacks.tool_call_start("Read", "a", by="claude")
         return "summary"
 
 
@@ -99,10 +99,16 @@ def test_bridge_labels_child_events(monkeypatch):
 
     assert entry["status"] == "completed"
     assert ("stream", ("thinking",), {"kind": "reasoning", "by": "itsm"}) in rec.calls
-    assert ("start", ("read_file", "args"), {"by": "itsm"}) in rec.calls
-    assert ("result", ("read_file", "res", 1.0), {"by": "itsm"}) in rec.calls
+    # tool events carry tool_call_id through (exact client-side pairing needs
+    # the ring id on the child's frames too) — key present, value None when
+    # the child fired without one.
+    assert ("start", ("read_file", "args"),
+            {"by": "itsm", "tool_call_id": None}) in rec.calls
+    assert ("result", ("read_file", "res", 1.0),
+            {"by": "itsm", "tool_call_id": None}) in rec.calls
     # innermost attribution wins
-    assert ("start", ("Read", "a"), {"by": "claude"}) in rec.calls
+    assert ("start", ("Read", "a"),
+            {"by": "claude", "tool_call_id": None}) in rec.calls
 
 
 # ------------------------------------------------- external_agent forward ---

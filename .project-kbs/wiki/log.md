@@ -2,6 +2,14 @@
 
 > 按时间顺序记录的收录、回写、查询、整理操作。
 
+## 2026-09-24
+
+- **收录候选 specialist-parallel-dispatch**（用户要求"先记录到 wiki 后面再评估"）：专家 agent 并发派发的 parallel_safe 调度分组方案——起于两起实测（delegate_task 三连单调用串行 30+ 分钟、run_explore_agent 三连 tool_call 被 `_dispatch_tools` 的 read_only 分组串行化——模型协议原生的并行表达被调度层浪费）。核心设计：注册表新维度 parallel_safe 与 read_only 模式同构、按专家 def 字段计算（sticky ∨ 写面 → 串行，纯只读专家并行，零新配置）、四个已核实交互点（sticky 会话共写/MidturnHub 单 pending 构造假设/取号竞态/中断与回填安全）、两条已否决替代路径（goals 数组、YAML 显式声明）。~1.5 天量级，暂不实施，触发信号与已落地配套存档。开放候选 2→3。
+
+## 2026-09-23
+
+- **回写**: 上下文压缩 v3.2 + 桌面滚动竞态修复 + 连通性探针改对话（用户方案评审定稿 v3.2 后实施；"压缩吞掉桌面历史"质询驱动架构反转；"测试连接不该用 /models"两轮实测指认）→ 新增变更页 [[0057_context-compression-v32]]（append-only + compactions 视图 + usage 校准 + 七段通用摘要 + 否决项决策链 + 冒烟脚本）、[[0058_desktop-scroll-follow-race]]（程序化滚动 launder onScroll 判定的竞态与意图事件修法）、[[0059_connectivity-chat-probe]]（探针打在用户要用的路径上 + ok/error/note 字段分离）；订正 [[0048_sessions-messages-reset]]（持久化节 append-only 语义 + 压缩视图节 + 不变量 9→11）。同步 index.md（3 新行 + 0048 行更新）、active.md（顶部条目）、recent.md。
+
 ## 2026-09-21
 
 - **回写**: 企微中继卡体系（用户要求评估企微卡片化调研文档起步，实施中七轮 spike 真连接实测推翻调研文档多处结论，转实测驱动落地）→ 新增变更页 [[0055_wecom-relay-cards]]（审批/clarify 交互卡 + 通用路由表 + 健康探测 + cron 审批卡 + multi_select 全链路）+ 洞察页 [[0056_wecom-aibot-card-protocol]]（毒字段静默丢弃/卡型可用性真相/事件结构/5 秒更新窗/单连接互顶——文档没写或与文档冲突的全部实测结论）；同批收原始快照 `raw/sources/xihe-agent × 企业微信集成方案（调研 + 设计）.md`（调研文档本体，多处协议错误被实测证伪，教训见 insight）。**编号撞号险情**：insight 初编 0030 与打包策略页撞号（0048 同款错误重演），改 0056。同步 index.md（0055 changes 行 + 0056 insights 行 + 页面数 53→55）、active.md（顶部条目）、recent.md。total_pages 53→55。

@@ -130,6 +130,10 @@ def test_truncate_unknown_id_returns_zero_with_no_side_effect():
     db.rewrite_messages(sid, [{"role": "user", "content": "q1"}])
     assert db.truncate_messages_from(db.build_key(_src()), sid, "nonexistent") == 0
     assert len(db.load_messages_with_id(sid)) == 1
+
+
+def test_truncate_removes_target_and_meta():
+    """truncate from 某 id：该行及之后全删，meta 无孤儿。"""
     db = _mk_db()
     sid = db.get_or_create_session(_src())
     db.rewrite_messages(sid, [
