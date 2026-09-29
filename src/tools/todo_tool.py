@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import threading
 from pathlib import Path
 from tools import registry, tool_error, tool_result
@@ -9,10 +10,15 @@ from tools import registry, tool_error, tool_result
 logger = logging.getLogger(__name__)
 
 from core.config import AGENT_HOME
+from core.support.process_lock import CrossProcessLock
 _TODO_FILE = AGENT_HOME / "todos.json"
-# Load-modify-save on one shared file: parallel batch children would clobber
-# each other's writes without serialization.
+# Two-layer lock on the load-modify-save transaction: the threading.Lock
+# serializes same-process callers cheaply (CrossProcessLock is exclusive
+# across handles within one process too — bare use would self-deadlock to
+# timeout), the CrossProcessLock serializes serve vs gateway vs CLI sharing
+# one AGENT_HOME. Reads go lockless — safe against the atomic save below.
 _TODO_LOCK = threading.Lock()
+_TODO_CROSS_LOCK = AGENT_HOME / "todos.lock"
 
 
 def _load_todos() -> dict:
@@ -26,7 +32,20 @@ def _load_todos() -> dict:
 
 def _save_todos(data: dict):
     _TODO_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _TODO_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp = _TODO_FILE.parent / (_TODO_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, _TODO_FILE)
+
+
+def _with_cross_lock(fn):
+    """Run fn() inside the cross-process todo lock; contention (>10s) degrades
+    to a controlled tool_error instead of blowing up the agent loop."""
+    try:
+        with _TODO_LOCK, CrossProcessLock(_TODO_CROSS_LOCK, timeout=10):
+            return fn()
+    except TimeoutError:
+        logger.warning("todo cross-process lock contention (>10s)")
+        return tool_error("todo 文件正被其他 xihe 进程占用，请稍后重试")
 
 
 def _scoped_list_name(args: dict, kw: dict) -> str:
@@ -57,8 +76,7 @@ def _todo(args: dict, **kw) -> str:
 
 
 def _list_todos(list_name: str) -> str:
-    with _TODO_LOCK:
-        todos = _load_todos()
+    todos = _load_todos()
     items = todos.get(list_name, [])
     return tool_result(list=list_name, items=items, count=len(items))
 
@@ -71,7 +89,7 @@ def _add_todo(list_name: str, args: dict) -> str:
     if not title:
         return tool_error("title is required")
 
-    with _TODO_LOCK:
+    def _tx():
         todos = _load_todos()
         items = todos.get(list_name, [])
         item = {
@@ -84,7 +102,9 @@ def _add_todo(list_name: str, args: dict) -> str:
         items.append(item)
         todos[list_name] = items
         _save_todos(todos)
-    return tool_result(success=True, item=item)
+        return tool_result(success=True, item=item)
+
+    return _with_cross_lock(_tx)
 
 
 def _update_todo(list_name: str, args: dict) -> str:
@@ -94,10 +114,9 @@ def _update_todo(list_name: str, args: dict) -> str:
     if not item_id:
         return tool_error("id is required")
 
-    with _TODO_LOCK:
+    def _tx():
         todos = _load_todos()
         items = todos.get(list_name, [])
-
         for item in items:
             if item["id"] == item_id:
                 if status:
@@ -110,8 +129,9 @@ def _update_todo(list_name: str, args: dict) -> str:
                     item["priority"] = args["priority"]
                 _save_todos(todos)
                 return tool_result(success=True, item=item)
+        return tool_error(f"Item not found: {item_id}")
 
-    return tool_error(f"Item not found: {item_id}")
+    return _with_cross_lock(_tx)
 
 
 def _delete_todo(list_name: str, args: dict) -> str:
@@ -120,17 +140,17 @@ def _delete_todo(list_name: str, args: dict) -> str:
     if not item_id:
         return tool_error("id is required")
 
-    with _TODO_LOCK:
+    def _tx():
         todos = _load_todos()
         items = todos.get(list_name, [])
         new_items = [i for i in items if i["id"] != item_id]
-
         if len(new_items) == len(items):
             return tool_error(f"Item not found: {item_id}")
-
         todos[list_name] = new_items
         _save_todos(todos)
-    return tool_result(success=True, deleted=item_id)
+        return tool_result(success=True, deleted=item_id)
+
+    return _with_cross_lock(_tx)
 
 
 registry.register(
@@ -197,13 +217,16 @@ def hydrate_from_history(messages: list[dict]):
             items = parsed.get("items")
             list_name = parsed.get("list", "default")
             if items and isinstance(items, list):
-                todos = _load_todos()
-                # Only hydrate if the list is currently empty
-                if not todos.get(list_name):
-                    todos[list_name] = items
-                    _save_todos(todos)
-                    logger.info("Hydrated todo list '%s' from history (%d items)",
-                                list_name, len(items))
+                def _tx():
+                    todos = _load_todos()
+                    # Only hydrate if the list is currently empty
+                    if not todos.get(list_name):
+                        todos[list_name] = items
+                        _save_todos(todos)
+                        logger.info("Hydrated todo list '%s' from history (%d items)",
+                                    list_name, len(items))
+                # Failure only means the list stays unhydrated — degrade quietly.
+                _with_cross_lock(_tx)
                 return
         except (json.JSONDecodeError, TypeError):
             continue

@@ -34,7 +34,7 @@ There is a small **pytest** suite under `tests/` — L0 pure functions, L1 tool 
 
 Runtime state lives under `~/.xihe-agent/` (override with `AGENT_HOME` or `--config`):
 - `config.yaml` — **single source** of all config and credentials (see Config below)
-- `agent.log` — log file (gateway logs here; check it when debugging)
+- `agent-serve.log` / `agent-gateway.log` / `cli.log` — per-entrypoint logs (one writer per file keeps rollover Windows-safe; check the one for the mode you're debugging)
 - `sessions.db` — SQLite conversation history
 - `browser/states/*.json` — saved browser login states; `skills/` — user-created skills
 - `agents/*.yaml` — specialist-agent definitions (one file per specialist; see Specialist agents below)
@@ -77,7 +77,7 @@ SQLite-backed. `SessionSource` (platform + chat_id + user) → deterministic key
 ### Config (`src/core/config.py`)
 **Single source.** All config — top-level keys (`model`, `base_url`, `api_key`, `platform`, `max_iterations`, `compression_threshold`, `vision_model`, `toolsets`, `skills`, `language`) and sections (`models`, `platforms`, `mcp_servers`, `session`, `auxiliary`, `delegation`, `external_agents`, `approvals`, `kbs`, `specialists`) — is read from one config.yaml. Values are literal: there is **no `.env`, no environment-variable override, and no `${VAR}` expansion**. Default location: `~/.xihe-agent/config.yaml`. Note `load_config` copies sections from an allowlist — new sections must be added to both loops in `src/core/config.py` or they silently vanish.
 
-`xihe --config path/to/x.yaml` selects an **instance**: that file is the single config source, and its optional `agent_home` overrides the data root (`AGENT_HOME`, so `sessions.db` / `agent.log` / `browser` / `cron` isolate per instance). `AGENT_HOME` is resolved at import time by peeking `sys.argv` (`--config`) and the `AGENT_HOME` env var, so it's correct before any consumer module pins it; the chosen config path is stashed in `XIHE_CONFIG_FILE` so dynamic `load_config()` callers (which pass no path) still see the right instance.
+`xihe --config path/to/x.yaml` selects an **instance**: that file is the single config source, and its optional `agent_home` overrides the data root (`AGENT_HOME`, so `sessions.db` / logs / `browser` / `cron` isolate per instance). `AGENT_HOME` is resolved at import time by peeking `sys.argv` (`--config`) and the `AGENT_HOME` env var, so it's correct before any consumer module pins it; the chosen config path is stashed in `XIHE_CONFIG_FILE` so dynamic `load_config()` callers (which pass no path) still see the right instance.
 
 ### Auxiliary LLM client (`src/core/agent/auxiliary_client.py`)
 Distinct from the main agent model — used for tool-internal LLM calls (vision analysis, context compression, title generation). Vision/image tools route here, not through the main model.

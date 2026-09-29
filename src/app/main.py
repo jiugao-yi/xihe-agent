@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.config import load_config, seed_default_config
+from core.config import AGENT_HOME, load_config, seed_default_config
 from core.logging_config import setup_logging
 from core.version import VERSION
 
@@ -124,7 +124,8 @@ def cmd_serve(args):
     # and built-in defaults until the next restart.
     seed_default_config(getattr(args, "config", None))
     config = load_config(getattr(args, "config", None))
-    setup_logging(level=logging.INFO, also_file=True)
+    setup_logging(level=logging.INFO, also_file=True,
+                  log_file=Path(AGENT_HOME) / "agent-serve.log")
     run_serve(config, host=args.host, port=args.port, version=VERSION)
     return 0
 

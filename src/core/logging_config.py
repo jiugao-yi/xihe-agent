@@ -20,7 +20,11 @@ def setup_logging(level: int = logging.WARNING, also_file: bool = False,
     Args:
         level: Console (and default) log level.
         also_file: Also write to a log file.
-        log_file: Custom log file path. Defaults to ~/.xihe-agent/agent.log.
+        log_file: Custom log file path. Defaults to ~/.xihe-agent/<entrypoint
+            log> — each entrypoint passes its own name (serve → agent-serve.log,
+            gateway → agent-gateway.log, CLI → cli.log): one writer per file
+            keeps RotatingFileHandler's rename-rollover single-process-safe
+            (shared-file rollover deadlocks on Windows, WinError 32).
         file_level: File-handler level (defaults to ``level``). Set lower than
             ``level`` (e.g. INFO with level=WARNING) to capture detail in the
             file while keeping the console quiet — root is lowered to the more
@@ -39,12 +43,12 @@ def setup_logging(level: int = logging.WARNING, also_file: bool = False,
     if also_file:
         path = Path(log_file) if log_file else AGENT_HOME / "agent.log"
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Rotating, not bare: the gateway/serve log every tool call at INFO
-        # and run for weeks — unbounded agent.log growth once ate the disk.
-        # Not multi-process safe (two xihe instances sharing one AGENT_HOME
-        # may interleave during rollover); the worst case is lost log lines,
-        # which beats silent growth. delay=True avoids empty log files on
-        # short runs.
+        # Rotating, not bare: gateway/serve log every tool call at INFO
+        # and run for weeks — unbounded log growth once ate the disk.
+        # Single-writer-per-file by entrypoint (see log_file docstring);
+        # two instances of the SAME entrypoint sharing one AGENT_HOME may
+        # still interleave at rollover — lost lines beat silent growth.
+        # delay=True avoids empty log files on short runs.
         from logging.handlers import RotatingFileHandler
         fh = RotatingFileHandler(path, encoding="utf-8",
                                  maxBytes=10 * 1024 * 1024, backupCount=3,

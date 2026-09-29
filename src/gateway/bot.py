@@ -217,7 +217,8 @@ def run_gateway(args):
               file=sys.stderr)
         return 1
 
-    setup_logging(level=logging.INFO, also_file=True)
+    setup_logging(level=logging.INFO, also_file=True,
+                  log_file=AGENT_HOME / "agent-gateway.log")
     logger = logging.getLogger("gateway")
 
     platform_name = getattr(args, "platform", None) or config.get("platform", "wecom")
@@ -920,7 +921,7 @@ def run_gateway(args):
 
         logger.info("Xihe Agent gateway running on %s — 去给机器人发条消息试试。"
                     "日志: %s | Ctrl+C 停止。",
-                    platform_name, AGENT_HOME / "agent.log")
+                    platform_name, AGENT_HOME / "agent-gateway.log")
         stop_event = asyncio.Event()
 
         for sig in (signal.SIGINT, signal.SIGTERM):

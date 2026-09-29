@@ -12,13 +12,32 @@ import logging
 import os
 import re
 import shutil
+import threading
 from typing import Optional
 from tools import registry, tool_error, tool_result
 from core.config import AGENT_HOME
+from core.support.process_lock import CrossProcessLock
 
 logger = logging.getLogger(__name__)
 
 _MEMORIES_FILE = AGENT_HOME / "memories.json"
+# save/delete 是跨进程 load-modify-save：serve/gateway/CLI 共享一个
+# AGENT_HOME 时必须串行。threading.Lock 先挡同进程（CrossProcessLock 同进程
+# 两个 handle 也互斥，裸用会自等到超时）；读路径不进锁，靠 _save_memories
+# 的原子 replace 保证读者只见完整文件。
+_MEMORY_LOCK = threading.Lock()
+_MEMORY_CROSS_LOCK = AGENT_HOME / "memories.lock"
+
+
+def _with_memory_lock(fn):
+    """Run fn() inside the two-layer memory lock; contention (>10s) returns
+    a controlled tool_error instead of blowing up the agent loop."""
+    try:
+        with _MEMORY_LOCK, CrossProcessLock(_MEMORY_CROSS_LOCK, timeout=10):
+            return fn()
+    except TimeoutError:
+        logger.warning("memory cross-process lock contention (>10s)")
+        return tool_error("memory 文件正被其他 xihe 进程占用，请稍后重试")
 
 _MEMORY_THREAT_PATTERNS = [
     # Prompt injection
@@ -135,21 +154,29 @@ def _memory_manage(args: dict, **kw) -> str:
         scan_error = _scan_memory_content(value)
         if scan_error:
             return tool_error(scan_error)
-        memories = _load_memories()
-        memories[key] = value
-        _save_memories(memories)
-        logger.info("Memory saved: %s", key)
-        return tool_result(success=True, action="save", key=key)
+
+        def _tx():
+            memories = _load_memories()
+            memories[key] = value
+            _save_memories(memories)
+            logger.info("Memory saved: %s", key)
+            return tool_result(success=True, action="save", key=key)
+
+        return _with_memory_lock(_tx)
 
     elif action == "delete":
         if not key:
             return tool_error("key is required for delete")
-        memories = _load_memories()
-        if key in memories:
-            del memories[key]
-            _save_memories(memories)
-            return tool_result(success=True, action="delete", key=key)
-        return tool_error(f"Key not found: {key}")
+
+        def _tx():
+            memories = _load_memories()
+            if key in memories:
+                del memories[key]
+                _save_memories(memories)
+                return tool_result(success=True, action="delete", key=key)
+            return tool_error(f"Key not found: {key}")
+
+        return _with_memory_lock(_tx)
 
     else:
         return tool_error(f"Unknown action: {action}. Use: save, delete (reads: memory)")

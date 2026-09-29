@@ -132,7 +132,7 @@ class _ServeAccessLogger(AccessLogger):
 
     The desktop's ServeSupervisor GETs /health every few seconds for readiness
     + steady-state liveness (see ``serve.ts``), so those INFO lines otherwise
-    dominate agent.log as near-identical noise. Every other endpoint
+    dominate agent-serve.log as near-identical noise. Every other endpoint
     (/sessions, /mcp, /skills, /cron) is rare and worth keeping for
     diagnostics — only /health is suppressed. The browser panel polls
     /browser/status every 5s and re-snaps every frame during a width-handle

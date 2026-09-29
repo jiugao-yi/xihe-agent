@@ -399,7 +399,7 @@ function ItemCard({
               {item.type === 'mcp' && mcpLive && (
                 <span
                   className="flex items-center gap-1 rounded border border-success/50 px-1.5 py-0.5 text-[10px] text-success"
-                  title={mcpLive.connected ? `已连接 · 注册 ${mcpLive.tools} 个工具` : '未连接（见 agent.log）'}
+                  title={mcpLive.connected ? `已连接 · 注册 ${mcpLive.tools} 个工具` : '未连接（见 agent-serve.log）'}
                 >
                   <Dot on={mcpLive.connected} />
                   {mcpLive.connected ? `${mcpLive.tools} 工具` : '未连接'}
@@ -415,7 +415,7 @@ function ItemCard({
                 mcpLive ? (
                   <span
                     className="flex items-center gap-1 rounded border border-success/50 px-1.5 py-0.5 text-[10px] text-success"
-                    title={mcpLive.connected ? `已连接 · 注册 ${mcpLive.tools} 个工具` : '已安装但未连接（见 agent.log）'}
+                    title={mcpLive.connected ? `已连接 · 注册 ${mcpLive.tools} 个工具` : '已安装但未连接（见 agent-serve.log）'}
                   >
                     <Dot on={mcpLive.connected} />
                     {mcpLive.connected ? `已连接 · ${mcpLive.tools} 工具` : '未连接'}

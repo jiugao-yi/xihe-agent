@@ -202,7 +202,7 @@ def capability_matrix(config: dict, toolsets: list | None,
     elif roster_lacks("web"):
         browser = cap(False, "toolsets 未包含 web")
     else:
-        browser = cap(False, "browser 工具未注册（检查 agent.log）")
+        browser = cap(False, "browser 工具未注册（检查日志文件）")
 
     if "vision_analyze" in names:
         vision = cap(True)

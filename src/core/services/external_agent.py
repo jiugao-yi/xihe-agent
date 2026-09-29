@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from core.support.proc_utils import kill_tree, list_process_command_line, process_alive
+from core.support.process_lock import CrossProcessLock
 from core.support.safe_env import build_safe_env, sanitize_error
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,27 @@ def _log_path() -> Path:
 
 _log_lock = threading.Lock()
 
+# external-agent.log append-only guard: roll to .1 past this instead of
+# growing forever (the same failure mode that once ate the disk via agent.log).
+_LOG_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _roll_if_large(p: Path, max_bytes: int) -> None:
+    """Roll p → p.1 (single generation) once over max_bytes.
+
+    No resident handle on purpose: these logs are appended via
+    open/append/close from any of the three run modes sharing one
+    AGENT_HOME, and a RotatingFileHandler's held-open file makes its
+    rename-based rollover deadlock on Windows (WinError 32) — the exact
+    agent.log bug. Rename contention with a concurrent writer is
+    microsecond-scale and swallowed by the caller's except.
+    """
+    try:
+        if p.exists() and p.stat().st_size > max_bytes:
+            os.replace(p, p.parent / (p.name + ".1"))
+    except OSError:
+        pass
+
 
 def _log_event(line: str) -> None:
     """Append a timestamped, secret-scrubbed event line to the dedicated log.
@@ -133,9 +155,12 @@ def _log_event(line: str) -> None:
         import datetime
         d = _data_dir()
         d.mkdir(parents=True, exist_ok=True)
-        ts = datetime.datetime.now().isoformat(timespec="seconds")
-        with _log_lock, open(_log_path(), "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {sanitize_error(line)}\n")
+        p = _log_path()
+        with _log_lock:
+            _roll_if_large(p, _LOG_MAX_BYTES)
+            ts = datetime.datetime.now().isoformat(timespec="seconds")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {sanitize_error(line)}\n")
     except Exception:
         pass
 
@@ -151,20 +176,18 @@ def _log_traffic(line: str) -> None:
     """Raw turn traffic (full prompts out, claude's NDJSON frames back).
 
     Debug-only, opt-in via external_agents.claude.debug. Separate file from
-    the event log because a long turn is thousands of frames; a size guard
-    truncates so a forgotten toggle can't fill the disk.
+    the event log because a long turn is thousands of frames; rolls to .1
+    (kept, not deleted — like _log_event) so a forgotten toggle can't fill
+    the disk.
     """
     try:
         import datetime
         p = _trace_path()
-        try:
-            if p.exists() and p.stat().st_size > 50 * 1024 * 1024:
-                p.unlink()
-        except OSError:
-            pass
         ts = datetime.datetime.now().isoformat(timespec="milliseconds")
-        with _trace_lock, open(p, "a", encoding="utf-8") as f:
-            f.write(f"{ts} {line}\n")
+        with _trace_lock:
+            _roll_if_large(p, 50 * 1024 * 1024)
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(f"{ts} {line}\n")
     except Exception:
         pass
 
@@ -178,27 +201,48 @@ def _read_pids() -> List[dict]:
         return []
 
 
+_pids_lock = threading.Lock()
+_pids_cross_lock = _data_dir() / "external-agent-pids.lock"
+
+
 def _write_pids(entries: List[dict]) -> None:
     # Best-effort: failure only affects next-startup sweep, not this process.
+    # Cross-process locked: serve/gateway/CLI share one AGENT_HOME, and an
+    # unlocked add/remove read-modify-write loses the other side's entry →
+    # the startup sweep misses an orphaned engine child.
     try:
         d = _data_dir()
         d.mkdir(parents=True, exist_ok=True)
-        with open(_pids_path(), "w", encoding="utf-8") as f:
-            json.dump(entries, f, ensure_ascii=False, indent=2)
+        with _pids_lock, CrossProcessLock(_pids_cross_lock, timeout=5):
+            with open(_pids_path(), "w", encoding="utf-8") as f:
+                json.dump(entries, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
 
 def _add_pid(entry: dict) -> None:
-    entries = [e for e in _read_pids() if e.get("pid") != entry.get("pid")]
-    entries.append(entry)
-    _write_pids(entries)
+    with _pids_lock, CrossProcessLock(_pids_cross_lock, timeout=5):
+        entries = [e for e in _read_pids() if e.get("pid") != entry.get("pid")]
+        entries.append(entry)
+        try:
+            _data_dir().mkdir(parents=True, exist_ok=True)
+            with open(_pids_path(), "w", encoding="utf-8") as f:
+                json.dump(entries, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 
 def _remove_pid(pid: Any) -> None:
     if not pid:
         return
-    _write_pids([e for e in _read_pids() if e.get("pid") != pid])
+    with _pids_lock, CrossProcessLock(_pids_cross_lock, timeout=5):
+        entries = [e for e in _read_pids() if e.get("pid") != pid]
+        try:
+            _data_dir().mkdir(parents=True, exist_ok=True)
+            with open(_pids_path(), "w", encoding="utf-8") as f:
+                json.dump(entries, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 
 # (engine, session_key) → engine session/thread id. Survives process death

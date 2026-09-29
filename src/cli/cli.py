@@ -1073,7 +1073,8 @@ def run_chat(args):
               file=sys.stderr)
         return 1
 
-    setup_logging(level=logging.WARNING, also_file=True, file_level=logging.INFO)
+    setup_logging(level=logging.WARNING, also_file=True, file_level=logging.INFO,
+                  log_file=AGENT_HOME / "cli.log")
     shared_ctx, agent = _build_cli_agent(config)
 
     from datetime import datetime
