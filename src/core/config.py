@@ -193,20 +193,7 @@ def config_stamp(config_path: str | None = None) -> tuple[int, int] | None:
 def _parse_config_file(config_path: str) -> dict:
     """Uncached parse of one config.yaml (the load_config body proper)."""
 
-    config = {
-        "model": "glm-5.1-tc",
-        "vision_model": "",
-        "base_url": "https://api.openai.com/v1",
-        "api_key": "",
-        "platform": "wecom",
-        "max_iterations": 30,
-        "compression_threshold": 0.75,
-        # 思考/回复语言引导：zh | en | auto（不引导）。桌面端可配置。
-        "language": "zh",
-        # GLM-class thinking models spend completion tokens on reasoning too;
-        # 4096 let a long thinking phase starve content to empty.
-        "max_completion_tokens": 8192,
-    }
+    config: dict[str, object] = {}
 
     # 2. Apply the single YAML source (literal values — no ${VAR} expansion,
     #    no environment-variable override).

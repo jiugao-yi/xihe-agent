@@ -38,15 +38,15 @@ class SharedContext:
         self.config = config
         self.db = SessionDB(config=config)
         self.aux = AuxiliaryClient(
-            base_url=config["base_url"],
-            api_key=config["api_key"],
-            model=config["model"],
+            base_url=config.get("base_url"),
+            api_key=config.get("api_key"),
+            model=config.get("model"),
             config=config,
         )
-        context_length = XiheAgent._get_context_length_static(config, config["model"])
+        context_length = XiheAgent._get_context_length_static(config, config.get("model"))
         self.compressor = ContextCompressor(
             context_length=context_length,
-            threshold_percent=config["compression_threshold"],
+            threshold_percent=config.get("compression_threshold", 0.75),
             aux=self.aux,
             db=self.db,
         )
@@ -61,8 +61,8 @@ class SharedContext:
             import httpx
             from openai import OpenAI
             self.llm_client = OpenAI(
-                api_key=config["api_key"],
-                base_url=config["base_url"],
+                api_key=config.get("api_key"),
+                base_url=config.get("base_url"),
                 timeout=httpx.Timeout(120.0, connect=10.0),
             )
 

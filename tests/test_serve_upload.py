@@ -106,16 +106,17 @@ def test_upload_rejects_missing_field(tmp_path, monkeypatch):
     asyncio.run(drive())
 
 
-def test_describe_attachments_metadata(tmp_path, monkeypatch):
-    """附件元数据构建：文件条目带 name/path/size；文本不在此拼接（content
-    保持用户原文，提示块由 agent 在 API 边界注入）。图片分支走 vision。"""
+def test_normalize_attachments_metadata(tmp_path, monkeypatch):
+    """附件元数据整理：文件条目带 name/path/size；文本不在此拼接（content
+    保持用户原文，提示块由 agent 在 API 边界注入）；无视觉预生成——统一交
+    agent 按需判断。"""
     app_obj = ServeApp(FakeCtx({"api_key": "sk-x", "model": "m"}), version="test")
-    atts = app_obj._describe_attachments([
+    atts = app_obj._normalize_attachments([
         {"path": r"C:\data\uploads\t1\doc.pdf", "name": "doc.pdf", "size": 2_500_000},
     ])
     assert atts == [{"name": "doc.pdf", "path": r"C:\data\uploads\t1\doc.pdf",
                      "size": 2_500_000}]
-    assert app_obj._describe_attachments([]) is None
+    assert app_obj._normalize_attachments([]) is None
 
 
 def test_attachments_roundtrip_and_reshape(tmp_path):
@@ -156,7 +157,7 @@ def test_attachments_roundtrip_and_reshape(tmp_path):
     agent.config = {}
     api_msgs = XiheAgent._prepare_api_messages(agent, loaded)
     assert api_msgs[0]["content"].startswith("[用户发送了文件 a.csv")
-    assert "服务器路径: /tmp/a.csv" in api_msgs[0]["content"]
+    assert "路径: /tmp/a.csv" in api_msgs[0]["content"]
     assert api_msgs[0]["content"].endswith("帮我分析")
     assert "_attachments" not in api_msgs[0]
     # source untouched

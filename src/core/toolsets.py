@@ -17,11 +17,11 @@ from typing import Optional
 TOOLSETS = {
     "base": {
         "label": "基础底座",
-        "description": "全员强制：读面（自己/知识/文件）+ 自治 + 内存计算沙箱，XiheAgent 构造时自动并入",
+        "description": "全员强制：读面（自己/知识/文件/Office）+ 自治 + 内存计算沙箱，XiheAgent 构造时自动并入",
         "tools": ["todo", "model_info", "skills_list", "skill_view",
                   "memory", "kbs_search", "kbs_status",
                   "read_file", "search_files", "directory_tree",
-                  "run_sandbox_code", "clarify"],
+                  "office_read", "pdf_to_images", "run_sandbox_code", "clarify"],
     },
     "web": {
         "label": "网页与搜索",

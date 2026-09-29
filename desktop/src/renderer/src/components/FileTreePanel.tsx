@@ -118,19 +118,36 @@ const GIT_COLOR: Record<string, string> = {
   D: 'text-danger',
 }
 
-function reasonText(reason: FsFailReason): string {
+/** Failure copy generator: one place per failure reason, phrased for the
+ *  operation. Windows file-lock (target open in Word/an editor) is the
+ *  dominant real-world io failure for ALL mutating ops — every io message
+ *  names that likely cause instead of a bare "读写错误". */
+function failText(op: 'create' | 'rename' | 'delete' | 'save',
+                  reason: FsFailReason, name?: string): string {
+  const who = name ? `「${name}」` : '文件'
   switch (reason) {
     case 'outsideWorkspace':
-      return '不在工作空间内'
+      return `${who}不在工作空间内，无法${opText(op)}`
     case 'exists':
-      return '已存在同名项'
+      return `已存在同名项，无法${opText(op)}`
     case 'notFound':
-      return '不存在'
+      return `${who}不存在（可能已被删除或移动）`
     case 'io':
+      return `${opText(op)}${who}失败：文件可能正被其他程序占用（如 Word/编辑器），关闭后重试`
     default:
-      return '读写错误'
+      return `${opText(op)}${who}失败（读写错误）`
   }
 }
+
+function opText(op: 'create' | 'rename' | 'delete' | 'save'): string {
+  switch (op) {
+    case 'create': return '新建'
+    case 'rename': return '重命名'
+    case 'delete': return '删除'
+    case 'save': return '保存'
+  }
+}
+
 
 interface FileTreeProps {
   workspace: Workspace
@@ -198,7 +215,19 @@ export function FileTree({
   const [renaming, setRenaming] = useState<{ path: string; dir: boolean; name: string } | null>(null)
   const [renameValue, setRenameValue] = useState('')
   // One transient message for whichever inline form last failed (shown in place).
+  // Auto-dismisses after 6s AND carries a manual ✕ — a stale error strip that
+  // can't be cleared reads as a broken tree (user report: delete failed while
+  // the file was open in Word, the message then hung around forever).
   const [formError, setFormError] = useState<string | null>(null)
+  const formErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (formErrorTimer.current) clearTimeout(formErrorTimer.current)
+  }, [])
+  function showFormError(msg: string): void {
+    setFormError(msg)
+    if (formErrorTimer.current) clearTimeout(formErrorTimer.current)
+    formErrorTimer.current = setTimeout(() => setFormError(null), 6_000)
+  }
   const fsVersion = useStore((s) => s.fsVersion)
   const [git, setGit] = useState<GitStatus | null>(null)
 
@@ -350,7 +379,7 @@ export function FileTree({
         ? await desktop.createDir(creating.parent, name)
         : await desktop.createFile(creating.parent, name)
     if (!r.ok) {
-      setFormError(reasonText(r.reason))
+      showFormError(failText('create', r.reason, name))
       return
     }
     setFormError(null)
@@ -392,7 +421,7 @@ export function FileTree({
     }
     const r = await desktop.renamePath(renaming.path, newName)
     if (!r.ok) {
-      setFormError(reasonText(r.reason))
+      showFormError(failText('rename', r.reason, renaming.name))
       return
     }
     setFormError(null)
@@ -419,7 +448,7 @@ export function FileTree({
     setFormError(null)
     const r = await desktop.deletePath(entry.path)
     if (!r.ok) {
-      setFormError(reasonText(r.reason))
+      showFormError(failText('delete', r.reason, entry.name))
       return
     }
     onPathDeleted?.(entry.path)
@@ -686,8 +715,15 @@ export function FileTree({
       )}
 
       {formError && (
-        <div className="border-b border-danger/40 bg-danger/10 px-3 py-1 text-[11px] text-danger">
-          {formError}
+        <div className="flex items-center gap-1 border-b border-danger/40 bg-danger/10 px-3 py-1 text-[11px] text-danger">
+          <span className="flex-1">{formError}</span>
+          <button
+            onClick={() => setFormError(null)}
+            title="关闭"
+            className="rounded p-0.5 text-danger/70 transition hover:text-danger"
+          >
+            <X className="h-3 w-3" />
+          </button>
         </div>
       )}
 
@@ -810,6 +846,16 @@ export function FileTreePanel({ workspace, className, onCollapse, onRunFile, onE
   const [draft, setDraft] = useState('')
   const [saving, setSaving] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
+  // Same transient-error policy as the tree's form strip (auto-dismiss + ✕).
+  const formErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (formErrorTimer.current) clearTimeout(formErrorTimer.current)
+  }, [])
+  function showFormError(msg: string): void {
+    setFormError(msg)
+    if (formErrorTimer.current) clearTimeout(formErrorTimer.current)
+    formErrorTimer.current = setTimeout(() => setFormError(null), 6_000)
+  }
 
   // Keep the editor draft in sync with the loaded file: on open and after a
   // successful save (which produces a new content object), reset the editor
@@ -887,7 +933,7 @@ export function FileTreePanel({ workspace, className, onCollapse, onRunFile, onE
     const r = await desktop.writeFile(selectedFile, draft)
     setSaving(false)
     if (!r.ok) {
-      setFormError(reasonText(r.reason))
+      showFormError(failText('save', r.reason, baseName(selectedFile)))
       return
     }
     setFormError(null)
@@ -983,6 +1029,18 @@ export function FileTreePanel({ workspace, className, onCollapse, onRunFile, onE
             </button>
           </div>
           <div className="min-h-0 flex-1">
+            {formError && (
+              <div className="flex items-center gap-1 border-b border-danger/40 bg-danger/10 px-3 py-1 text-[11px] text-danger">
+                <span className="flex-1">{formError}</span>
+                <button
+                  onClick={() => setFormError(null)}
+                  title="关闭"
+                  className="rounded p-0.5 text-danger/70 transition hover:text-danger"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            )}
             {content.state === 'loading' && (
               <div className="px-3 py-2 text-xs text-ink-4">读取中…</div>
             )}

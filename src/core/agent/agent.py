@@ -101,13 +101,13 @@ class XiheAgent:
         self.config = config or load_config()
         # Injectable for tests (FakeChatClient); defaults to a real OpenAI client.
         self.llm_client = llm_client or OpenAI(
-            api_key=self.config["api_key"],
-            base_url=self.config["base_url"],
+            api_key=self.config.get("api_key"),
+            base_url=self.config.get("base_url"),
             timeout=httpx.Timeout(120.0, connect=10.0),
         )
-        self.model = self.config["model"]
-        self.max_iterations = self.config["max_iterations"]
-        self.max_completion_tokens = int(self.config.get("max_completion_tokens") or 8192)
+        self.model = self.config.get("model")
+        self.max_iterations = int(self.config.get("max_iterations", 30))
+        self.max_completion_tokens = self.config.get("max_completion_tokens")
         # Extra request fields (reasoning_effort, thinking, ...) forwarded as
         # extra_body so unsupported gateway params can be A/B-tested from
         # config without code changes; absent = nothing forwarded.
@@ -149,8 +149,8 @@ class XiheAgent:
 
         # Auxiliary client for tool-internal LLM calls (vision, compression, etc.)
         self.aux = shared_aux or AuxiliaryClient(
-            base_url=self.config["base_url"],
-            api_key=self.config["api_key"],
+            base_url=self.config.get("base_url"),
+            api_key=self.config.get("api_key"),
             model=self.model,
             config=self.config,
         )
@@ -216,7 +216,7 @@ class XiheAgent:
             context_length = self._get_context_length(self.model)
             self.compressor = ContextCompressor(
                 context_length=context_length,
-                threshold_percent=self.config["compression_threshold"],
+                threshold_percent=self.config.get("compression_threshold", 0.75),
                 aux=self.aux,
                 db=self.db,
             )
@@ -305,7 +305,7 @@ class XiheAgent:
         # model names into config. Discovery failure (endpoint without /models)
         # is cached-empty inside model_catalog, so this stays cheap.
         for mid in model_catalog.discover_models(
-                self.config["base_url"], self.config["api_key"]):
+                self.config.get("base_url"), self.config.get("api_key")):
             if mid not in entries:
                 entries[mid] = {
                     "name": mid,
@@ -344,7 +344,7 @@ class XiheAgent:
             new_len = self._get_context_length(model_name)
             self.compressor = ContextCompressor(
                 context_length=new_len,
-                threshold_percent=self.config["compression_threshold"],
+                threshold_percent=self.config.get("compression_threshold", 0.75),
                 aux=self.aux,
                 db=self.db,
             )
@@ -1394,8 +1394,9 @@ class XiheAgent:
 
     @staticmethod
     def _attachment_hint(atts: list) -> str:
-        """附件提示块 —— 模型面向的注入文本（路径/大小/图片描述）。用哪个读
-        取/图片工具是 agent 自己的路由决策，只陈述事实，不点名工具。"""
+        """附件提示块 —— 模型面向的注入文本（路径/大小）。用哪个读取/图片
+        识别工具是 agent 自己的路由决策，只陈述事实，不点名工具、不预生成
+        视觉描述（图片与文本一视同仁按需读取）。"""
         from pathlib import Path as _P
         parts = []
         for a in atts:
@@ -1404,15 +1405,11 @@ class XiheAgent:
             p = str(a.get("path"))
             name = str(a.get("name") or _P(p).name)
             size = a.get("size")
-            desc = a.get("desc")
-            if _P(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp") \
-                    and desc:
-                parts.append(f"[用户发送了图片 {name}: {desc}]")
-            else:
-                mb = f"，{size / (1 << 20):.1f}MB" if size else ""
-                parts.append(
-                    f"[用户发送了文件 {name}{mb}，服务器路径: {p}。"
-                    f"需要内容时用你可用的工具读取]")
+            mb = f"，{size / (1 << 20):.1f}MB" if size else ""
+            verb = "@引用了" if a.get("mention") else "发送了"
+            parts.append(
+                f"[用户{verb}文件 {name}{mb}，路径: {p}。"
+                f"需要内容时（含图片识别）用你可用的工具读取]")
         return "\n".join(parts)
 
     def _prepare_api_messages(self, messages: list[dict]) -> list[dict]:

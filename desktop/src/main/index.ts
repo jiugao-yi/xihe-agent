@@ -5,7 +5,7 @@ import { existsSync, promises as fs } from 'fs'
 import { ServeSupervisor, serveLogPath, type XiheStatus, type XiheStatusState } from './serve'
 import { BrowserPanelController } from './browserPanel'
 import { readXiheConfig, writeXiheConfig, type XiheConfigPatch } from './xiheConfig'
-import { gitStatus, gitHeadFile } from './git'
+import { gitStatus, gitHeadFile, gitLsFiles } from './git'
 import {
   createTerminal,
   attachTerminal,
@@ -402,6 +402,13 @@ function registerIpc(): void {
   ipcMain.handle('git:headFile', async (_e, path: unknown) => {
     if (typeof path !== 'string' || !isAbsolute(path)) return { ok: false, reason: 'error' }
     return gitHeadFile(path)
+  })
+
+  // Tracked-file list for the @-mention picker (fallback to renderer's
+  // recursive listDir when the workspace isn't a git repo).
+  ipcMain.handle('git:lsFiles', async (_e, workdir: unknown) => {
+    if (typeof workdir !== 'string') return { ok: false, reason: 'error' }
+    return gitLsFiles(workdir)
   })
 
   // --- Shell panel (multi-instance local terminals) --------------------------

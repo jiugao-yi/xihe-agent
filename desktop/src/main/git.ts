@@ -129,3 +129,28 @@ export async function gitHeadFile(absPath: string): Promise<GitHeadFile> {
     return { ok: false, reason: 'error' }
   }
 }
+
+export type GitLsFiles =
+  | { ok: true; files: string[] }   // repo-relative, forward slashes
+  | { ok: false; reason: 'not-repo' | 'no-git' | 'error' }
+
+/** `git ls-files` for the @-mention file index: tracked files only (build
+ *  artifacts and vendored noise stay out), repo-relative forward-slash paths.
+ *  Capped like gitStatus so a huge repo can't blow IPC. */
+export async function gitLsFiles(workdir: string): Promise<GitLsFiles> {
+  const repoRoot = findRepoRoot(workdir)
+  if (!repoRoot) return { ok: false, reason: 'not-repo' }
+  try {
+    const res = await execFileAsync(
+      'git',
+      ['-C', repoRoot, '--no-optional-locks', 'ls-files'],
+      { windowsHide: true, timeout: 10_000, maxBuffer: 8 * 1024 * 1024, encoding: 'utf8' }
+    )
+    const files = res.stdout.split('\n').filter(Boolean).slice(0, MAX_ENTRIES)
+    return { ok: true, files }
+  } catch (err) {
+    const e = err as { code?: unknown }
+    if (e.code === 'ENOENT') return { ok: false, reason: 'no-git' }
+    return { ok: false, reason: 'error' }
+  }
+}

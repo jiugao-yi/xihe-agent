@@ -212,7 +212,7 @@ def run_gateway(args):
 
     config = load_config(getattr(args, "config", None))
     seeded = seed_default_config(getattr(args, "config", None))
-    if not config["api_key"]:
+    if not config.get("api_key"):
         print(api_key_missing_message(getattr(args, "config", None), seeded=seeded),
               file=sys.stderr)
         return 1
@@ -906,7 +906,7 @@ def run_gateway(args):
     from core.context import bootstrap_process
     bootstrap_process(shared_ctx, adapter=platform_adapter)
 
-    logger.info("Gateway initialized: model=%s base_url=%s", config["model"], config["base_url"])
+    logger.info("Gateway initialized: model=%s base_url=%s", config.get("model"), config.get("base_url"))
 
     async def _run():
         # Store main event loop for tools that need to schedule async work

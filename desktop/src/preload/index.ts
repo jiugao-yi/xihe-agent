@@ -41,6 +41,9 @@ const desktop = {
   gitStatus: (workdir: string) => ipcRenderer.invoke('git:status', workdir),
   // HEAD text of one file — the base for editor gutter change marks.
   gitHeadFile: (path: string) => ipcRenderer.invoke('git:headFile', path),
+  // Tracked files (repo-relative) for the @-mention picker; not-repo callers
+  // fall back to the renderer's recursive listDir walk.
+  gitLsFiles: (workdir: string) => ipcRenderer.invoke('git:lsFiles', workdir),
   // Shell panel — multi-instance local terminals in main (ConPTY). Attach
   // returns the session's replay snapshot; live chunks/exit arrive via
   // onTermEvent. Sessions survive panel close.

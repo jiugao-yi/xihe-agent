@@ -26,6 +26,7 @@ import { copyText } from '../lib/clipboard'
 import { localImgUrl } from '../lib/localImage'
 import { TurnTrace } from './TurnTrace'
 import { Markdown } from './Markdown'
+import { FileMention } from './FileMention'
 import logoUrl from '../assets/logo.png'
 
 /** 空态品牌图（assets/logo.png 由 docs/_make_icons.py 从 docs/banner.jpg 生成）。 */
@@ -866,6 +867,21 @@ export function ChatPanel() {
   // 发送时随 send 帧的 attachments 字段回传；chip 可单个移除。
   const [pendingFiles, setPendingFiles] = useState<{ name: string; path: string; size: number }[]>([])
   const [uploading, setUploading] = useState(false)
+  // @-mention picker state (workspace-bound conversations). `ws` holds the
+  // workspace whose index backs the open picker — null when closed/unbound.
+  const [mention, setMention] = useState<{
+    open: boolean
+    items: { name: string; relPath: string }[]
+    index: number
+  }>({ open: false, items: [], index: 0 })
+  const mentionWs = useStore((s) => {
+    const cid = s.activeConvId
+    const wid = cid ? s.convWorkspace[cid] : undefined
+    return wid ? s.workspaces.find((w) => w.id === wid) : undefined
+  })
+  // Flat file index per workspace (relPath list), cached for the picker;
+  // rebuilt on open when fsVersion moved since the last build.
+  const mentionIndexRef = useRef<{ wsDir: string; fsVersion: number; files: string[] } | null>(null)
   // Plan mode: sends run read-only planning + an approval card; approval
   // auto-starts the execution turn (serve-side). Sticky — stays armed until
   // toggled off, for consecutive planning tasks.
@@ -1121,6 +1137,108 @@ export function ChatPanel() {
     )
   }
 
+  /** Build (or reuse) the workspace's flat file index: git ls-files first
+   *  (tracked files only — build noise stays out), recursive listDir walk as
+   *  the not-a-repo fallback. Cached until fsVersion moves. */
+  async function mentionIndex(): Promise<string[]> {
+    const ws = mentionWs
+    if (!ws) return []
+    const fv = useStore.getState().fsVersion
+    const cached = mentionIndexRef.current
+    if (cached && cached.wsDir === ws.workdir && cached.fsVersion === fv) {
+      return cached.files
+    }
+    let files: string[] = []
+    const git = await desktop.gitLsFiles(ws.workdir)
+    if (git.ok) {
+      files = git.files
+    } else {
+      // Fallback walk (SKIP_DIRS equivalents live main-side in listDir).
+      const walk = async (dir: string, depth: number): Promise<void> => {
+        if (depth > 6 || files.length >= 2000) return
+        const entries = await desktop.listDir(dir)
+        for (const e of entries) {
+          if (files.length >= 2000) return
+          if (e.dir) await walk(e.path, depth + 1)
+          else files.push(e.path.slice(ws.workdir.length + 1).replace(/\\/g, '/'))
+        }
+      }
+      await walk(ws.workdir, 0)
+    }
+    mentionIndexRef.current = { wsDir: ws.workdir, fsVersion: fv, files }
+    return files
+  }
+
+  /** Detect an open @-query at the caret: text from the LAST unclosed '@' to
+   *  the caret, where "unclosed" means no whitespace since it. Re-filters the
+   *  picker on every input change. */
+  function updateMention(text: string, caret?: number) {
+    const ws = mentionWs
+    if (!ws) {
+      if (mention.open) setMention((m) => ({ ...m, open: false }))
+      return
+    }
+    const pos = caret ?? text.length
+    const before = text.slice(0, pos)
+    const at = before.lastIndexOf('@')
+    if (at < 0) {
+      if (mention.open) setMention((m) => ({ ...m, open: false }))
+      return
+    }
+    const query = before.slice(at + 1)
+    if (/[\s]/.test(query)) {
+      if (mention.open) setMention((m) => ({ ...m, open: false }))
+      return
+    }
+    void mentionIndex().then((files) => {
+      // Stale-result guard: the query may have moved on while the index was
+      // building (fast typing) — only apply if still the live query.
+      const live = inputRef.current
+      const liveBefore = (live ? live.value : text).slice(0, live?.selectionStart ?? pos)
+      const liveAt = liveBefore.lastIndexOf('@')
+      if (liveAt !== at || liveBefore.slice(at + 1) !== query) return
+      const q = query.toLowerCase()
+      const scored = files
+        .filter((f) => f.toLowerCase().includes(q))
+        .map((f) => {
+          const name = f.split('/').pop() ?? f
+          const nl = name.toLowerCase()
+          let score = 0
+          if (nl.startsWith(q)) score -= 3
+          else if (nl.includes(q)) score -= 2
+          return { f, name, score }
+        })
+        .sort((a, b) => a.score - b.score || a.f.localeCompare(b.f))
+        .slice(0, 12)
+        .map((s) => ({ name: s.name, relPath: s.f }))
+      setMention({ open: true, items: scored, index: 0 })
+    })
+  }
+
+  /** Replace the open @query with the picked file's `@relPath` reference —
+   *  a path REFERENCE (serve resolves it against the conversation's
+   *  workspace and tells the model; the model reads/vision/OCR on demand),
+   *  not an uploaded attachment. */
+  function insertMention(item: { name: string; relPath: string }) {
+    const ta = inputRef.current
+    const pos = ta?.selectionStart ?? input.length
+    const before = input.slice(0, pos)
+    const at = before.lastIndexOf('@')
+    if (at < 0) return
+    const next =
+      input.slice(0, at) + '@' + item.relPath + ' ' + input.slice(pos)
+    setInput(next)
+    setMention((m) => ({ ...m, open: false }))
+    const caret = at + item.relPath.length + 2
+    requestAnimationFrame(() => {
+      if (inputRef.current) {
+        inputRef.current.selectionStart = caret
+        inputRef.current.selectionEnd = caret
+        inputRef.current.focus()
+      }
+    })
+  }
+
   const submit = () => {
     const text = input.trim()
     if (!text && !pendingFiles.length) return
@@ -1327,10 +1445,24 @@ export function ChatPanel() {
           >
             <Map className="h-4 w-4" />
           </button>
+          <div className="relative min-w-0 flex-1">
+          {/* @-mention picker (workspace-bound conversations only). The index
+              caches per workspace; fsVersion bumps invalidate. */}
+          {mention.open && mentionWs && (
+            <FileMention
+              items={mention.items}
+              index={mention.index}
+              onHover={(i) => setMention((m) => ({ ...m, index: i }))}
+              onSelect={(it) => insertMention(it)}
+            />
+          )}
           <textarea
             ref={inputRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value)
+              updateMention(e.target.value, e.target.selectionStart ?? undefined)
+            }}
             onPaste={(e) => {
               const cd = e.clipboardData
               // 剪贴板带文件（截图 Ctrl+V、复制的文件）→ 直接上传成附件
@@ -1384,6 +1516,29 @@ export function ChatPanel() {
               })
             }}
             onKeyDown={(e) => {
+              // Mention picker drives the keys while open: ↑↓ move, Enter/Tab
+              // select (NOT send), Esc closes. Falls through when closed.
+              if (mention.open && mention.items.length > 0) {
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                  e.preventDefault()
+                  const d = e.key === 'ArrowDown' ? 1 : -1
+                  setMention((m) => ({
+                    ...m,
+                    index: (m.index + d + m.items.length) % m.items.length,
+                  }))
+                  return
+                }
+                if (e.key === 'Enter' || e.key === 'Tab') {
+                  e.preventDefault()
+                  insertMention(mention.items[mention.index])
+                  return
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault()
+                  setMention((m) => ({ ...m, open: false }))
+                  return
+                }
+              }
               // Only a bare Enter sends; Shift+Enter and Ctrl+Enter both
               // newline (textarea default inserts the line for either —
               // Ctrl alone types nothing extra, the Enter carries it).
@@ -1398,8 +1553,9 @@ export function ChatPanel() {
                 ? '追加指示（steer 改向，不打断）…'
                 : '输入消息，Enter 发送，Shift/Ctrl+Enter 换行…'
             }
-            className="max-h-32 flex-1 resize-none bg-transparent text-sm outline-none placeholder:text-ink-4"
+            className="max-h-32 min-w-0 flex-1 resize-none bg-transparent text-sm outline-none placeholder:text-ink-4"
           />
+          </div>
           {running ? (
             <div className="flex items-end gap-2">
               {input.trim() && (

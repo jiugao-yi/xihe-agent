@@ -5,6 +5,7 @@ workspace-resolved like write_file's)."""
 
 import importlib.util
 import logging
+import time
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -21,7 +22,9 @@ _COL_MIN, _COL_MAX = 8, 48
 
 def _check() -> bool:
     return (importlib.util.find_spec("openpyxl") is not None
-            or importlib.util.find_spec("docx") is not None)
+            or importlib.util.find_spec("docx") is not None
+            or importlib.util.find_spec("pypdf") is not None
+            or importlib.util.find_spec("fitz") is not None)
 
 
 def _resolve(path: str, kw: dict) -> Path:
@@ -330,6 +333,111 @@ def _truncate_text(text: str, max_chars: int) -> tuple[str, bool]:
     return text[:max_chars], True
 
 
+def _pdf_read(args: dict, kw: dict) -> str:
+    """office_read kind="pdf": 提取 PDF 文本（逐页，markdown 化分段）。
+
+    只读——与 office_read 同档进 base，plan 模式可用。纯文字 PDF 提取
+    文本；扫描件/图片页无文本层，返回空 + has_images（agent 用
+    pdf_to_images 渲染成图后自行决定识别方式）。"""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return tool_error("pypdf is not installed — pdf unavailable in this environment")
+
+    path = str(args.get("path") or "").strip()
+    if not path:
+        return tool_error("path is required")
+    p = _resolve(path, kw)
+    if not p.exists():
+        return tool_error(f"File not found: {p}")
+    try:
+        max_chars = int(args.get("max_chars") or 40000)
+    except (TypeError, ValueError):
+        max_chars = 40000
+    max_chars = max(500, min(max_chars, 200000))
+
+    try:
+        reader = PdfReader(str(p))
+        total_pages = len(reader.pages)
+        parts = []
+        total = 0
+        truncated = False
+        for i in range(min(total_pages, 200)):
+            text = (reader.pages[i].extract_text() or "").strip()
+            if not text:
+                continue
+            if total + len(text) > max_chars:
+                truncated = True
+                break
+            parts.append(f"## 第 {i + 1} 页\n{text}")
+            total += len(text)
+        if not parts:
+            # 无文本层（扫描件/纯图页）——不点名工具，只陈述"页面需渲染为
+            # 图片"，识别方式交给 agent 自行决定。
+            return tool_result(success=True, action="pdf_read", path=str(p),
+                               text="", truncated=False,
+                               has_images=True, pages=total_pages,
+                               note="PDF 无文本层（扫描件或图片型页面）。"
+                                    "可先把页面渲染为图片（pdf_to_images），"
+                                    "再对图片自行决定识别方式")
+    except Exception as e:
+        return tool_error(f"cannot read pdf '{p}': {e}")
+    return tool_result(success=True, action="pdf_read", path=str(p),
+                       text="\n\n".join(parts), truncated=truncated,
+                       pages=total_pages)
+
+
+def _pdf_to_images(args: dict, kw: dict) -> str:
+    """pdf_to_images: PDF 页渲染成 PNG（只读，进 base）。把"无文本层的
+    页面"变成图片文件清单——后续用哪个图片工具由 agent 判断，本工具只
+    陈述"第 N 页渲染到了哪个路径"。"""
+    try:
+        import fitz  # pymupdf
+    except ImportError:
+        return tool_error("pymupdf is not installed — pdf rendering unavailable")
+
+    path = str(args.get("path") or "").strip()
+    if not path:
+        return tool_error("path is required")
+    p = _resolve(path, kw)
+    if not p.exists():
+        return tool_error(f"File not found: {p}")
+
+    try:
+        first = max(1, int(args.get("first_page") or 1))
+        last = max(first, int(args.get("last_page") or first + 19))
+    except (TypeError, ValueError):
+        first, last = 1, 20
+    last = first + max(0, last - first)  # 段上限最多 20 页/次，防爆
+    last = min(last, first + 19)
+    try:
+        dpi = max(72, min(int(args.get("dpi") or 150), 400))
+    except (TypeError, ValueError):
+        dpi = 150
+
+    from core.config import AGENT_HOME
+    out_dir = Path(AGENT_HOME) / "charts" / f"pdf_{p.stem}_{int(time.time())}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        doc = fitz.open(str(p))
+        total = doc.page_count
+        last = min(last, total)
+        images: list[dict] = []
+        for i in range(first - 1, last):
+            page = doc[i]
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            out = out_dir / f"page_{i + 1:03d}.png"
+            pix.save(str(out))
+            images.append({"page": i + 1, "path": str(out)})
+        doc.close()
+    except Exception as e:
+        return tool_error(f"cannot render pdf '{p}': {e}")
+    return tool_result(success=True, action="pdf_to_images", path=str(p),
+                       pages=total, images=images)
+
+
 def _word_read(args: dict, kw: dict) -> str:
     try:
         from docx import Document
@@ -389,18 +497,108 @@ def _word_read(args: dict, kw: dict) -> str:
                        text=text[:max_chars], truncated=truncated)
 
 
+def _office_read(args: dict, **kw) -> str:
+    """office_read 入口：excel_read / word_read / pdf_read 只读动作。与
+    _office 拆开注册——读能力进 base（plan 模式可用），写动作留在 office
+    工具集。"""
+    kind = str(args.get("kind") or "word").lower()
+    if kind == "excel":
+        return _excel_read(args, kw)
+    if kind == "word":
+        return _word_read(args, kw)
+    if kind == "pdf":
+        return _pdf_read(args, kw)
+    return tool_error("kind must be 'word', 'excel' or 'pdf'")
+
+
 def _office(args: dict, **kw) -> str:
     action = str(args.get("action") or "").lower()
     if action not in _ACTIONS:
         return tool_error(f"action must be one of: {', '.join(_ACTIONS)}")
     if action == "excel_write":
         return _excel_write(args, kw)
-    if action == "excel_read":
-        return _excel_read(args, kw)
     if action == "word_write":
         return _word_write(args, kw)
+    if action == "excel_read":
+        return _excel_read(args, kw)
     return _word_read(args, kw)
 
+
+_OFFICE_READ_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "office_read",
+        "description": (
+            "Read office documents offline (xlsx via openpyxl, docx via "
+            "python-docx, legacy .doc via olefile, pdf via pypdf) — excel "
+            "rows back as JSON, word/pdf as markdown-ish text. READ-ONLY "
+            "(no file mutation), so it is available in plan mode and on the "
+            "base floor. For writing office artifacts use the 'office' tool."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["word", "excel", "pdf"],
+                         "description": "word = .docx/.doc → text; excel = .xlsx → rows; "
+                                        "pdf = text extraction (scan-only PDFs have no "
+                                        "text layer — use image_ocr on pages instead)"},
+                "path": {"type": "string",
+                         "description": "File path (.xlsx/.docx/.doc/.pdf); relative = workspace"},
+                "sheet": {"type": "string",
+                          "description": "excel: sheet name or index (default active)"},
+                "max_rows": {"type": "integer",
+                             "description": "excel: row cap (default 200)"},
+                "max_chars": {"type": "integer",
+                              "description": "word/pdf: text cap (default word 20000 / pdf 40000)"},
+                "max_pages": {"type": "integer",
+                              "description": "pdf: page cap (default 100)"},
+            },
+            "required": ["kind", "path"],
+        },
+    },
+}
+
+registry.register(
+    name="office_read",
+    schema=_OFFICE_READ_SCHEMA,
+    handler=lambda args, **kw: _office_read(args, **kw),
+    check_fn=_check,
+    toolset="office",
+)
+
+_PDF_IMAGES_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "pdf_to_images",
+        "description": (
+            "Render PDF pages to PNG images (read-only). For scan-type PDFs "
+            "that have no text layer (office_read returns has_images), "
+            "rendering each page to an image lets the model then decide how "
+            "to read it (OCR / vision) — this tool only states which page "
+            "rendered to which path, never how to consume them. Images land "
+            "under AGENT_HOME/charts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "PDF file path"},
+                "first_page": {"type": "integer", "description": "First page (1-based, default 1)"},
+                "last_page": {"type": "integer",
+                              "description": "Last page inclusive (default first+19, ≤20 pages/call)"},
+                "dpi": {"type": "integer", "description": "Render resolution (default 150, 72-400)"},
+            },
+            "required": ["path"],
+        },
+    },
+}
+
+registry.register(
+    name="pdf_to_images",
+    schema=_PDF_IMAGES_SCHEMA,
+    handler=lambda args, **kw: _pdf_to_images(args, **kw),
+    check_fn=_check,
+    toolset="office",
+)
 
 registry.register(
     name="office",
@@ -409,40 +607,34 @@ registry.register(
         "function": {
             "name": "office",
             "description": (
-                "Create and read office documents offline (xlsx via openpyxl, "
-                "docx via python-docx, legacy .doc via olefile) — the "
-                "deterministic way to deliver "
-                "real file artifacts (reports, data exports, memos). Gateway "
+                "Create office documents offline (xlsx via openpyxl, docx "
+                "via python-docx) — the deterministic way to deliver real "
+                "file artifacts (reports, data exports, memos). Gateway "
                 "chats deliver the file with send_file(file_path=...); on "
                 "desktop a relative path lands in the conversation's "
-                "workspace. Four actions: excel_write (sheets of rows, "
-                "optional header styling + column autofit), excel_read "
-                "(rows back as JSON), word_write (heading/paragraph/bullet/"
-                "table blocks), word_read (markdown-ish text back)."
+                "workspace. Actions: excel_write (sheets of rows, optional "
+                "header styling + column autofit) and word_write "
+                "(heading/paragraph/bullet/table blocks). To READ office "
+                "files use the 'office_read' tool (available even in plan "
+                "mode); this tool only creates/mutates."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": list(_ACTIONS)},
+                    "action": {"type": "string", "enum": ["excel_write", "word_write"]},
                     "path": {"type": "string",
-                             "description": "File path (.xlsx/.docx/.doc); relative = workspace"},
+                             "description": "File path (.xlsx/.docx); relative = workspace"},
                     "sheets": {
                         "type": "array",
                         "description": "excel_write: [{name, rows: [[...]], header?: bool}]",
                         "items": {"type": "object"},
                     },
-                    "sheet": {"type": "string",
-                              "description": "excel_read: sheet name or index (default active)"},
-                    "max_rows": {"type": "integer",
-                                 "description": "excel_read row cap (default 200)"},
                     "blocks": {
                         "type": "array",
                         "description": "word_write: [{type: heading|paragraph|bullet|table, "
                                        "text, level, items, rows, header}]",
                         "items": {"type": "object"},
                     },
-                    "max_chars": {"type": "integer",
-                                  "description": "word_read text cap (default 20000)"},
                 },
                 "required": ["action"],
             },

@@ -202,6 +202,12 @@ export interface DesktopAPI {
   gitStatus: (workdir: string) => Promise<GitStatus>
   /** HEAD text of one file (editor change-mark base). */
   gitHeadFile: (path: string) => Promise<GitHeadFile>
+  /** Tracked files (repo-relative, forward slashes) for the @-mention
+   *  picker; ok:false reason='not-repo' → renderer falls back to a
+   *  recursive listDir walk. */
+  gitLsFiles: (workdir: string) => Promise<
+    { ok: true; files: string[] } | { ok: false; reason: 'not-repo' | 'no-git' | 'error' }
+  >
   /** Create a shell session (cwd only seeds it; interactive ConPTY).
    *  Output/exit arrive via onTermEvent; attach replays the tail. */
   termCreate: (

@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import queue
+import re
 import uuid
 from pathlib import Path
 
@@ -30,6 +31,34 @@ def _ws_approval_key(cwd) -> str:
     不敏感）保证同一工作空间永远落同一个桶。"""
     norm = str(cwd).replace("\\", "/").rstrip("/")
     return f"ws:{norm.lower()}"
+
+
+# @引用的模式：@后跟无空白路径片段（来自桌面 @ 选择器；用户手打也兼容）。
+_MENTION_RE = re.compile(r"(?<![\w@])@([\w./\\\-]+)")
+
+
+def _mention_metadata(text: str, cwd: str) -> list:
+    """把消息里的 `@rel/path` 引用翻译成附件形元数据（mention: true，
+    不做视觉描述）。落库走 attachments 通道：content 保持用户原文，
+    提示块由 agent 的 _attachment_hint 在 API 边界注入——重发/重新生成
+    重新展开，不会像"前置进 text"那样块套块（0054 的教训）。"""
+    out: list = []
+    seen: set = set()
+
+    def _sub(m: "re.Match[str]") -> str:
+        rel = m.group(1).replace("\\", "/")
+        if rel in seen:
+            return m.group(0)
+        seen.add(rel)
+        out.append({
+            "name": rel.rsplit("/", 1)[-1],
+            "path": str(Path(cwd) / rel),
+            "mention": True,
+        })
+        return m.group(0)
+
+    _MENTION_RE.sub(_sub, text)
+    return out
 
 
 def _reshape_history(rows: list, marks: dict = None) -> list:
@@ -241,22 +270,18 @@ class ChatMixin:
         return web.json_response(
             {"path": str(dest), "name": name, "size": len(data)})
 
-    def _describe_attachments(self, attachments: list) -> list | None:
-        """附件元数据就绪：图片补视觉描述（秒级 LLM 调用——调用方必须放到
-        executor 线程跑，不能卡事件循环）。返回持久化用的 attachments 数组；
-        无附件返回 None。消息文本不在此拼接：content 保持用户原文，模型
-        面向的提示块由 agent 在 API 边界注入（见 _attachment_hint）。"""
-        from core.agent.auxiliary_client import describe_image
+    def _normalize_attachments(self, attachments: list) -> list | None:
+        """附件元数据整理（不做视觉预描述——统一交 agent 自行判断是否调
+        用视觉/OCR：图片与文本一视同仁，hint 只陈述路径事实）。返回持久化
+        用的 attachments 数组；无附件返回 None。消息文本不在此拼接：content
+        保持用户原文，提示块由 agent 在 API 边界注入（_attachment_hint）。"""
         out = []
         for a in attachments:
             p = str(a.get("path"))
             item = {"name": str(a.get("name") or Path(p).name),
                     "path": p, "size": a.get("size")}
-            if Path(p).suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
-                try:
-                    item["desc"] = describe_image(self.ctx.aux, p)
-                except Exception as e:
-                    logger.warning("attachment describe failed for %s: %s", p, e)
+            if a.get("mention"):
+                item["mention"] = True
             out.append(item)
         return out or None
 
@@ -367,21 +392,20 @@ class ChatMixin:
     async def _handle_send(self, ws, cmd):
         conv_id = str(cmd.get("conv_id") or uuid.uuid4().hex)
         text = cmd.get("text") or ""
-        # 附件（桌面 /upload 先落盘，这里拿 path 列表注入消息文本）。图片
-        # 走视觉自动描述（与 gateway 同一 describe_image_sync），普通文件
-        # 只注入路径 + 大小，agent 用 read_file 等工具按需取。
+        # 附件（桌面 /upload 先落盘，这里整理 path/size 元数据）；@ 引用稍后
+        # 并入同一通道。content 恒为用户原文——面向模型的路径提示块由 agent
+        # 在 API 边界注入（_attachment_hint），图片与文本统一由 agent 按需
+        # 决定读取方式。
         attachments = [a for a in (cmd.get("attachments") or [])
                        if isinstance(a, dict) and a.get("path")]
         if not str(text).strip() and not attachments:
             await self._safe_send(ws, {"type": "error", "code": "empty_text",
                                        "conv_id": conv_id, "message": "empty text"})
             return
-        # 图片描述是秒级视觉 LLM 调用——放 executor 线程，不卡事件循环。
+        # 附件元数据（纯内存整理，无 LLM——视觉统一交 agent 按需判断）。
         att_meta = None
         if attachments:
-            loop = asyncio.get_running_loop()
-            att_meta = await loop.run_in_executor(
-                None, lambda: self._describe_attachments(attachments))
+            att_meta = self._normalize_attachments(attachments)
 
         source = self._source(conv_id)
         session_key = self.ctx.db.build_key(source)
@@ -414,6 +438,17 @@ class ChatMixin:
             if cwd and not Path(str(cwd)).is_dir():
                 logger.warning("serve: ignoring non-existent cwd %r", cwd)
                 cwd = None
+            # @-file references (desktop's @ picker): `@rel/path` tokens ride
+            # the ATTACHMENT pipeline as path-only metadata — the hint block
+            # is API-boundary-injected, so the persisted user row stays the
+            # literal input (re-sends/regenerates re-expand cleanly, no
+            # block-stacking; the 0054 lesson re-applied). The model decides
+            # how to consume each (read_file / vision / OCR).
+            if cwd:
+                mentions = _mention_metadata(str(text), str(cwd))
+                if mentions:
+                    attachments = (attachments or []) + mentions
+                    att_meta = self._normalize_attachments(attachments)
             # Plan mode (desktop toggle): read-only planning turn; a user
             # approval on the plan's clarify card auto-launches the execution
             # turn.
