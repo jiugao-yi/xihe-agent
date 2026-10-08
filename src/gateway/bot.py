@@ -185,13 +185,6 @@ def _split_response(text: str, max_len: int = 3500) -> list[str]:
     return chunks
 
 
-def _describe_image(image_path: str) -> str:
-    """入站图片自动描述——与 serve 桌面上传共用同一实现（core 层基础设施，
-    无 vision 时只陈述路径事实，用哪个图片工具由 agent 自行判断）。"""
-    from core.agent.auxiliary_client import describe_image
-    return describe_image(shared_ctx.aux, image_path)
-
-
 def _extract_media_from_response(text: str) -> tuple[list[str], str]:
     """Extract MEDIA: tags from agent response. Returns (media_paths, clean_text)."""
     media_paths = []
@@ -393,23 +386,9 @@ def run_gateway(args):
         if not text and not event.media_urls:
             return
 
-        image_descriptions = []
-        for i, url in enumerate(event.media_urls):
-            mtype = event.media_types[i] if i < len(event.media_types) else ""
-            if mtype.startswith("image/"):
-                try:
-                    desc = await asyncio.to_thread(_describe_image, url)
-                    image_descriptions.append(desc)
-                    logger.info("Auto-described image %s: %s", url[:50], desc[:80])
-                except Exception as e:
-                    logger.warning("Vision auto-describe failed for %s: %s", url, e)
-                    image_descriptions.append(f"(自动识别失败，图片路径: {url})")
-
-        if image_descriptions:
-            img_ctx = "\n".join(
-                f"[用户发送了图片: {d}]" for d in image_descriptions
-            )
-            text = f"{img_ctx}\n{text}" if text else img_ctx
+        # 图片不做预描述：adapter 已把路径事实注入 text（含"按需用图片工具
+        # 处理"提示），视觉/OCR 是 agent 自己的路由决策——与 serve 桌面
+        # 上传同一契约（路径进文本，模型按需调工具）。
 
         if not text:
             return

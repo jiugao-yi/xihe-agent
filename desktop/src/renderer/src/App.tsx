@@ -45,6 +45,9 @@ export default function App() {
   const hydrateXiheConfig = useStore((s) => s.hydrateXiheConfig)
   const activeTab = useStore((s) => s.activeTab)
   const setTab = useStore((s) => s.setTab)
+  const serveModel = useStore((s) => s.serveModel)
+  const xiheConfig = useStore((s) => s.xiheConfig)
+  const modelLabel = serveModel || xiheConfig.model
   const convWorkspace = useStore((s) => s.convWorkspace)
   const workspaces = useStore((s) => s.workspaces)
   // Panel-collapse states (session-local, like showBrowser): the panel folds
@@ -188,12 +191,17 @@ export default function App() {
   // the panel drives Chrome hide/show through its `active` prop.
   return (
     <>
-      <div className={cn('flex h-screen bg-app text-ink', activeTab !== 'chat' && 'hidden')}>
-      <Sidebar />
-      <main className="flex min-w-0 flex-1 flex-col">
-        <>
-          <header className="flex items-center gap-3 border-b border-line px-5 py-3">
-              <div className="ml-auto relative flex items-center gap-1">
+      <div className={cn('flex h-screen flex-col bg-app text-ink', activeTab !== 'chat' && 'hidden')}>
+          <header className="flex shrink-0 items-center gap-3 border-b border-line px-5 py-3">
+              {modelLabel && (
+                <div
+                  className="max-w-[16rem] truncate text-xs text-ink-3"
+                  title={modelLabel}
+                >
+                  {modelLabel}
+                </div>
+              )}
+              <div className="ml-auto flex items-center gap-1">
                 {activeWs ? (
                   <button
                     onClick={() => void setLayoutMode(inWorkbench ? 'chat' : 'workbench')}
@@ -350,6 +358,9 @@ export default function App() {
                 </button>
               </div>
             </header>
+            <div className="flex min-h-0 flex-1">
+      <Sidebar />
+      <main className="flex min-w-0 flex-1 flex-col">
             <div className="flex min-h-0 flex-1 flex-col">
               <div className="flex h-full min-h-0 flex-1">
                 {inWorkbench ? (
@@ -464,8 +475,8 @@ export default function App() {
                   conversation/workspace-independent terminals. */}
               {showShell && <ShellPanel className="shrink-0 border-t border-line" />}
             </div>
-        </>
       </main>
+      </div>
       </div>
       {activeTab === 'manage' && <SettingsPanel onBack={() => setTab('chat')} />}
       {activeTab === 'store' && <StorePage onBack={() => setTab('chat')} />}

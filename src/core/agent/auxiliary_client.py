@@ -218,13 +218,15 @@ class AuxiliaryClient:
 
         Priority: explicit arg > top-level config key > auxiliary section > default.
 
-        When a top-level config key (e.g. vision_model) is explicitly set to empty
-        string, the task is considered **disabled** — no fallback to default model.
+        When a top-level config key (e.g. vision_model) is unset or empty, the
+        task is **disabled** — no fallback to the main model. The main model is
+        often text-only (this deployment's default is); sending image_url
+        content to it just produces a 400 and a misleading retry.
         """
         top_key = self._TASK_CONFIG_KEYS.get(task)
         top_val = self._config.get(top_key) if top_key else None
 
-        if top_key and top_key in self._config and top_val == "":
+        if top_key and not top_val:
             effective_timeout = timeout or _DEFAULT_TIMEOUTS.get(task, 30)
             return "", effective_timeout
 

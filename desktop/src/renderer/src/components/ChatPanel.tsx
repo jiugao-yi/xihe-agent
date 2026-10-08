@@ -561,11 +561,11 @@ const UserRow = memo(function UserRow({ m, i, editing, editText, copied, disable
           <div className="flex max-w-full flex-col items-end gap-1">
             {!!m.attachments?.length && (
               <div className="flex max-w-full flex-wrap justify-end gap-1">
-                {m.attachments.map((a) => {
+                {m.attachments.map((a, idx) => {
                   const isImg = /\.(png|jpe?g|gif|webp|bmp)$/i.test(a.path)
                   return isImg ? (
                     <img
-                      key={a.path}
+                      key={`${a.path}:${idx}`}
                       src={localImgUrl(a.path)}
                       alt={a.name}
                       title={a.desc || a.path}
@@ -573,7 +573,7 @@ const UserRow = memo(function UserRow({ m, i, editing, editText, copied, disable
                     />
                   ) : (
                     <span
-                      key={a.path}
+                      key={`${a.path}:${idx}`}
                       className="inline-flex items-center gap-1 rounded-lg border border-line bg-panel px-2 py-1 text-xs text-ink-3"
                       title={a.path}
                     >
@@ -1379,11 +1379,11 @@ export function ChatPanel() {
         )}
         {!!pendingFiles.length && !running && (
           <div className="mb-2 flex flex-wrap gap-1.5">
-            {pendingFiles.map((f) => {
+            {pendingFiles.map((f, idx) => {
               const isImg = /\.(png|jpe?g|gif|webp|bmp)$/i.test(f.path)
               return (
                 <span
-                  key={f.path}
+                  key={`${f.path}:${idx}`}
                   className="group/att inline-flex items-center gap-1 rounded-lg border border-line bg-panel px-2 py-1 text-xs text-ink-3"
                   title={f.path}
                 >
@@ -1553,7 +1553,7 @@ export function ChatPanel() {
                 ? '追加指示（steer 改向，不打断）…'
                 : '输入消息，Enter 发送，Shift/Ctrl+Enter 换行…'
             }
-            className="max-h-32 min-w-0 flex-1 resize-none bg-transparent text-sm outline-none placeholder:text-ink-4"
+            className="max-h-32 w-full flex-1 resize-none bg-transparent text-sm outline-none placeholder:text-ink-4"
           />
           </div>
           {running ? (

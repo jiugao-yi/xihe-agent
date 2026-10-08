@@ -18,13 +18,11 @@ import { useStore, type ConvMeta } from '../appStore'
 import { cn } from '../lib/cn'
 import { desktop } from '../lib/desktop'
 import { Resizer, usePanelSize } from './Resizer'
-import logoUrl from '../assets/logo.png'
 
 // Aside width INCLUDING the 48px icon rail; the content column flexes the rest.
 const MIN_SIDEBAR_W = 208
 
-export function Sidebar() {
-  const conversations = useStore((s) => s.conversations)
+export function Sidebar() {  const conversations = useStore((s) => s.conversations)
   const activeConvId = useStore((s) => s.activeConvId)
   const serveConnected = useStore((s) => s.serveConnected)
   const serveVersion = useStore((s) => s.serveVersion)
@@ -44,12 +42,12 @@ export function Sidebar() {
   const exitWorkspace = useStore((s) => s.exitWorkspace)
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId)
   const convWorkspace = useStore((s) => s.convWorkspace)
-  // Which rail column is expanded. 'convs' is the default view (mirrors the
-  // pre-rail layout); 'ws' swaps in the workspace list. In a workspace view
-  // the header collapses to a back arrow + name, as before.
+  // Which content root the column shows. 'convs' is the default view; 'ws'
+  // swaps in the workspace list. In a workspace view the header collapses to
+  // a back arrow + name, as before.
   const [railTab, setRailTab] = useState<'convs' | 'ws'>('convs')
-  // Collapse the content column, leaving the icon rail alone. Rail nav clicks
-  // re-expand (the icons are the only visible navigation while collapsed).
+  // Collapsed = whole sidebar folds to a thin strip (like the file-tree
+  // EdgeStrip); the strip's icons re-expand into the matching root.
   const [collapsed, setCollapsed] = useState(false)
   const [sidebarW, setSidebarW] = usePanelSize('sidebarWidth', 256, MIN_SIDEBAR_W)
   const asideRef = useRef<HTMLElement>(null)
@@ -62,20 +60,57 @@ export function Sidebar() {
   const boundConvs = activeWorkspaceId
     ? conversations.filter((c) => convWorkspace[c.id] === activeWorkspaceId)
     : []
-  const modelLabel = serveModel || xiheConfig.model
+
+  // Fully-collapsed state — a thin strip visually identical to the file-tree /
+  // chat panels' EdgeStrip (the icon rail folds away too). The two nav roots
+  // stay reachable: clicking one expands AND switches to it.
+  if (collapsed) {
+    return (
+      <aside className="flex w-9 shrink-0 flex-col items-center gap-2 border-r border-line bg-panel/50 pt-3 text-ink-4 transition hover:bg-elevated hover:text-ink">
+        <button
+          onClick={() => setCollapsed(false)}
+          title="展开侧栏"
+          className="rounded p-1"
+        >
+          <PanelLeftOpen className="h-4 w-4" />
+        </button>
+        <button
+          onClick={() => {
+            setRailTab('convs')
+            setCollapsed(false)
+            if (activeWorkspaceId) exitWorkspace()
+          }}
+          title="对话"
+          className="rounded p-1"
+        >
+          <MessageSquare className="h-3.5 w-3.5" />
+        </button>
+        <button
+          onClick={() => {
+            setRailTab('ws')
+            setCollapsed(false)
+          }}
+          title="工作空间"
+          className="rounded p-1"
+        >
+          <Folder className="h-3.5 w-3.5" />
+        </button>
+      </aside>
+    )
+  }
 
   return (
     <aside
       ref={asideRef}
-      className="relative flex shrink-0 border-r border-line bg-panel/50"
-      style={collapsed ? undefined : { width: sidebarW }}
+      className="relative flex shrink-0 overflow-hidden border-r border-line bg-panel/50"
+      style={{ width: sidebarW }}
     >
+      <div className="flex min-h-0 min-w-0 flex-1">
       {/* Icon rail — the two navigation roots. 对话 is the default column. */}
       <div className="flex w-12 shrink-0 flex-col items-center gap-1 border-r border-line py-3">
         <button
           onClick={() => {
             setRailTab('convs')
-            setCollapsed(false)
             // Inside a workspace the railTab branch is masked by
             // activeWorkspaceId — navigating to 对话 must leave the view.
             if (activeWorkspaceId) exitWorkspace()
@@ -91,10 +126,7 @@ export function Sidebar() {
           <MessageSquare className="h-4 w-4" />
         </button>
         <button
-          onClick={() => {
-            setRailTab('ws')
-            setCollapsed(false)
-          }}
+          onClick={() => setRailTab('ws')}
           title="工作空间"
           className={cn(
             'flex h-9 w-9 items-center justify-center rounded-lg transition',
@@ -105,54 +137,44 @@ export function Sidebar() {
         >
           <Folder className="h-4 w-4" />
         </button>
-        <button
-          onClick={() => setCollapsed((v) => !v)}
-          title={collapsed ? '展开侧栏' : '折叠侧栏（只留图标栏）'}
-          className="mt-auto flex h-9 w-9 items-center justify-center rounded-lg text-ink-4 transition hover:bg-elevated hover:text-ink-2"
-        >
-          {collapsed ? (
-            <PanelLeftOpen className="h-4 w-4" />
-          ) : (
-            <PanelLeftClose className="h-4 w-4" />
-          )}
-        </button>
       </div>
 
-      {/* Content column — one of the two roots, or the in-workspace view. */}
-      <div className={cn('flex min-w-0 flex-1 flex-col', collapsed && 'hidden')}>
-      <div className="px-4 py-3">
-        <div className="flex items-center gap-2">
-          <img src={logoUrl} alt="xihe" draggable={false} className="h-6 w-6 rounded-md object-cover" />
-          <div className="text-xs font-semibold">xihe</div>
-          {modelLabel && (
-            <div className="truncate text-[10px] text-ink-4" title={modelLabel}>
-              {modelLabel}
-            </div>
-          )}
-        </div>
-      </div>
-
+      {/* Content column — one of the two roots, or the in-workspace view.
+          Header is a FileTree-style tool row: icon + title … [collapse]. */}
+      <div className="flex min-w-0 flex-1 flex-col">
       {activeWorkspaceId ? (
-        <>
-          <div className="flex items-center gap-1 px-2 pb-1 pt-2">
-            <button
-              onClick={exitWorkspace}
-              title="退出工作空间"
-              className="rounded p-0.5 text-ink-4 transition hover:bg-elevated hover:text-ink"
-            >
-              <ChevronLeft className="h-4 w-4" />
-            </button>
-            <span className="flex-1 truncate text-[10px] font-semibold tracking-wider text-ink-4">
-              {activeWsObj?.name ?? '工作空间'}
-            </span>
-          </div>
-        </>
+        <div className="flex items-center gap-2 border-b border-line px-3 py-2">
+          <Folder className="h-3.5 w-3.5 shrink-0 text-accent" />
+          <span className="flex-1 truncate text-xs font-medium" title={activeWsObj?.workdir}>
+            {activeWsObj?.name ?? '工作空间'}
+          </span>
+          <button
+            onClick={exitWorkspace}
+            title="退出工作空间"
+            className="rounded p-1 text-ink-4 transition hover:bg-elevated hover:text-ink"
+          >
+            <ChevronLeft className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onClick={() => setCollapsed(true)}
+            title="折叠侧栏"
+            className="rounded p-1 text-ink-4 transition hover:bg-elevated hover:text-ink-2"
+          >
+            <PanelLeftClose className="h-3.5 w-3.5" />
+          </button>
+        </div>
       ) : (
-        <div className="px-4 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-ink-4">
-          {railTab === 'ws' ? '工作空间' : '对话'}
+        <div className="flex items-center justify-end gap-2 border-b border-line px-3 py-2">
+          <button
+            onClick={() => setCollapsed(true)}
+            title="折叠侧栏"
+            className="rounded p-1 text-ink-4 transition hover:bg-elevated hover:text-ink-2"
+          >
+            <PanelLeftClose className="h-3.5 w-3.5" />
+          </button>
         </div>
       )}
-      <nav className="flex-1 space-y-0.5 overflow-y-auto px-2">
+      <nav className="min-w-0 flex-1 space-y-0.5 overflow-y-auto px-2">
         {activeWorkspaceId ? (
           // convWorkspace binding scopes this list to the workspace; new convs
           // started here are auto-bound to it.
@@ -292,6 +314,7 @@ export function Sidebar() {
             </>
           )}
         </div>
+      </div>
       </div>
       </div>
 
