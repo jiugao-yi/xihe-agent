@@ -915,6 +915,13 @@ export function ChatPanel() {
   // 思考/工具 trace): auto-follow new content only while already near the
   // bottom. Opening/switching a conversation re-arms the follow.
   const stickRef = useRef(true)
+  // The user has actively left the bottom (scrolled up to read) and the view
+  // must stay put until they scroll back. Separating this from `stickRef` is
+  // what makes follow-survive: during a stream the list keeps growing, so a
+  // fresh distance<80 reading on every onScroll is *not* "user came back" —
+  // it's the stream. Only an explicit user action (non-programmatic scroll to
+  // near-bottom, or downward intent to the bottom) clears it. See onScroll.
+  const userDetachedRef = useRef(false)
 
   // Bottom sentinel: jump/follow scroll THIS node into view instead of
   // scrollTo(scrollHeight) — scrollHeight at call time is stale when async
@@ -929,6 +936,7 @@ export function ChatPanel() {
 
   useEffect(() => {
     stickRef.current = true
+    userDetachedRef.current = false
     setEditingId(null)
     // Jump after the new conv's DOM commits (double-rAF: commit → layout →
     // paint), so the sentinel exists at its final position.
@@ -1003,7 +1011,10 @@ export function ChatPanel() {
       const k = e as React.KeyboardEvent
       up = k.key === 'PageUp' || k.key === 'ArrowUp' || k.key === 'Home'
     }
-    if (up) stickRef.current = false
+    if (up) {
+      stickRef.current = false
+      userDetachedRef.current = true
+    }
   }
   const lastTouchY = useRef<number | null>(null)
 
@@ -1037,8 +1048,26 @@ export function ChatPanel() {
     // drag that isn't parked at the very bottom disengages the follow.
     if (scrollbarDrag.current && distance >= 80) {
       stickRef.current = false
+      userDetachedRef.current = true
       return
     }
+    if (userDetachedRef.current) {
+      // The user left the bottom on purpose. Neither the stream's growth
+      // (which arrives here as a programmatic onScroll) nor a mid-list reading
+      // position may re-stick the view — otherwise every chunk the stream
+      // adds yanks the reader back to the latest line (the regression this
+      // flag exists for). Stick again ONLY when the user themselves scrolls
+      // back near the bottom: that onScroll is real (not programmatic) and
+      // lands at distance < 80.
+      if (programmaticScroll.current) {
+        programmaticScroll.current = false
+      } else if (distance < 80) {
+        userDetachedRef.current = false
+        stickRef.current = true
+      }
+      return
+    }
+    // Bottom-following (not detached): the original behavior.
     if (distance > el.clientHeight) {
       stickRef.current = true   // rollback collapse (bounded by intent path)
     } else if (distance < 80) {
