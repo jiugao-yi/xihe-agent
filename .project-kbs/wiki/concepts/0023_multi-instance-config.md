@@ -27,6 +27,8 @@ sources:
 
 ## 摘要
 
+> **现状缺口（2026-10-10）**: `--config` 多实例机制**仅服务端有效**——桌面控制面（Electron）**未接入**：拉起 serve 不带 `--config`、读写 config 硬编码默认 `~/.xihe-agent/config.yaml`、自身数据目录独立于 agent_home。方案探讨见候选 `meta/candidates/desktop-multi-instance-control.md`（未落地，待定）。
+
 `xihe --config path/to/x.yaml` 让**一个 YAML 文件完整描述一个"实例"**：`agent_home` 决定数据根（`sessions.db` / `agent.log` / `browser` / `cron` 各自隔离），其余键作为最高优先级配置覆盖。目的：同台机器**同时跑多个 xihe、配置与数据互不干扰**（一个接 WeCom、一个接 Feishu，或对接不同模型）。比 `--profile` 更透明（无魔法命名 / 约定目录）。2026-08-07 落地于 `src/core/config.py` + `src/app/main.py` + `src/cli/chat.py` + `src/gateway/bot.py`。
 
 ## 使用方法

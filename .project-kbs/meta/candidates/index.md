@@ -3,11 +3,12 @@
 > 待验证的方案草稿、临时笔记缓冲区。生命周期: `open` → `promoted | merged | dropped`。
 > 候选**不是**正式结论，仅作补充线索，不作为唯一依据。
 
-_3 个开放候选。_
+_4 个开放候选。_
 
 | Slug | 标题 | 状态 | 更新 | 下一步 |
 |------|------|------|------|--------|
 | desktop-dynamic-skin | 桌面端动态皮肤（背景/主题）功能 | open | 2026-09-15 | 决定是否立项；若做先定 manifest schema |
+| desktop-multi-instance-control | 桌面端接入多实例：config 路径选择 + 数据目录归位 | open | 2026-10-10 | 需支持时先做「设置加 config 路径 → spawn serve 带 --config」最小闭环，再评估数据目录归位 |
 | multi-instance-a2a | 多实例 + A2A 协同架构 | open | 2026-07-27 | 遇到单进程瓶颈时再评估 |
 | specialist-parallel-dispatch | 专家 agent 并发派发（parallel_safe 调度分组） | open | 2026-09-24 | 暂不实施；再遇多派发串行浪费时评估 |
 

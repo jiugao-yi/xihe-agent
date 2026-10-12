@@ -2,6 +2,10 @@
 
 > 最近新增、更新、修正或已过时的知识。按时间倒序。
 
+## 2026-10-10
+
+- **新增候选 desktop-multi-instance-control**（桌面端接入多实例，待定未落地）：起于日志梳理——桌面端 serve.log 重复抄 Python 日志、且桌面控制面完全没接上服务端 `--config` 多实例。已知缺口：serve 由桌面拉起（晚于桌面端启动）→ 不能靠接口取 agent_home，须桌面端自解析；默认 config 无 `agent_home` 字段。方案：桌面 `xiheConfig`(config 路径) → spawn serve 带 `--config` → 数据归 `<agent_home>/desktop/`。**serve.log 收窄部分已落地 serve.ts**。concept [[0023_multi-instance-config]] 补缺口注记。
+
 ## 2026-09-28
 
 - **补写既有页 ×2（09-24~28 大批次，随代码提交 cb0242f）** [[0057_context-compression-v32]] [[0058_desktop-scroll-follow-race]] — 按用户指定不加新页，两大块补进已有变更页：**①委派/trace 链**（追加进 0057）——delegate_task 收敛单一 tasks 形态（双轨让模型连发三次单调用串行 30+ 分钟，反模式进 description）、bridge 工具事件 by 标签+tool_call_id 修复（子代理工具流此前完全不可见）、specialist explore-N 编号（共享 _delegate_seq）、sync 指纹幂等（每消息全量重注册+缓存失效消除）、message_meta.children+created_at 与 serve get_trace 下钻（历史刷新显示子代理过程；指针不进模型可见结果 JSON——0054 分类标准延续；存量库 ALTER 幂等脚本）、流中断掐断在途请求（GLM 长思考窗口 115s→亚秒）、registry 截断参数自愈（completion 上限截断 20KB+ write_file 实测，自愈指引替代裸 JSONDecodeError）；**②桌面 trace 体验**（追加进 0058）——两级分组（时序切段+思考合并 / 并行穿插坍缩）、子代理仪表盘（状态行+单焦点展开，Manus/Claude Code/Cursor 调研校准：无人做多路直播）、委派点位置保真（仪表盘挂自己的委派工具行后，主代理叙事不断——用户实测纠正"全堆最后面"首版）、来源色条+child 弱化样式。暂挂未做：goal 展示到状态行、tool 参数语义化、@ 选文件。

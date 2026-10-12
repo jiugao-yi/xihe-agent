@@ -2,6 +2,10 @@
 
 > 按时间顺序记录的收录、回写、查询、整理操作。
 
+## 2026-10-10
+
+- **收录候选 desktop-multi-instance-control**（用户要求"记录到 wiki 后面再看是否需要支持"）：桌面端接入多实例——config 路径选择 + 数据目录归位。起点：日志梳理发现"桌面端 serve.log 重复抄 Python 日志" → 引申到桌面端完全不知多实例（spawn serve 不带 `--config`、写读 config 硬编码 `~/.xihe-agent/config.yaml`、`dataDir()` 独立于 agent_home）。已确认两条稳定事实：①serve 由桌面端拉起、晚于桌面端，桌面端**不能**靠 serve 接口取 agent_home，须自己解析；②默认 config.yaml 无 `agent_home` 字段（chicken-and-egg），仅实例文件才有。方案（未落地）：新增桌面 `xiheConfig`（config 路径，默认 `~/.xihe-agent/config.yaml`）→ spawn serve 带 `--config` → 数据目录改 `<agent_home>/desktop/`。**serve.log 日志收窄部分已同日落地在 `serve.ts`**（bootReady 控启动期 stderr + writeLine 前端自记 + 失败兜底；运行日志归 agent-serve.log）。关联：concept [[0023_multi-instance-config]] 加"桌面控制面未接入"缺口注记；候选并联 [[multi-instance-a2a]]（服务端协同，方向互补）。开放候选 3→4。
+
 ## 2026-09-28
 
 - **补写**: 09-24~28 大批次（已随代码提交 cb0242f）回写进**既有页面**（用户指定不加新页）——[[0057_context-compression-v32]] 追加「委派/trace 链后续批次」节（delegate_task 单 tasks 形态收敛/bridge by+tool_call_id 修复/specialist 编号/sync 指纹幂等/message_meta.children+created_at 下钻/流中断掐断 115s→亚秒/registry 截断参数自愈+write_file 长度提示，frontmatter affected_modules 与 updated 同步）；[[0058_desktop-scroll-follow-race]] 扩为桌面体验批（滚动条拖拽盲区补丁/trace 子代理展示体系：两级分组+仪表盘+位置保真+色条/Ctrl+F/Enter 语义/工作空间绑定入口/图片 MD 适配/文件覆盖层/Office 不做决策，title 与 affected_modules 同步）。同步 index.md 0057/0058 两行。未回写项（goal 展示、tool 参数语义化、@ 选文件）：暂挂待做，对话在案。
