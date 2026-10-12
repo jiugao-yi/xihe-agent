@@ -79,6 +79,11 @@ const MAX_RESTART_FAILURES = 6
 // serve.log rotation threshold — at open, an oversized log is renamed to
 // serve.log.old (dropping any previous .old) so the file can't grow forever.
 const SERVE_LOG_MAX_BYTES = 5 * 1024 * 1024
+// Boot-stderr ring buffer: cap both the chunk count and the rendered tail so
+// an exit-before-ready dump never grows unbounded (it is raw, unbounded stream
+// data; the steady-state log stays capped by SERVE_LOG_MAX_BYTES).
+const STDERR_TAIL_CHUNKS = 64
+const STDERR_TAIL_CHARS = 8 * 1024
 
 export interface ServeSupervisorOptions {
   host?: string
@@ -133,6 +138,13 @@ export class ServeSupervisor {
   private livenessFailures = 0
   private readinessDeadline = 0
   private logStream: WriteStream | null = null
+  // Boot-time stderr capture (see pipeLogs): the serve child's stderr is only
+  // mirrored while it has not yet reported ready, as a last-resort record of
+  // "python wouldn't start". Once ready, the child's own agent-serve.log owns
+  // all run-time logging — the desktop stops duplicating it. stderrTail keeps
+  // the most recent bytes so an exit-before-ready can dump the real cause.
+  private bootReady = false
+  private stderrTail: (() => string) | null = null
 
   constructor(opts: ServeSupervisorOptions = {}) {
     this.host = opts.host ?? '127.0.0.1'
@@ -253,6 +265,8 @@ export class ServeSupervisor {
       return
     }
     this.child = child
+    this.bootReady = false
+    this.stderrTail = null
     this.pipeLogs(child)
 
     // With shell:true a missing binary does NOT fire 'error' — cmd.exe runs,
@@ -271,11 +285,28 @@ export class ServeSupervisor {
       if (this.stopped) return // expected — we killed it on quit
       if (!this.owned) return // not ours to manage
       this.child = null
-      if (binMissing) {
-        // Retrying can't help until the user installs xihe — park in not_found
-        // (restart()/a fresh launch re-probes PATH).
-        this.emit('not_found', { message: this.notFoundMessage() })
-        return
+      // Died before readiness → boot stderr is the only copy of the cause
+      // (no agent-serve.log exists for a process that never came up). Dump its
+      // tail into serve.log so the crash stays diagnosable.
+      if (!this.bootReady) {
+        if (binMissing) {
+          // Retrying can't help until the user installs xihe — park in not_found
+          // (restart()/a fresh launch re-probes PATH).
+          this.emit('not_found', { message: this.notFoundMessage() })
+          return
+        }
+        try {
+          if (this.stderrTail) {
+            const tail = this.stderrTail()
+            if (tail) this.writeLine(`serve died before ready; boot stderr tail: ${tail}`)
+          }
+        } catch {
+          /* best-effort */
+        }
+      } else {
+        // A ready child that later died already logged its run in
+        // agent-serve.log — the desktop only records the exit itself.
+        this.writeLine(`serve exited: code=${code} signal=${signal ?? ''}`)
       }
       this.lastExitDetail = `exit code=${code} signal=${signal ?? ''}`
       this.emit('stopped', {
@@ -320,6 +351,13 @@ export class ServeSupervisor {
       this.backoffIdx = 0
       this.livenessFailures = 0
       this.restartFailures = 0
+      // First readiness: stop mirroring boot stderr — a healthy child owns its
+      // run-time log now. Record the boundary once (not on later liveness
+      // confirmations of the same process).
+      if (!this.bootReady) {
+        this.bootReady = true
+        this.writeLine(`serve ready on http://${this.host}:${this.port} (${h.version}) — runtime log: agent-serve.log`)
+      }
       this.emit('running', { version: h.version, message: undefined })
       this.scheduleLiveness()
       return
@@ -468,6 +506,12 @@ export class ServeSupervisor {
       pid: this.owned ? (this.child?.pid ?? null) : null,
       ...patch,
     }
+    // Desktop owns serve.log — record each of its own status transitions here
+    // (this is the front end logging the front end). Message only when present
+    // so repetitive re-confirmations of the same state stay one line.
+    if (patch.message) {
+      this.writeLine(`[${state}] ${patch.message}`)
+    }
     this.onStatus(this.snapshot())
   }
 
@@ -497,16 +541,40 @@ export class ServeSupervisor {
     }
   }
 
-  /** Append the child's stdout/stderr to ~/.xihe-desktop/serve.log so a
-   *  "xihe wouldn't start" report stays diagnosable. Best-effort.
-   *  The stream is opened once per app run and never rotated mid-run; the
-   *  size check at open keeps a rolling two-file window instead of an
-   *  unbounded append across months of launches. */
+  /** Capture only the serve child's boot-time stderr into serve.log.
+   *
+   *  No stdout mirroring: a running serve owns every line of its own running
+   *  log in agent-serve.log, so duplicating the console here would double it
+   *  (and at a different, date-less format). The one thing the desktop must
+   *  retain is the "python wouldn't start" case — a child that dies before
+   *  readiness has no agent-serve.log to read, and its cmd/import stderr is
+   *  the only diagnostic. So stderr is mirrored only while `bootReady` is
+   *  false; the tail is kept either way so an exit-before-ready can dump it.
+   *  Best-effort; the stream opens once per app run (see openLogStream). */
   private pipeLogs(child: ChildProcess): void {
     try {
       if (!this.logStream) this.logStream = this.openLogStream()
-      child.stdout?.on('data', (d: Buffer | string) => this.logStream?.write(d))
-      child.stderr?.on('data', (d: Buffer | string) => this.logStream?.write(d))
+      const buf: Buffer[] = []
+      child.stderr?.on('data', (d: Buffer | string) => {
+        buf.push(d as Buffer)
+        if (buf.length > STDERR_TAIL_CHUNKS) buf.shift()
+        if (!this.bootReady) {
+          this.logStream?.write(d)
+        }
+      })
+      this.stderrTail = () => Buffer.concat(buf).toString('utf8').slice(-STDERR_TAIL_CHARS)
+    } catch {
+      /* logging is best-effort */
+    }
+  }
+
+  /** Append one line written by the desktop process itself (a status
+   *  transition, spawn/crash/health) to serve.log — this is the "front end
+   *  logs its own behavior" surface. Never mixes bytes from the child. */
+  private writeLine(msg: string): void {
+    try {
+      if (!this.logStream) this.logStream = this.openLogStream()
+      this.logStream.write(`[${new Date().toISOString()}] ${msg}\n`)
     } catch {
       /* logging is best-effort */
     }
