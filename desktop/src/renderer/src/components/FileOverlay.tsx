@@ -91,8 +91,13 @@ export function FileOverlay({ path, onClose }: { path: string; onClose: () => vo
             </div>
           )}
           {st.s === 'text' && isMd && (
-            <div className="mx-auto max-w-3xl px-8 py-6">
+            <div className="mx-auto max-w-3xl px-8 py-6 text-ink">
               <Markdown content={st.text} />
+              {st.truncated && (
+                <div className="mt-4 border-t border-line bg-warning/5 px-4 py-1.5 text-[10px] text-warning/80">
+                  文件过大，仅显示前 1 MB（只读）。
+                </div>
+              )}
             </div>
           )}
           {st.s === 'text' && !isMd && (

@@ -323,6 +323,8 @@ interface DesktopState {
   setActiveTab: (id: string) => void
   /** Close every file tab at *path* or under it (tree delete follow-up). */
   closeTabsUnder: (path: string) => void
+  /** Close every editor tab (context-menu 关闭全部). */
+  closeAllTabs: () => void
   /** Re-point a file tab whose path was renamed in the tree (id is path-keyed).
    *  An unsaved draft keyed by the old path is not carried over — the tab
    *  reloads from disk. */
@@ -1078,6 +1080,8 @@ export const useStore = create<DesktopState>()((set, get) => {
         }
       })
     },
+
+    closeAllTabs: () => set({ editorTabs: [], activeTabId: null }),
 
     renameTabPath: (oldPath, newPath) => {
       set((s) => {

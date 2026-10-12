@@ -47,10 +47,44 @@ export function EditorArea({ className }: { className?: string }) {
   const fsVersion = useStore((s) => s.fsVersion)
   const setActiveTab = useStore((s) => s.setActiveTab)
   const closeTab = useStore((s) => s.closeTab)
+  const closeAllTabs = useStore((s) => s.closeAllTabs)
   const openShellPanel = useStore((s) => s.openShellPanel)
 
   const [files, setFiles] = useState<Record<string, Content>>({})
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  // Right-click tab context menu (IntelliJ-style). `anchor` is the right-clicked
+  // tab id; menu closes on outside click / Escape / any action.
+  const [ctxTab, setCtxTab] = useState<string | null>(null)
+  const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null)
+  const ctxRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!ctxPos) return
+    const onDown = (e: MouseEvent) => {
+      if (ctxRef.current && !ctxRef.current.contains(e.target as Node)) closeCtx()
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeCtx() }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => { window.removeEventListener('mousedown', onDown); window.removeEventListener('keydown', onKey) }
+  }, [ctxPos]) // eslint-disable-line react-hooks/exhaustive-deps
+  function closeCtx(): void { setCtxPos(null); setCtxTab(null) }
+  function openCtx(id: string, x: number, y: number): void { setCtxTab(id); setCtxPos({ x, y }) }
+  // Menu relies on editorTabs order = tab strip order, so "右侧" = indices after.
+  const ctxIdx = ctxTab ? editorTabs.findIndex((t) => t.id === ctxTab) : -1
+  function closeRight(): void {
+    if (ctxIdx < 0) return
+    for (let i = editorTabs.length - 1; i > ctxIdx; i--) closeTab(editorTabs[i].id)
+    closeCtx()
+  }
+  function closeLeft(): void {
+    if (ctxIdx < 0) return
+    for (let i = ctxIdx - 1; i >= 0; i--) closeTab(editorTabs[i].id)
+    closeCtx()
+  }
+  function closeOthers(): void {
+    editorTabs.forEach((t) => { if (t.id !== ctxTab) closeTab(t.id) })
+    closeCtx()
+  }
   // path → git HEAD text for gutter change marks ('' = untracked/new file,
   // null = no marks: not a repo / git unavailable / too large). Fetched once
   // per open — HEAD only moves on commit, which the renderer can't observe.
@@ -201,6 +235,7 @@ export function EditorArea({ className }: { className?: string }) {
           return (
             <div
               key={t.id}
+              onContextMenu={(e) => { e.preventDefault(); openCtx(t.id, e.clientX, e.clientY) }}
               className={cn(
                 'group/tab flex shrink-0 items-center gap-1.5 border-r border-line px-3 py-1.5 text-xs transition',
                 isActive ? 'bg-app text-ink' : 'text-ink-3 hover:bg-elevated/60'
@@ -275,7 +310,39 @@ export function EditorArea({ className }: { className?: string }) {
           }
         />}
       </div>
+
+      {/* Tab context menu — right-click a tab (IntelliJ close actions). */}
+      {ctxPos && (
+        <div
+          ref={ctxRef}
+          style={{ left: ctxPos.x, top: ctxPos.y }}
+          className="fixed z-50 min-w-[168px] rounded-md border border-line bg-elevated py-1 shadow-lg"
+        >
+          <CtxItem disabled={ctxIdx < 0} label="关闭" onClick={() => { if (ctxTab) closeTab(ctxTab); closeCtx() }} />
+          <CtxItem disabled={editorTabs.length <= 1} label="关闭其他" onClick={closeOthers} />
+          <CtxItem disabled={ctxIdx < 0 || ctxIdx === 0} label="关闭左侧" onClick={closeLeft} />
+          <CtxItem disabled={ctxIdx < 0 || ctxIdx === editorTabs.length - 1} label="关闭右侧" onClick={closeRight} />
+          <div className="my-1 border-t border-line" />
+          <CtxItem disabled={editorTabs.length === 0} label="关闭全部" onClick={() => { closeAllTabs(); closeCtx() }} />
+        </div>
+      )}
     </section>
+  )
+}
+
+function CtxItem({ label, onClick, disabled }: {
+  label: string
+  onClick: () => void
+  disabled?: boolean
+}) {
+  return (
+    <button
+      onClick={disabled ? undefined : onClick}
+      disabled={disabled}
+      className="w-full px-3 py-1 text-left text-xs text-ink-2 transition hover:bg-brand/15 hover:text-ink disabled:opacity-40"
+    >
+      {label}
+    </button>
   )
 }
 

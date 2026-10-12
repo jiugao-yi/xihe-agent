@@ -10,7 +10,7 @@
 # =============================================================================
 
 # 数据根（仅 `--config <instance>.yaml` 实例配置里写才生效）---------------------
-# agent_home: ~/xihe-instance   # 该实例的数据根：sessions.db / agent.log / browser /
+# agent_home: ~/xihe-agent      # 该实例的数据根：sessions.db / agent.log / browser /
 #                               # skills / cron / .biz_kbs 全在这下面。相对路径相对
 #                               # 仓库根解析。不写则默认 ~/.xihe-agent。
 
