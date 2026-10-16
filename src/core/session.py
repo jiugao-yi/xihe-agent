@@ -432,19 +432,30 @@ class SessionDB:
             logger.warning("FTS5 not available, full-text search will use LIKE fallback")
             return
 
-        # Triggers to keep FTS in sync with messages table
+        # Triggers to keep FTS in sync with messages table. The FTS row's rowid
+        # IS the messages row's rowid (both implicit integer rowids), so the
+        # delete trigger locates the FTS row by rowid — O(1). An earlier
+        # version located by `message_id` (UNINDEXED): an unindexed column
+        # can only be filtered by a full FTS scan, making a conversation
+        # delete O(N) FTS scans per row (O(N²) total) — the "deleting a
+        # session takes forever" report. Old rows written before this fix
+        # carry no rowid correspondence: they stop being deletable by the
+        # trigger, the count check below catches the drift, and the rebuild
+        # re-aligns every FTS row to its rowid.
         try:
+            self._execute("DROP TRIGGER IF EXISTS messages_fts_insert")
+            self._execute("DROP TRIGGER IF EXISTS messages_fts_delete")
             self._execute("""
-                CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages
+                CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages
                 BEGIN
-                    INSERT INTO messages_fts(message_id, content)
-                    VALUES (new.id, new.content);
+                    INSERT INTO messages_fts(rowid, message_id, content)
+                    VALUES (new.rowid, new.id, new.content);
                 END
             """)
             self._execute("""
-                CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages
+                CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages
                 BEGIN
-                    DELETE FROM messages_fts WHERE message_id = old.id;
+                    DELETE FROM messages_fts WHERE rowid = old.rowid;
                 END
             """)
         except sqlite3.OperationalError:
@@ -462,8 +473,8 @@ class SessionDB:
             if msg_n != fts_n:
                 self._execute("DELETE FROM messages_fts")
                 self._execute(
-                    "INSERT INTO messages_fts(message_id, content) "
-                    "SELECT id, content FROM messages")
+                    "INSERT INTO messages_fts(rowid, message_id, content) "
+                    "SELECT rowid, id, content FROM messages")
         except Exception:
             # a broken FTS index silently disables session search
             logger.warning("FTS rebuild failed — session search degraded",
@@ -942,6 +953,28 @@ class SessionDB:
         rows = self._execute(
             "SELECT m.id, m.role, m.content, m.tool_calls, m.tool_call_id, "
             "mt.reasoning, mt.usage, m.created_at, m.session_id, mt.attachments, mt.approval, mt.children "
+            "FROM messages m LEFT JOIN message_meta mt ON mt.message_id = m.id "
+            "WHERE m.session_key = ? ORDER BY m.ord",
+            (session_key,),
+        ).fetchall()
+        return self._rows_to_display(rows)
+
+    def load_transcript_bubbles(self, session_key: str) -> list[dict]:
+        """Slim variant of load_transcript for the conversation-bubble view:
+        the fold (_reshape_history) never uses tool-row content and only needs
+        "has reasoning", so those columns are truncated in SQL. A long
+        conversation's tool results and thinking text are tens of MB that
+        would otherwise be fetched, parsed and thrown away on every history
+        load — the 12s /convs/{id}/messages report. Trace views
+        (get_trace/_child_events) need the full text and stay on
+        load_transcript.
+        """
+        rows = self._execute(
+            "SELECT m.id, m.role, "
+            "CASE WHEN m.role = 'tool' THEN NULL ELSE m.content END, "
+            "m.tool_calls, m.tool_call_id, "
+            "CASE WHEN mt.reasoning IS NULL THEN NULL ELSE substr(mt.reasoning, 1, 1) END, "
+            "mt.usage, m.created_at, m.session_id, mt.attachments, mt.approval, mt.children "
             "FROM messages m LEFT JOIN message_meta mt ON mt.message_id = m.id "
             "WHERE m.session_key = ? ORDER BY m.ord",
             (session_key,),

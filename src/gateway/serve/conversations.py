@@ -719,7 +719,7 @@ class ChatMixin:
             # Cross-round transcript: the conversation view keeps pre-reset
             # history; the agent's own context still loads the current round
             # only (load_messages on the live session_id).
-            rows = self.ctx.db.load_transcript(session_key)
+            rows = self.ctx.db.load_transcript_bubbles(session_key)
             marks = self.ctx.db.reset_marks(session_key)
             # Compaction records per round: the desktop renders a "compacted,
             # expand for originals" card at each boundary (raw rows are always
