@@ -1,6 +1,6 @@
-import { app, shell, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, Notification, net, protocol } from 'electron'
+import { app, shell, BrowserWindow, clipboard, ClipboardItem, dialog, ipcMain, nativeTheme, Notification, net, protocol } from 'electron'
 import { join, isAbsolute, dirname, basename, relative } from 'path'
-import { pathToFileURL } from 'url'
+import { pathToFileURL, fileURLToPath } from 'url'
 import { existsSync, promises as fs } from 'fs'
 import { ServeSupervisor, serveLogPath, type XiheStatus, type XiheStatusState } from './serve'
 import { BrowserPanelController } from './browserPanel'
@@ -664,41 +664,48 @@ function registerIpc(): void {
   ipcMain.handle('fs:move', (_e, src: unknown, targetDir: unknown) =>
     userCopyMove(false, src, targetDir))
 
-  // System-clipboard file bridge (Windows Explorer interop). Explorer copies
-  // files as CF_HDROP; Electron exposes it under the name 'FileNameW', with a
-  // DROPFILES header (20 bytes: pFiles=20, pt, fNC, fWide=1) before the
-  // NUL-separated UTF-16LE path list (double-NUL terminated). Reading and
-  // writing both go through that exact layout so Explorer <-> tree interop
-  // is one format in both directions.
-  ipcMain.handle('clip:readFiles', () => {
-    const buf = clipboard.readBuffer('FileNameW')
-    if (buf.length === 0) return []
+  // System-clipboard file bridge (Windows Explorer interop). Electron 44 maps
+  // the 'text/uri-list' MIME type to the OS's native copied-files format
+  // (CF_HDROP on Windows) in BOTH directions, so Explorer / WeCom / tree all
+  // speak one format. Windows paths round-trip via pathToFileURL/fileURLToPath
+  // (drive letters, percent-encoding, CJK names).
+  ipcMain.handle('clip:readFiles', async (): Promise<string[]> => {
     try {
-      const s = buf.toString('utf16le')
-      return s
-        .split('\u0000')
-        .map((p) => p.replace(/\r/g, ''))
-        .filter((p) => /^[A-Za-z]:[\\/]/.test(p))
+      const items = await clipboard.read()
+      for (const item of items) {
+        if (!item.types.includes('text/uri-list')) continue
+        const blob = await item.getType('text/uri-list')
+        const text = await blob.text()
+        return text
+          .split(/\r?\n/)
+          .map((u) => u.trim())
+          .filter((u) => u.startsWith('file://'))
+          .map((u) => {
+            try {
+              return fileURLToPath(u)
+            } catch {
+              return ''
+            }
+          })
+          .filter((p): p is string => isAbsolute(p))
+      }
+      return []
     } catch {
       return []
     }
   })
-  ipcMain.handle('clip:writeFiles', (_e, paths: unknown) => {
+  ipcMain.handle('clip:writeFiles', async (_e, paths: unknown): Promise<boolean> => {
     if (!Array.isArray(paths)) return false
     const list = paths.filter((p): p is string => typeof p === 'string' && isAbsolute(p))
     if (list.length === 0) return false
-    // DROPFILES header: offset 0 = pFiles (20), 4/8 = pt.x/pt.y, 12 = fNC,
-    // 16 = fWide(1 = UTF-16). Paths follow, each NUL-terminated, list ends
-    // with an extra NUL.
-    const header = Buffer.alloc(20)
-    header.writeUInt32LE(20, 0)
-    header.writeUInt32LE(0, 4)
-    header.writeUInt32LE(0, 8)
-    header.writeUInt32LE(0, 12)
-    header.writeUInt32LE(1, 16)
-    const payload = Buffer.from(list.join('\u0000') + '\u0000\u0000', 'utf16le')
-    clipboard.writeBuffer('FileNameW', Buffer.concat([header, payload]))
-    return true
+    try {
+      await clipboard.write([
+        new ClipboardItem({ 'text/uri-list': list.map((p) => pathToFileURL(p).href).join('\r\n') }),
+      ])
+      return true
+    } catch {
+      return false
+    }
   })
 
   // Rename: change *path*'s name to *newName* (same directory).

@@ -247,11 +247,14 @@ export class ServeSupervisor {
 
     const args = ['serve', '--host', this.host, '--port', String(this.port)]
     // On Windows, spawning `xihe` needs PATHEXT resolution → shell. An absolute
-    // XIHE_BIN is spawned directly (predictable, no transient cmd.exe).
+    // XIHE_BIN is spawned directly (predictable, no transient cmd.exe). With
+    // shell, the command must be ONE string — an args array + shell trips
+    // Node's DEP0190 (unescaped concat); args here are fixed literals anyway.
     const useShell = process.platform === 'win32' && !isAbsolute(this.bin)
+    const command = useShell ? [this.bin, ...args].join(' ') : this.bin
     let child: ChildProcess
     try {
-      child = spawn(this.bin, args, {
+      child = spawn(command, useShell ? undefined : args, {
         shell: useShell,
         windowsHide: true,
         // POSIX: new process group so `kill(-pid)` reaches any subprocess;
