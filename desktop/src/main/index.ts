@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, dialog, ipcMain, nativeTheme, Notification, net, protocol } from 'electron'
+import { app, shell, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, Notification, net, protocol } from 'electron'
 import { join, isAbsolute, dirname, basename, relative } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync, promises as fs } from 'fs'
@@ -609,6 +609,96 @@ function registerIpc(): void {
     } catch (e) {
       return fsFail(reasonOf(e))
     }
+  })
+
+  // User-initiated copy/move (hover action + drag): unlike agent writes these
+  // are NOT sandboxed to a workspace — the user picked both ends by hand — so
+  // only the path shape is validated. Destination = targetDir + basename(src).
+  async function userCopyMove(
+    copy: boolean, src: unknown, targetDir: unknown
+  ): Promise<FsResult> {
+    if (typeof src !== 'string' || typeof targetDir !== 'string' || !isAbsolute(src) || !isAbsolute(targetDir)) {
+      return fsFail('io')
+    }
+    try {
+      const st = await fs.stat(src)
+      if (!st.isFile() && !st.isDirectory()) return fsFail('notFound')
+      await fs.access(targetDir)
+    } catch {
+      return fsFail('notFound')
+    }
+    // Explorer behavior on collision: copy appends " - 副本" to whatever
+    // destination name is taken (a - 副本, a - 副本 - 副本, …) — each retry
+    // re-checks the CURRENT directory state, not the original name. Move
+    // still refuses (same-name move would clobber).
+    let dest = join(targetDir, basename(src))
+    const dot = dest.lastIndexOf('.')
+    const ext = dot > dest.lastIndexOf('\\') && dot > dest.lastIndexOf('/') ? dest.slice(dot) : ''
+    const stem = () => (ext ? dest.slice(0, dest.length - ext.length) : dest)
+    try {
+      while (copy) {
+        await fs.access(dest)
+        dest = `${stem()} - 副本${ext}`
+      }
+      if (!copy) {
+        await fs.access(dest)
+        return fsFail('exists')
+      }
+    } catch {
+      /* target free — proceed */
+    }
+    try {
+      if (copy) {
+        await fs.cp(src, dest, { recursive: true })
+      } else {
+        await fs.rename(src, dest)
+      }
+      return { ok: true }
+    } catch (e) {
+      return fsFail(reasonOf(e))
+    }
+  }
+
+  ipcMain.handle('fs:copy', (_e, src: unknown, targetDir: unknown) =>
+    userCopyMove(true, src, targetDir))
+  ipcMain.handle('fs:move', (_e, src: unknown, targetDir: unknown) =>
+    userCopyMove(false, src, targetDir))
+
+  // System-clipboard file bridge (Windows Explorer interop). Explorer copies
+  // files as CF_HDROP; Electron exposes it under the name 'FileNameW', with a
+  // DROPFILES header (20 bytes: pFiles=20, pt, fNC, fWide=1) before the
+  // NUL-separated UTF-16LE path list (double-NUL terminated). Reading and
+  // writing both go through that exact layout so Explorer <-> tree interop
+  // is one format in both directions.
+  ipcMain.handle('clip:readFiles', () => {
+    const buf = clipboard.readBuffer('FileNameW')
+    if (buf.length === 0) return []
+    try {
+      const s = buf.toString('utf16le')
+      return s
+        .split('\u0000')
+        .map((p) => p.replace(/\r/g, ''))
+        .filter((p) => /^[A-Za-z]:[\\/]/.test(p))
+    } catch {
+      return []
+    }
+  })
+  ipcMain.handle('clip:writeFiles', (_e, paths: unknown) => {
+    if (!Array.isArray(paths)) return false
+    const list = paths.filter((p): p is string => typeof p === 'string' && isAbsolute(p))
+    if (list.length === 0) return false
+    // DROPFILES header: offset 0 = pFiles (20), 4/8 = pt.x/pt.y, 12 = fNC,
+    // 16 = fWide(1 = UTF-16). Paths follow, each NUL-terminated, list ends
+    // with an extra NUL.
+    const header = Buffer.alloc(20)
+    header.writeUInt32LE(20, 0)
+    header.writeUInt32LE(0, 4)
+    header.writeUInt32LE(0, 8)
+    header.writeUInt32LE(0, 12)
+    header.writeUInt32LE(1, 16)
+    const payload = Buffer.from(list.join('\u0000') + '\u0000\u0000', 'utf16le')
+    clipboard.writeBuffer('FileNameW', Buffer.concat([header, payload]))
+    return true
   })
 
   // Rename: change *path*'s name to *newName* (same directory).

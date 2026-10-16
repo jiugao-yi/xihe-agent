@@ -20,6 +20,10 @@ const desktop = {
   createDir: (parentDir: string, name: string) => ipcRenderer.invoke('fs:createDir', parentDir, name),
   deletePath: (path: string) => ipcRenderer.invoke('fs:delete', path),
   renamePath: (path: string, newName: string) => ipcRenderer.invoke('fs:rename', path, newName),
+  copyPath: (src: string, targetDir: string) => ipcRenderer.invoke('fs:copy', src, targetDir),
+  movePath: (src: string, targetDir: string) => ipcRenderer.invoke('fs:move', src, targetDir),
+  clipReadFiles: (): Promise<string[]> => ipcRenderer.invoke('clip:readFiles'),
+  clipWriteFiles: (paths: string[]) => ipcRenderer.invoke('clip:writeFiles', paths),
   workspaceLoad: () => ipcRenderer.invoke('workspace:load'),
   workspaceSave: (data: unknown) => ipcRenderer.invoke('workspace:save', data),
   // xihe config — main line-patches ~/.xihe-agent/config.yaml (single source).

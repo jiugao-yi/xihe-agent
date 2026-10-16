@@ -176,6 +176,17 @@ export interface DesktopAPI {
   deletePath: (path: string) => Promise<FsResult>
   /** Rename *path* to *newName* in the same directory (sandboxed). */
   renamePath: (path: string, newName: string) => Promise<FsResult>
+  /** User-initiated copy of a file/directory (recursive) into *targetDir*,
+   *  keeping its name. Not sandboxed — the user picked both ends by hand. */
+  copyPath: (src: string, targetDir: string) => Promise<FsResult>
+  /** User-initiated move of a file/directory into *targetDir* (not sandboxed). */
+  movePath: (src: string, targetDir: string) => Promise<FsResult>
+  /** Windows Explorer clipboard interop: file paths currently on the system
+   *  clipboard (CF_HDROP), [] when it holds no files. */
+  clipReadFiles: () => Promise<string[]>
+  /** Write file paths to the system clipboard (CF_HDROP) so Explorer and other
+   *  apps can paste them. */
+  clipWriteFiles: (paths: string[]) => Promise<boolean>
   /** Load the workspace store file (empty on missing/corrupt). */
   workspaceLoad: () => Promise<WorkspaceStore>
   /** Persist the workspace store (atomic write). */

@@ -87,11 +87,11 @@ export function FileOverlay({ path, onClose }: { path: string; onClose: () => vo
                 backgroundPosition: '0 0,8px 8px',
               }}
             >
-              <img src={localImgUrl(path)} alt={name} className="max-h-full max-w-full object-contain" draggable={false} />
+              <img src={localImgUrl(path)} alt={name} className="h-full w-full object-contain" draggable={false} />
             </div>
           )}
           {st.s === 'text' && isMd && (
-            <div className="mx-auto max-w-3xl px-8 py-6 text-ink">
+            <div className="px-8 py-6 text-ink">
               <Markdown content={st.text} />
               {st.truncated && (
                 <div className="mt-4 border-t border-line bg-warning/5 px-4 py-1.5 text-[10px] text-warning/80">

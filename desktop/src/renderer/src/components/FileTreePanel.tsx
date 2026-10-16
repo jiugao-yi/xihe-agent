@@ -211,6 +211,14 @@ export function FileTree({
   // Inline-create input: which parent dir, and file vs folder.
   const [creating, setCreating] = useState<{ parent: string; kind: 'file' | 'dir' } | null>(null)
   const [createValue, setCreateValue] = useState('')
+  // Selection (Explorer semantics): click selects a row (dirs included),
+  // Ctrl+C writes it to the SYSTEM clipboard (CF_HDROP — Explorer-compatible),
+  // Ctrl+V reads files back from the system clipboard into the selected dir —
+  // or the selected file's parent — falling back to activeDir. Tree-internal
+  // and Explorer-originated copies are the same path.
+  const [selected, setSelected] = useState<{ path: string; dir: boolean } | null>(null)
+  // Mirror of the system-clipboard files (for the ✓ indicator + enable V).
+  const [clipFiles, setClipFiles] = useState<string[]>([])
   // Inline-rename input: which entry is being renamed.
   const [renaming, setRenaming] = useState<{ path: string; dir: boolean; name: string } | null>(null)
   const [renameValue, setRenameValue] = useState('')
@@ -292,6 +300,8 @@ export function FileTree({
     setActiveDir(workspace.workdir)
     setCreating(null)
     setRenaming(null)
+    setSelected(null)
+    setClipFiles([])
     setFormError(null)
     setGit(null)
     void desktop.listDir(workspace.workdir).then((entries) => {
@@ -411,6 +421,99 @@ export function FileTree({
     setFormError(null)
   }
 
+  /** Explorer-style default name for the inline create input: 新建文件夹 /
+   *  新建文件夹 (2) … — first free name among the dir's CURRENT children. */
+  function suggestCreateName(parent: string, kind: 'file' | 'dir'): string {
+    const base = kind === 'dir' ? '新建文件夹' : '新建文件'
+    const children = tree[parent]
+    if (children == null) return base
+    const taken = new Set(children.map((c) => c.name.toLowerCase()))
+    if (!taken.has(base.toLowerCase())) return base
+    for (let i = 2; ; i++) {
+      const n = `${base} (${i})`
+      if (!taken.has(n.toLowerCase())) return n
+    }
+  }
+
+  /** Paste target, Explorer-style: the selected dir, else the selected file's
+   *  parent, else the last-opened dir (activeDir). */
+  function pasteTargetDir(): string | null {
+    if (selected) return selected.dir ? selected.path : parentDir(selected.path)
+    return activeDir
+  }
+
+  async function pasteClip(): Promise<void> {
+    const dir = pasteTargetDir()
+    if (!dir) return
+    const files = await desktop.clipReadFiles()
+    if (files.length === 0) return
+    for (const f of files) {
+      const r = await desktop.copyPath(f, dir)
+      if (!r.ok) {
+        showFormError(failText('create', r.reason, baseName(f)))
+        return
+      }
+    }
+    setFormError(null)
+    useStore.getState().bumpFsVersion()
+    // Show the copy: expand the destination if it isn't already.
+    setExpanded((e) => ({ ...e, [dir]: true }))
+    await refresh()
+  }
+
+  async function onCopyClip(): Promise<boolean> {
+    if (!selected) return false
+    const ok = await desktop.clipWriteFiles([selected.path])
+    if (ok) setClipFiles([selected.path])
+    return ok
+  }
+
+  async function onDragMove(src: string, targetDir: string): Promise<void> {
+    const r = await desktop.movePath(src, targetDir)
+    if (!r.ok) {
+      showFormError(failText('rename', r.reason, baseName(src)))
+      return
+    }
+    setFormError(null)
+    const newName = baseName(src)
+    const sep = targetDir.includes('\\') ? '\\' : '/'
+    const newPath = targetDir.endsWith(sep) ? targetDir + newName : targetDir + sep + newName
+    onPathRenamed?.(src, newPath)
+    setExpanded((e) => ({ ...e, [targetDir]: true }))
+    useStore.getState().bumpFsVersion()
+    await refresh()
+  }
+
+  // Ctrl+C / Ctrl+V on the tree. Skip while an inline input has focus — those
+  // keys belong to the text being edited. Also skip native text selections
+  // elsewhere (copy only when a tree row is the current target).
+  useEffect(() => {
+    function onKey(e: KeyboardEvent): void {
+      if (creating || renaming) return
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+        void onCopyClip().then((did) => {
+          if (did) e.preventDefault()
+        })
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+        e.preventDefault()
+        void pasteClip()
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'r') {
+        // Explorer-style refresh — swallow it or Chromium reloads the whole
+        // window (drops app state).
+        e.preventDefault()
+        void refresh()
+        void loadGit()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // `selected` MUST be in the deps — a stale closure copies the previous
+    // selection (the "Ctrl+C does nothing / pastes the wrong file" bug).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeDir, selected, creating, renaming, expanded])
+
   async function confirmRename(): Promise<void> {
     if (!renaming) return
     const newName = renameValue.trim()
@@ -500,7 +603,31 @@ export function FileTree({
           gitIndex.byFile.get(normKey(entry.path)) ??
           (entry.dir ? gitIndex.byDir.get(normKey(nodePath)) : undefined)
         rows.push(
-          <div key={entry.path} className="group relative">
+          <div
+            key={entry.path}
+            className="group relative"
+            draggable={!isRenaming}
+            onDragStart={(e) => {
+              e.dataTransfer.setData('application/x-xihe-path', nodePath)
+              e.dataTransfer.effectAllowed = 'move'
+            }}
+            onDragOver={(e) => {
+              if (!entry.dir) return
+              if (e.dataTransfer.types.includes('application/x-xihe-path')) {
+                e.preventDefault()
+                e.dataTransfer.dropEffect = 'move'
+              }
+            }}
+            onDrop={(e) => {
+              if (!entry.dir) return
+              const src = e.dataTransfer.getData('application/x-xihe-path')
+              if (!src || src === nodePath) return
+              // Drop into self or a descendant is a no-op.
+              if (nodePath.startsWith(src + '\\') || nodePath.startsWith(src + '/')) return
+              e.preventDefault()
+              void onDragMove(src, nodePath)
+            }}
+          >
             {isRenaming ? (
               <NameEditRow
                 padLeft={8 + depth * 12}
@@ -524,16 +651,20 @@ export function FileTree({
             ) : (
               <>
                 <button
-                  onClick={() =>
-                    entry.dir
-                      ? void toggle({ name: nodeLabel, dir: true, path: nodePath })
-                      : onSelectFile(entry)
-                  }
+                  onClick={() => {
+                    setSelected({ path: nodePath, dir: entry.dir })
+                    if (entry.dir) {
+                      void toggle({ name: nodeLabel, dir: true, path: nodePath })
+                    } else {
+                      onSelectFile(entry)
+                    }
+                  }}
                   style={{ paddingLeft: 8 + depth * 12 }}
                   title={nodePath}
                   className={cn(
                     'flex w-full items-center gap-1 py-1 pr-16 text-left text-xs transition hover:bg-elevated/60',
-                    selectedPath === entry.path && 'bg-elevated text-ink'
+                    (selected?.path === nodePath || selectedPath === entry.path) &&
+                      'bg-elevated text-ink'
                   )}
                 >
                   {entry.dir ? (
@@ -647,7 +778,7 @@ export function FileTree({
           onClick={() => {
             setFormError(null)
             setCreating({ parent: activeDir, kind: 'file' })
-            setCreateValue('')
+            setCreateValue(tree[activeDir] ? suggestCreateName(activeDir, 'file') : '')
             // Make sure the target dir is open so the inline input is visible.
             setExpanded((e) => ({ ...e, [activeDir]: true }))
             ensureChildren(activeDir)
@@ -661,7 +792,7 @@ export function FileTree({
           onClick={() => {
             setFormError(null)
             setCreating({ parent: activeDir, kind: 'dir' })
-            setCreateValue('')
+            setCreateValue(tree[activeDir] ? suggestCreateName(activeDir, 'dir') : '')
             setExpanded((e) => ({ ...e, [activeDir]: true }))
             ensureChildren(activeDir)
           }}
@@ -677,6 +808,15 @@ export function FileTree({
         >
           <RefreshCw className="h-3 w-3" />
         </button>
+        {clipFiles.length > 0 && (
+          <span
+            className="max-w-24 shrink-0 truncate text-[10px] text-accent"
+            title={`已复制 ${clipFiles.length} 项，Ctrl+V 粘贴到选中目录`}
+          >
+            ✓{baseName(clipFiles[0])}
+            {clipFiles.length > 1 ? ` +${clipFiles.length - 1}` : ''}
+          </span>
+        )}
         {onCollapse && (
           <button
             onClick={onCollapse}

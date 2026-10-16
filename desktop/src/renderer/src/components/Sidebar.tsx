@@ -360,17 +360,6 @@ function ConversationRow({
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(conv.title)
   const inputRef = useRef<HTMLInputElement>(null)
-  // Two-step delete instead of window.confirm: the native dialog's focus
-  // restore lands on the row being unmounted, so focus drops to <body> and
-  // the composer then swallows nothing until the user clicks somewhere.
-  const [confirmDel, setConfirmDel] = useState(false)
-  const disarmRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useEffect(
-    () => () => {
-      if (disarmRef.current) clearTimeout(disarmRef.current)
-    },
-    []
-  )
 
   // Focus + select-all on enter so continued typing replaces the old title.
   useEffect(() => {
@@ -457,22 +446,12 @@ function ConversationRow({
           <button
             onClick={(e) => {
               e.stopPropagation()
-              if (disarmRef.current) clearTimeout(disarmRef.current)
-              if (!confirmDel) {
-                setConfirmDel(true)
-                disarmRef.current = setTimeout(() => setConfirmDel(false), 3000)
-                return
-              }
-              setConfirmDel(false)
               onDelete()
             }}
-            title={confirmDel ? '再点一次确认删除' : '删除会话'}
-            className={cn(
-              'rounded p-0.5 text-[10px] transition',
-              confirmDel ? 'text-danger' : 'text-ink-4 hover:text-danger'
-            )}
+            title="删除会话"
+            className="rounded p-0.5 text-ink-4 transition hover:text-danger"
           >
-            {confirmDel ? '确认?' : <Trash2 className="h-3 w-3" />}
+            <Trash2 className="h-3 w-3" />
           </button>
         </div>
       )}
