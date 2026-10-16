@@ -160,8 +160,11 @@ registry.register(
         "function": {
             "name": "todo",
             "description": (
-                "Manage task checklists. Create, update, and track todo items. "
-                "Organize items into named lists. Use for tracking multi-step tasks."
+                "Manage task checklists for multi-step tasks. Create the list "
+                "BEFORE starting (3+ steps), execute one item at a time, mark "
+                "completed immediately. Keep per-step thinking short — act via "
+                "tool calls, not extended deliberation. To continue a stalled "
+                "task: list todos, do the next pending item."
             ),
             "parameters": {
                 "type": "object",
