@@ -55,6 +55,7 @@ Remove-Item -Recurse -Force dist\cli, build\pyinstaller, build\xihe.spec -ErrorA
   --exclude-module pytest `
   --hidden-import RestrictedPython `
   --hidden-import olefile `
+  --collect-all jiter `
   --collect-all playwright `
   --collect-submodules tools `
   --add-data "$Root\src\core\kbs_templates;core\kbs_templates" `
@@ -71,5 +72,10 @@ $Bin = Join-Path $Root "dist\cli\xihe\xihe.exe"
 if (-not (Test-Path $Bin)) { throw "打包产物不存在: $Bin" }
 & $Bin --version
 if ($LASTEXITCODE -ne 0) { throw "打包产物无法执行 (exit=$LASTEXITCODE)" }
+# 深度冒烟：触发 openai/jiter 等运行时 import（--version 不加载 LLM 客户端，测不出原生扩展漏收）
+$smokeOut = & $Bin doctor 2>&1 | Out-String
+if ($smokeOut -match "ModuleNotFoundError|No module named|DLL load failed") {
+  throw "打包产物运行时缺原生模块: $smokeOut"
+}
 
 Write-Host "[4/4] 完成: $Root\dist\cli\xihe\xihe.exe"

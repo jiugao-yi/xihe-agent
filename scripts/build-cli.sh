@@ -59,6 +59,7 @@ rm -rf dist/cli build/pyinstaller build/xihe.spec
   --exclude-module pytest \
   --hidden-import RestrictedPython \
   --hidden-import olefile \
+  --collect-all jiter \
   --collect-all playwright \
   --collect-submodules tools \
   --add-data "$ROOT/src/core/kbs_templates:core/kbs_templates" \
@@ -80,6 +81,14 @@ if ! "$BIN" --version >/dev/null 2>&1; then
     echo "错误: 打包产物无法执行" >&2
     exit 1
   fi
+fi
+# 深度冒烟：触发 openai/jiter 等运行时 import（--version/--help 不加载 LLM 客户端，测不出原生扩展漏收）
+# doctor 在无配置时会在 import 阶段就暴露 ModuleNotFoundError；只拦截 ImportError/ModuleNotFoundError 类崩溃，其他错误允许
+SMOKE_OUT="$("$BIN" doctor 2>&1 >/dev/null || true)"
+if echo "$SMOKE_OUT" | grep -qE "ModuleNotFoundError|No module named|ImportError.*DLL load failed"; then
+  echo "错误: 打包产物运行时缺原生模块: " >&2
+  echo "$SMOKE_OUT" | tail -5 >&2
+  exit 1
 fi
 
 echo "[4/4] 完成: $ROOT/dist/cli/"
