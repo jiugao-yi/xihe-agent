@@ -60,6 +60,7 @@ rm -rf dist/cli build/pyinstaller build/xihe.spec
   --hidden-import RestrictedPython \
   --hidden-import olefile \
   --collect-all jiter \
+  --collect-all pydantic \
   --collect-all playwright \
   --collect-submodules tools \
   --add-data "$ROOT/src/core/kbs_templates:core/kbs_templates" \
